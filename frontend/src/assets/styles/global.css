@@ -1,0 +1,93 @@
+/* TradeRakshak™ v11.4 — Dark Pro Theme */
+/* Mirrors Python static/style.css colour palette */
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --navy:   #0B1E3D;
+  --card:   #112138;
+  --gold:   #F9A825;
+  --blue:   #2E8BF0;
+  --green:  #22c55e;
+  --red:    #ef4444;
+  --border: rgba(46, 139, 240, 0.2);
+}
+
+@layer base {
+  body {
+    @apply bg-[#0B1E3D] text-white font-sans antialiased;
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { @apply bg-[#0B1E3D]; }
+  ::-webkit-scrollbar-thumb { @apply bg-slate-600 rounded; }
+}
+
+@layer components {
+  .bg-navy   { background-color: var(--navy); }
+  .bg-card   { background-color: var(--card); }
+  .text-gold { color: var(--gold); }
+
+  .btn-primary {
+    @apply bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg
+           font-medium transition-colors duration-150 focus:outline-none focus:ring-2 focus:ring-blue-500;
+  }
+  .btn-secondary {
+    @apply bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded-lg
+           font-medium transition-colors duration-150;
+  }
+  .btn-danger {
+    @apply bg-red-700 hover:bg-red-600 text-white px-4 py-2 rounded-lg font-medium transition-colors;
+  }
+  .btn-gold {
+    @apply bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-lg font-medium transition-colors;
+  }
+
+  /* Form inputs */
+  .input {
+    @apply w-full bg-[#0B1E3D] border border-slate-600 rounded-lg px-4 py-2.5 text-white
+           focus:outline-none focus:border-blue-500 transition-colors;
+  }
+  .label { @apply block text-sm text-slate-400 mb-1; }
+
+  /* Cards */
+  .card {
+    @apply bg-[#112138] rounded-xl border border-slate-700/50 p-5;
+  }
+  .card-header {
+    @apply text-base font-semibold text-white mb-4 flex items-center justify-between;
+  }
+
+  /* Tables */
+  .table-base { @apply w-full text-sm border-collapse; }
+  .table-base thead tr { @apply border-b border-slate-700; }
+  .table-base thead th { @apply text-left text-xs text-slate-400 pb-2 pr-4 font-medium; }
+  .table-base tbody tr { @apply border-b border-slate-700/30 hover:bg-slate-800/30 transition-colors; }
+  .table-base tbody td { @apply py-2 pr-4 text-sm; }
+
+  /* Status badges */
+  .badge { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-medium; }
+  .badge-green  { @apply badge bg-green-900/40 text-green-400 border border-green-700/40; }
+  .badge-red    { @apply badge bg-red-900/40 text-red-400 border border-red-700/40; }
+  .badge-yellow { @apply badge bg-yellow-900/40 text-yellow-400 border border-yellow-700/40; }
+  .badge-blue   { @apply badge bg-blue-900/40 text-blue-400 border border-blue-700/40; }
+
+  /* Trade score color */
+  .score-high  { @apply text-green-400 font-bold; }
+  .score-med   { @apply text-yellow-400 font-bold; }
+  .score-low   { @apply text-red-400; }
+
+  /* Sidebar nav */
+  .nav-link {
+    @apply flex items-center gap-3 px-3 py-2 rounded-lg text-slate-400
+           hover:text-white hover:bg-slate-800/60 transition-colors text-sm;
+  }
+  .nav-link.active { @apply text-white bg-blue-900/40 border border-blue-700/30; }
+
+  /* Section header */
+  .section-title { @apply text-2xl font-bold text-white mb-1; }
+  .section-sub   { @apply text-sm text-slate-400 mb-6; }
+}

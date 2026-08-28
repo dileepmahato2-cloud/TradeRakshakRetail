@@ -1,0 +1,92 @@
+version: '3.9'
+
+# =============================================================================
+# TradeRakshak(tm) v11.5 - Docker Compose
+# Services: backend (Spring Boot) + frontend (Angular/Nginx)
+# =============================================================================
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: traderakshak-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-traderakshak}
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-123456}
+    volumes:
+      - tr_postgres:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-traderakshak}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - trnet
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: traderakshak-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - SPRING_PROFILE=dev
+      - DATABASE_URL=${DATABASE_URL:-jdbc:postgresql://postgres:5432/traderakshak}
+      - DB_DRIVER=${DB_DRIVER:-org.postgresql.Driver}
+      - JWT_SECRET=${JWT_SECRET}
+      - FERNET_KEY=${FERNET_KEY:-}
+      - SMTP_HOST=${SMTP_HOST:-smtp.gmail.com}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - CORS_ORIGINS=http://localhost,http://localhost:8888,http://frontend
+    volumes:
+      - tr_data:/app/data
+      - tr_uploads:/app/uploads
+      - tr_exports:/app/exports
+      - tr_backups:/app/backups
+      - maven_cache:/root/.m2
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/api/actuator/health 2>/dev/null || curl -f http://localhost:8080/api/actuator/health 2>/dev/null || exit 0"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    networks:
+      - trnet
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: traderakshak-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - trnet
+
+volumes:
+  tr_postgres:
+  tr_data:
+  tr_uploads:
+  tr_exports:
+  tr_backups:
+  maven_cache:
+
+networks:
+  trnet:
+    driver: bridge

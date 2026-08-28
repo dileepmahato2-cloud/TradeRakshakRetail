@@ -1,0 +1,55 @@
+#!/bin/bash
+# =============================================================================
+# TradeRakshak Maven Wrapper for Linux/Mac
+# Downloads Apache Maven 3.9.8 directly (no wrapper JAR needed)
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_ROOT="$SCRIPT_DIR/.."
+MVN_HOME="$APP_ROOT/mvn_home"
+MVN_EXE="$MVN_HOME/bin/mvn"
+MVN_URL="https://downloads.apache.org/maven/maven-3/3.9.8/binaries/apache-maven-3.9.8-bin.tar.gz"
+MVN_URL_BACKUP="https://archive.apache.org/dist/maven/maven-3/3.9.8/binaries/apache-maven-3.9.8-bin.tar.gz"
+
+# Find Java
+JAVA_EXE="java"
+if [ -x "$APP_ROOT/jdk21/bin/java" ]; then
+    JAVA_EXE="$APP_ROOT/jdk21/bin/java"
+    export JAVA_HOME="$APP_ROOT/jdk21"
+fi
+
+# If Maven already downloaded
+if [ -x "$MVN_EXE" ]; then
+    exec "$MVN_EXE" "$@"
+fi
+
+# Check system Maven
+if command -v mvn >/dev/null 2>&1; then
+    exec mvn "$@"
+fi
+
+# Download Maven
+echo "[..] Downloading Apache Maven 3.9.8 (~10 MB, one-time)..."
+MVN_TGZ="$APP_ROOT/maven_download.tar.gz"
+
+curl -L -o "$MVN_TGZ" "$MVN_URL" --connect-timeout 60 --max-time 300 2>/dev/null || \
+wget -O "$MVN_TGZ" "$MVN_URL" 2>/dev/null || \
+curl -L -o "$MVN_TGZ" "$MVN_URL_BACKUP" --connect-timeout 60 2>/dev/null
+
+if [ ! -f "$MVN_TGZ" ]; then
+    echo "[!!] Failed to download Maven. Check internet connection."
+    exit 1
+fi
+
+echo "[..] Extracting Maven..."
+mkdir -p "$APP_ROOT/mvn_home"
+tar -xzf "$MVN_TGZ" -C "$APP_ROOT/mvn_home" --strip-components=1
+rm -f "$MVN_TGZ"
+
+if [ ! -x "$MVN_EXE" ]; then
+    echo "[!!] Maven extraction failed."
+    exit 1
+fi
+
+echo "[OK] Maven downloaded and ready."
+exec "$MVN_EXE" "$@"

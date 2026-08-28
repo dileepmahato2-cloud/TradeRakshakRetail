@@ -1,0 +1,21 @@
+-- Reclaim ~1 GB from two indexes that earn very little.
+--
+-- Measured on 2026-08-27, after several days of representative traffic rather than a single
+-- backfill-dominated window:
+--
+--   idx_bmc_symbol_date   650 MB      703 scans   redundant with idx_bmc_norm_date, which is the
+--                                                 same size but served 97,656 scans - the code
+--                                                 normalises symbols before querying, so the plain
+--                                                 (symbol, trade_date) form is rarely the match
+--   idx_bmc_utsym_eq      363 MB    2,128 scans   near-duplicate of idx_bmc_utsym (353 MB, 28,456
+--                                                 scans); both index a trading_symbol variant
+--
+-- Deliberately NOT dropped, despite being far larger:
+--   broker_market_candles_..._key   6,942 MB, 6.6M scans - the upsert key every write depends on
+--   broker_market_candles_pkey      1,159 MB, 2 scans - unused for reads but it is the primary key
+--
+-- Also deliberately kept, at 27 MB each: idx_bmc_norm_daily_date and idx_bmc_daily_usym_date.
+-- They are partial (711k daily rows, not 51M) and together took ranking from 23 s to 1.6 s and the
+-- below-price chart from 227 s to 1 s. Size is not the same thing as cost.
+DROP INDEX IF EXISTS idx_bmc_symbol_date;
+DROP INDEX IF EXISTS idx_bmc_utsym_eq;
