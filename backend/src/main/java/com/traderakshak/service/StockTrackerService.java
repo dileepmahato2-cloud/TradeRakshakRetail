@@ -3807,7 +3807,9 @@ public class StockTrackerService {
             // As-of date: the newest day that actually has prices. During a session that is today;
             // after the close, or on a holiday, it is the last completed trading day - which is
             // what "after market last closing price will be considered" asks for.
-            List<String> days = tradingDaysWithData(
+            // Usable, not merely present: a date with a handful of live-feed bars and no daily
+            // candle is not a session this can be rebuilt from, and picking one blanks the panel.
+            List<String> days = tradingDaysWithUsableData(
                 java.time.LocalDate.now(IST).minusDays(30).toString(), DateUtil.today());
             if (days.isEmpty()) {
                 out.put("success", false);
@@ -4182,6 +4184,82 @@ public class StockTrackerService {
 
     /** Trading days that actually have daily candles, oldest first. Holidays are absent by nature. */
     @SuppressWarnings("unchecked")
+    /**
+     * Fewest intraday bar times that make a date a session rather than a fragment.
+     *
+     * <p>A real session prints bars right through it: measured over 2026-10-30..2026-11-09,
+     * genuine sessions carry 11 to 24 distinct bar times. The two dates that broke the panels
+     * carried 2 and 1 - a few minutes of live feed on 2026-11-11, and on 2026-11-16 the single
+     * partial bar per symbol that the shutdown flush writes on its way out.
+     */
+    private static final long MIN_INTRADAY_BARS_PER_SESSION = 3L;
+
+    /**
+     * Trading days that hold enough data to reconstruct a session from.
+     *
+     * <p>{@link #tradingDaysWithData} answers a different question - whether a date has ANY
+     * candle - and that is right for the coverage and rebuild callers, which want to see every
+     * date the database touches. It is wrong for choosing an as-of date, because one bar for one
+     * symbol makes a date look like a session that nothing can actually be rebuilt from.
+     *
+     * <p>That is what emptied the Previous Top 10 panels. On 2026-11-16 the day list ended
+     * ... Nov 9, Nov 11, Nov 16, so the as-of date - the session before the newest - resolved to
+     * Nov 11, a date holding 394 live-feed intraday bars and not one daily candle. Tracked stocks
+     * with a daily bar that day: zero, against 1,256 on Nov 9. The reconstruction had nothing to
+     * work from and returned an empty list, so three panels went blank while the data they needed
+     * sat in the table one session earlier.
+     *
+     * <p>A date qualifies on either feed: full daily coverage, or intraday with real depth. The
+     * second is deliberate - when the daily feed lags, a complete intraday session can still be
+     * folded into one (see {@link #gapSessionBars}), and excluding those would reintroduce the
+     * blindness that {@link #tradingDaysWithData} was widened to fix.
+     *
+     * <p>If the filter would leave nothing it returns the unfiltered list instead. A panel built
+     * on thin data and labelled as such beats a blank one, and this must never be the reason a
+     * chart stops updating.
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> tradingDaysWithUsableData(String from, String to) {
+        List<String> candidates = tradingDaysWithData(from, to);
+        if (candidates.size() <= 1) return candidates;
+        try {
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT trade_date, " +
+                "COUNT(DISTINCT symbol) FILTER (WHERE UPPER(COALESCE(candle_mode,'')) = 'DAILY'), " +
+                "COUNT(DISTINCT candle_time) FILTER (WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY') " +
+                "FROM broker_market_candles WHERE trade_date BETWEEN ? AND ? GROUP BY trade_date")
+                .setParameter(1, from)
+                .setParameter(2, to)
+                .getResultList();
+
+            Map<String, long[]> coverage = new HashMap<>();
+            for (Object[] r : rows) {
+                if (r[0] == null) continue;
+                long daily = r[1] instanceof Number n ? n.longValue() : 0L;
+                long bars  = r[2] instanceof Number n2 ? n2.longValue() : 0L;
+                coverage.put(String.valueOf(r[0]), new long[]{daily, bars});
+            }
+
+            List<String> usable = new ArrayList<>();
+            for (String d : candidates) {
+                long[] c = coverage.get(d);
+                if (c == null) continue;
+                if (c[0] >= MIN_DAILY_SYMBOLS_PER_SESSION || c[1] >= MIN_INTRADAY_BARS_PER_SESSION) {
+                    usable.add(d);
+                }
+            }
+            if (usable.isEmpty()) return candidates;
+            if (usable.size() < candidates.size()) {
+                log.debug("[Top10] Ignored {} date(s) with too little data to rebuild a session from.",
+                    candidates.size() - usable.size());
+            }
+            return usable;
+        } catch (Exception e) {
+            log.warn("Usable trading-day filter failed, using the unfiltered list: {}", e.getMessage());
+            return candidates;
+        }
+    }
+
     private List<String> tradingDaysWithData(String from, String to) {
         try {
             // Either feed counts. Restricting this to DAILY made the rebuild blind to sessions
@@ -11434,6 +11512,37 @@ public class StockTrackerService {
     //  periods look back N *trading* days. Buy prices come only from stored
     //  candles — never a live API call, never a ranking average.
     // =========================================================================
+    /**
+     * The newest session at or before {@code date} that actually holds data.
+     *
+     * <p>{@link #resolvePeriodDate} counts backwards through the calendar - "1D" means one
+     * trading day ago by {@link #isTradingDay}, which consults a holiday list that is empty by
+     * default. That answers "which date is this", not "which date do we have prices for", and
+     * the two part company the moment a session is missing from the database. On 2026-11-16 the
+     * default period NOW resolved to 2026-11-16 itself, a date holding no daily candle for any
+     * tracked stock, so the preview rebuilt from nothing and the panel showed nothing - while
+     * 2026-11-09 sat complete in the table with 1,256 of them.
+     *
+     * <p>Snapping back to the newest session with usable data means the panel shows the most
+     * recent thing it can actually show. The date it settled on is reported as run_date and on
+     * every row, so the view is never silently older than it claims to be.
+     *
+     * <p>Thirty days back is the same window the Top 10 sections use. Beyond that the answer is
+     * not a stale panel but a backfill, and returning the original date lets the caller report
+     * the absence rather than quietly reaching for something months old.
+     */
+    private String latestUsableSessionOnOrBefore(String date) {
+        if (date == null || !date.matches("\\d{4}-\\d{2}-\\d{2}")) return date;
+        try {
+            String from = java.time.LocalDate.parse(date).minusDays(30).toString();
+            List<String> days = tradingDaysWithUsableData(from, date);
+            if (!days.isEmpty()) return days.get(days.size() - 1);
+        } catch (Exception e) {
+            log.debug("Could not snap {} to a session with data: {}", date, e.getMessage());
+        }
+        return date;
+    }
+
     String resolvePeriodDate(String period, String customDate) {
         String p = period == null ? "NOW" : period.trim().toUpperCase(Locale.ROOT);
         if (p.equals("CUSTOM")) {
@@ -11536,11 +11645,19 @@ public class StockTrackerService {
         try {
             String p = period == null ? "NOW" : period.trim().toUpperCase(Locale.ROOT);
             String buyDate = resolvePeriodDate(p, customDate);
+            // A relative period asks for "the latest", not for one particular date, so give it
+            // the latest session there is data for. CUSTOM is left exactly as asked: the user
+            // named that date, and answering with a different one would be a lie about what is
+            // on screen - an empty result is the honest reply there.
+            if (!p.equals("CUSTOM")) buyDate = latestUsableSessionOnOrBefore(buyDate);
             // No day chosen and the market is shut: price off the last completed session
             // rather than a live tick that is really just that session's close wearing
             // today's date. Gives every row a real buy date and time to show.
+            //
+            // lastSessionCloseIST() is calendar arithmetic and names a weekday whether or not it
+            // was traded or stored, so it is snapped for the same reason buyDate is.
             boolean defaultToLastSession = p.equals("NOW") && !isMarketOpen();
-            String lastSessionDay = lastSessionCloseIST().substring(0, 10);
+            String lastSessionDay = latestUsableSessionOnOrBefore(lastSessionCloseIST().substring(0, 10));
             String today = DateUtil.today();
             String buyTime = normalizeHhmm(buyTimeHHmm);
             boolean historical = !buyDate.equals(today) && !p.equals("NOW") && !p.equals("PAPER");

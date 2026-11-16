@@ -2136,7 +2136,7 @@ public class DhanHistoricalBackfillService {
         if (after >= before) return;
         if (dailyChunkDays.compareAndSet(before, after)) {
             log.warn("[Backfill] Dhan rejected {}-day daily windows {} times in a row; narrowing to "
-                   + "{} days for the rest of this run. Set dhan.history.daily.chunk.days to {} to "
+                   + "{} days for the rest of this run. Set dhan.history.batch.days to {} to "
                    + "start there next time.", before, WIDE_REJECTIONS_BEFORE_NARROWING, after, after);
         }
     }

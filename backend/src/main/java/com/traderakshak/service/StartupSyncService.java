@@ -181,6 +181,40 @@ public class StartupSyncService {
      * <p>17:00 IST: comfortably after the 15:30 close and the settlement that follows, while still
      * leaving the evening free to notice and retry if it fails.
      */
+    /**
+     * Widest gap the nightly fetch will close on its own, in days.
+     *
+     * <p>Generous because it is cheap - one 90-day window per instrument covers it either way -
+     * but not unbounded, so the size of what a nightly job can start stays predictable.
+     */
+    private static final int MAX_EOD_GAP_DAYS = 30;
+
+    /**
+     * Newest daily session actually fetched from the broker, or null if there is none.
+     *
+     * <p>Deliberately excludes the bars {@link #saveTodayDailyCandlesFromIntraday()} folds from
+     * intraday at 16:00. Those are written in DAILY mode on the same key, so counting them would
+     * make this method report today as already stored an hour before the 17:00 fetch runs - and
+     * the fetch would then conclude there was nothing to do and never replace the provisional
+     * bar with the broker's official one.
+     */
+    private String newestBrokerDailySession() {
+        try {
+            Object v = em.createNativeQuery(
+                "SELECT MAX(trade_date) FROM broker_market_candles " +
+                "WHERE (candle_mode IS NULL OR UPPER(candle_mode)='DAILY') " +
+                "AND COALESCE(data_type,'') <> ?")
+                .setParameter(1, DERIVED_DAILY_TYPE)
+                .getSingleResult();
+            if (v == null) return null;
+            String s = String.valueOf(v).trim();
+            return s.isEmpty() || "null".equalsIgnoreCase(s) ? null : s;
+        } catch (Exception e) {
+            log.debug("[Sync] Newest stored daily session lookup failed: {}", e.getMessage());
+            return null;
+        }
+    }
+
     @Scheduled(cron = "0 0 17 * * MON-FRI", zone = "Asia/Kolkata")
     public void fetchLatestCompletedDailyCandles() {
         // This asked for target, and could therefore never fetch anything. startHistoricalBackfill
@@ -192,13 +226,59 @@ public class StartupSyncService {
         // bar arrives on tomorrow's run; until then screens use the intraday fold in
         // StockTrackerService.gapSessionBars(), which already stands in for a session with no
         // daily bar and steps aside once the real one lands.
-        String target = calendar.lastCompletedTradingDay().toString();
+        java.time.LocalDate to = calendar.lastCompletedTradingDay();
+        java.time.LocalDate from = to;
+
+        // Fetch the GAP, not just the last completed day.
+        //
+        // This asked for exactly one date, so a day the application was not running for was
+        // never fetched by anything, ever - the next evening's run asked only for that next
+        // evening's day and moved on. Measured on 2026-11-16: the application was down from the
+        // 11th to the 16th, daily candles stopped at the 9th, and the 11th, 12th and 13th were
+        // simply absent. Nothing reported it, because each night's run had done exactly what it
+        // was written to do.
+        //
+        // The cost of widening this is close to zero. Since monthlyBatches() moved to fixed
+        // 90-day windows, a four-day range and a one-day range are both a single request per
+        // instrument - the gap fill is the same size as the job it replaces.
+        //
+        // Those holes do not stay harmless either. tradingDaysWithData() counts a date as a
+        // session if EITHER feed has anything on it, so the 11th still looked like a session on
+        // the strength of 394 live-feed intraday bars while holding no daily candle at all. The
+        // Previous Top 10 panels take their as-of date from that list, landed on the 11th, found
+        // nothing to reconstruct from, and went blank.
+        String newest = newestBrokerDailySession();
+        if (newest != null) {
+            try {
+                java.time.LocalDate next = java.time.LocalDate.parse(newest).plusDays(1);
+                if (next.isBefore(from)) from = next;
+            } catch (Exception e) {
+                log.debug("[Sync] Could not read newest stored daily session '{}': {}", newest, e.getMessage());
+            }
+        }
+
+        // Bound a long outage so a machine off for a year does not silently queue a year of
+        // history from a nightly job. Anything older than this is a deliberate backfill, run
+        // from Data Warehouse where its size is visible before it starts.
+        java.time.LocalDate floor = to.minusDays(MAX_EOD_GAP_DAYS);
+        if (from.isBefore(floor)) {
+            log.warn("[Sync] Daily candles are missing further back than {} days (newest stored: {}). "
+                   + "Filling {} -> {} only; run a backfill from Data Warehouse for the rest.",
+                MAX_EOD_GAP_DAYS, newest, floor, to);
+            from = floor;
+        }
+        if (from.isAfter(to)) {
+            log.debug("[Sync] Post-close daily fetch: nothing missing (newest stored {} covers {}).", newest, to);
+            return;
+        }
+
+        String target = to.toString();
         try {
             User systemUser = userRepository.findAll().stream().findFirst().orElse(null);
             if (systemUser == null) return;
             Map<String, Object> req = new LinkedHashMap<>();
             req.put("mode", "DAILY");
-            req.put("fromDate", target);
+            req.put("fromDate", from.toString());
             req.put("toDate", target);
             req.put("exchanges", "NSE");
             req.put("segments", "NSE_EQ");
@@ -206,8 +286,8 @@ public class StartupSyncService {
             req.put("scope", "ALL");
             req.put("continueOnMissingData", true);
             Map<String, Object> res = historical.startHistoricalBackfill(systemUser, req);
-            log.info("[Sync] Post-close daily fetch for {} started: {}",
-                target, res.getOrDefault("message", "queued"));
+            log.info("[Sync] Post-close daily fetch for {} -> {} started: {}",
+                from, target, res.getOrDefault("message", "queued"));
         } catch (Exception e) {
             String msg = e.getMessage() == null ? "" : e.getMessage();
             if (msg.toLowerCase(java.util.Locale.ROOT).contains("current activity")

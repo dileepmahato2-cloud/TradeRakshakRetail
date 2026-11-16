@@ -30,19 +30,32 @@ if not defined FOUND (
 :: Why this step exists: LiveCandleAggregator keeps the bar it is currently building in memory and
 :: only writes it when the bucket closes. Bars used to be 5 minutes wide, so a taskkill /F cost at
 :: most five minutes of ticks. They are now 60 minutes wide (livecandle.interval.minutes), so a
-:: forced kill at 14:50 throws away the entire 14:15 bar for every tracked symbol. taskkill WITHOUT
-:: /F sends a close request the JVM turns into an orderly shutdown, which runs the @PreDestroy
-:: flush in LiveCandleAggregator and writes the open bars out first.
+:: forced kill at 14:50 throws away the entire 14:15 bar for every tracked symbol.
 ::
-:: /F still follows, because a graceful request is a request: a wedged JVM would otherwise leave the
-:: port held and the next build unable to delete the JAR.
-echo Asking TradeRakshak to close and save open candles...
-for %%p in (%PIDS%) do taskkill /PID %%p >nul 2>&1
+:: This used to be "taskkill /PID without /F", on the understanding that this is the polite form
+:: and /F is the forced one. It is - but what it actually does is post WM_CLOSE to windows OWNED
+:: by that process, and a JVM started as "java -jar" owns none. Measured on a running instance:
+::
+::     PID 18708   MainWindowHandle : 0   MainWindowTitle : ''
+::
+:: So the request reached nothing. Every stop waited the full 15 seconds, reported the JVM as
+:: wedged and forced the kill - six times out of six in one session - and the @PreDestroy flush
+:: never ran. Closing the START window did work, because that sends CTRL_CLOSE_EVENT to the
+:: console, which is why only this path was losing candles.
+::
+:: The application now watches for this file and shuts down in an orderly way when it appears
+:: (ShutdownTriggerWatcher). No port, no endpoint, and it works whether the app was started from
+:: a console window or headlessly.
+set "TRIGGER_DIR=%~dp0runtime-tmp"
+if not exist "%TRIGGER_DIR%" mkdir "%TRIGGER_DIR%" 2>nul
+echo stop-requested> "%TRIGGER_DIR%\.shutdown"
 
-:: Give the shutdown hook time to finish its write. 15 seconds covers the flush of a full session's
-:: open bars; past that, assume it is not coming back.
+echo Asking TradeRakshak to close and save open candles...
+
+:: The watcher polls once a second, so detection costs about a second; the rest of this budget is
+:: the flush itself. 20 seconds covers a full session's open bars.
 set "CLOSED="
-for /l %%i in (1,1,15) do (
+for /l %%i in (1,1,20) do (
     if not defined CLOSED (
         ping -n 2 127.0.0.1 >nul 2>&1
         call :checkgone
@@ -50,12 +63,30 @@ for /l %%i in (1,1,15) do (
     )
 )
 
+:: Fallback for a build that predates the watcher, or one that is too wedged to poll. Harmless
+:: where the trigger already worked, because by then there is no process left to signal.
+if not defined CLOSED (
+    echo  [..] No response to the stop request - asking the process directly...
+    for %%p in (%PIDS%) do taskkill /PID %%p >nul 2>&1
+    for /l %%i in (1,1,5) do (
+        if not defined CLOSED (
+            ping -n 2 127.0.0.1 >nul 2>&1
+            call :checkgone
+            if defined GONE set "CLOSED=1"
+        )
+    )
+)
+
 if defined CLOSED (
     echo Closed cleanly - open candles were saved.
 ) else (
-    echo  [!] Still running after 15s - forcing it. An in-progress candle may be lost.
+    echo  [!] Still running - forcing it. An in-progress candle may be lost.
     for %%p in (%PIDS%) do taskkill /PID %%p /F >nul 2>&1
 )
+
+:: Always clear the trigger, whichever way the app went down. A leftover would be ignored as
+:: stale by the watcher, but removing it here keeps the runtime directory honest.
+del /q "%TRIGGER_DIR%\.shutdown" 2>nul
 
 :: Wait for the PROCESS to exit, not just for the port to close. Windows releases
 :: the listening socket before the JVM has finished shutting down, so the old

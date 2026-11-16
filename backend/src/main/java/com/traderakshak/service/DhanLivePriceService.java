@@ -515,6 +515,17 @@ public class DhanLivePriceService {
         }
         connectionStatus.set("CONNECTED");
         websocketStatus.set("OPEN");
+        // Clear the diagnosis that got us here.
+        //
+        // apiStatus and lastApiError are set on every failure path above but were never reset
+        // on success, and only pauseForMarketClose() ever cleared them - at 15:30. So a feed
+        // that failed once and then connected kept reporting the stale reason for the rest of
+        // the session: reconnecting Dhan at 09:50:31 subscribed 1,266 instruments five seconds
+        // later, while the screen went on showing "No verified Dhan Client ID and Access Token
+        // found" from the attempt that had preceded it. The banner outlived the fault, which is
+        // worse than not showing one, because it sends you to fix something that is working.
+        apiStatus.set("AUTHENTICATION_SUCCESS");
+        lastApiError.set("");
         logEvent("CONNECTED", "INFO", null, "Dhan WebSocket connected.",
             Map.of("subscribedCount", subscribed.size(), "connections", connections));
         logEvent("SUBSCRIPTION_SUCCESS", "INFO", null, "Dhan live subscription completed.",
