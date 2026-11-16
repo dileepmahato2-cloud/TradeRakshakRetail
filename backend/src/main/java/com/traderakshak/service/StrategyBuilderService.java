@@ -67,6 +67,8 @@ public class StrategyBuilderService {
             .positionSizingJson(toJson(req.get("positionSizing")))
             .multiTimeframeJson(toJson(req.get("multiTimeframe")))
             .visualJson(toJson(req.get("visualBlocks")))
+            .basePriceDate(blankToNull(req.get("basePriceDate")))
+            .basePriceTime(blankToNull(req.get("basePriceTime")))
             .stopLossPct(getDouble(req, "stopLossPct", appConfig.getDouble("strategy.default_stop_loss_pct", 5.0)))
             .targetPct(getDouble(req, "targetPct", appConfig.getDouble("strategy.default_target_pct", 10.0)))
             .rrMin(getDouble(req, "rrMin", appConfig.getDouble("strategy.default_rr_min", 2.0)))
@@ -122,6 +124,10 @@ public class StrategyBuilderService {
         existing.setEntryConditionsJson((String) req.getOrDefault("entryLogicText", existing.getEntryConditionsJson()));
         existing.setExitConditionsJson((String) req.getOrDefault("exitLogicText", existing.getExitConditionsJson()));
         existing.setRiskManagementJson(toJson(req.getOrDefault("riskManagement", null)));
+        // Blank clears the reference point and falls back to the uploaded base price, so an
+        // empty string must not be stored as one.
+        if (req.containsKey("basePriceDate")) existing.setBasePriceDate(blankToNull(req.get("basePriceDate")));
+        if (req.containsKey("basePriceTime")) existing.setBasePriceTime(blankToNull(req.get("basePriceTime")));
         existing.setStopLossPct(getDouble(req, "stopLossPct", existing.getStopLossPct() != null ? existing.getStopLossPct() : 5.0));
         existing.setTargetPct(getDouble(req, "targetPct", existing.getTargetPct() != null ? existing.getTargetPct() : 10.0));
         existing.setRrMin(getDouble(req, "rrMin", existing.getRrMin() != null ? existing.getRrMin() : 2.0));
@@ -151,11 +157,22 @@ public class StrategyBuilderService {
             conditions = parseConditionsJson(strategy.getConditionsJson());
         }
 
+        // Resolve the strategy's base price reference once for the whole universe, rather
+        // than letting each symbol fall back to whatever it was uploaded with. A strategy that
+        // sets no reference gets exactly that fallback, so nothing changes for existing ones.
+        Map<String, Double> basePrices = backtestEngine.resolveBasePrices(
+            symbols, strategy.getBasePriceDate(), strategy.getBasePriceTime());
+
         List<Map<String, Object>> results = new ArrayList<>();
 
         for (String sym : symbols) {
             try {
-                boolean pass = evaluator.evaluate(conditions, sym, "NSE", "entry");
+                Map<String, Object> data = evaluator.loadSymbolData(sym, "NSE", 200);
+                if (data == null) continue;
+                Double refBase = basePrices.get(sym);
+                if (refBase != null && refBase > 0) data.put("base_price", refBase);
+
+                boolean pass = evaluator.evaluate(conditions, data, "entry");
                 if (!pass) continue;
 
                 // Get latest data for the result row
@@ -578,6 +595,12 @@ public class StrategyBuilderService {
     }
 
     @SuppressWarnings("unchecked")
+    private static String blankToNull(Object v) {
+        if (v == null) return null;
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
+    }
+
     private List<Map<String, Object>> loadConditions(Long stratId, String group) {
         List<Object[]> rows = em.createNativeQuery(
             "SELECT condition_group, operator, indicator_left, params_left, comparator, " +
@@ -624,7 +647,8 @@ public class StrategyBuilderService {
     private Object[] getLatestData(String sym, String ex) {
         try {
             return (Object[]) em.createNativeQuery(
-                "SELECT close, prev_close, volume, delivery_pct FROM market_data " +
+                "SELECT close, prev_close, COALESCE(total_volume,volume), delivery_pct FROM broker_market_candles " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "WHERE symbol=:s AND exchange=:e ORDER BY trade_date DESC LIMIT 1")
                 .setParameter("s",sym).setParameter("e",ex).getSingleResult();
         } catch (Exception e) { return null; }

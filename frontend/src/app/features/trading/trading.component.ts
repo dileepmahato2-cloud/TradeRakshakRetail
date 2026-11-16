@@ -5,6 +5,7 @@ import { HttpClient } from '@angular/common/http';
 import { ApiService } from '../../core/services/api.service';
 import { LivePriceService } from '../../core/services/live-price.service';
 import { environment } from '../../../environments/environment';
+import { ActivatedRoute } from '@angular/router';
 import { Subscription } from 'rxjs';
 
 @Component({
@@ -188,11 +189,11 @@ import { Subscription } from 'rxjs';
           <div class="panel-title" style="margin:0">Trading Journal</div>
           <div class="actions"><input class="input" style="width:220px" [(ngModel)]="journalSearch" placeholder="Search symbol"><button class="btn" (click)="loadJournal()">Filter</button><button class="btn primary" (click)="exportJournal()">Export Excel CSV</button><button class="btn" (click)="printPage()">Print</button></div>
         </div>
-        <div class="table-wrap"><table><thead><tr><th>Date</th><th>Trade ID</th><th>Strategy</th><th>Mode</th><th>Type</th><th>Symbol</th><th>Qty</th><th>Buy</th><th>Sell</th><th>SL</th><th>Trail SL</th><th>Target</th><th>Capital</th><th>Margin</th><th>P&L</th><th>Outcome</th><th>Exit Reason</th></tr></thead><tbody>
+        <div class="table-wrap"><table><thead><tr><th>Date</th><th>Trade ID</th><th>Strategy</th><th>Mode</th><th>Type</th><th>Symbol</th><th>Qty</th><th>Buy</th><th>Sell</th><th>Current</th><th>SL</th><th>Trail SL</th><th>Target</th><th>Capital</th><th>Margin</th><th>P&L</th><th>Outcome</th><th>Exit Reason</th></tr></thead><tbody>
           @for (j of journal; track j.tradeRef + j.createdAt) {
-            <tr><td>{{ j.createdAt }}</td><td>{{ j.tradeRef }}</td><td>{{ j.strategyName }}</td><td>{{ j.tradingMode }}</td><td>{{ j.tradeType }}</td><td><strong>{{ j.symbol }}</strong></td><td>{{ j.quantity }}</td><td>{{ number(j.buyPrice) }}</td><td>{{ number(j.sellPrice) }}</td><td>{{ number(j.stopLoss) }}</td><td>{{ number(j.trailingStopLoss) }}</td><td>{{ number(j.targetPrice) }}</td><td>{{ money(j.capitalUtilized) }}</td><td>{{ j.marginUtilized }}%</td><td [style.color]="j.netProfitLoss >= 0 ? '#5eead4' : '#ff6b6b'">{{ money(j.netProfitLoss) }}</td><td><span class="chip">{{ j.outcome }}</span></td><td>{{ j.exitReason }}</td></tr>
+            <tr><td>{{ j.createdAt }}</td><td>{{ j.tradeRef }}</td><td>{{ j.strategyName }}</td><td>{{ j.tradingMode }}</td><td>{{ j.tradeType }}</td><td><strong>{{ j.symbol }}</strong></td><td>{{ j.quantity }}</td><td>{{ number(j.buyPrice) }}</td><td>{{ number(j.sellPrice) }}</td><td [title]="j.livePnl ? 'Live price - this row is still open, so P&L moves with it.' : 'Trade is closed; P&L is the realised figure.'">{{ j.livePnl ? number(j.currentPrice) : '-' }}</td><td>{{ number(j.stopLoss) }}</td><td>{{ number(j.trailingStopLoss) }}</td><td>{{ number(j.targetPrice) }}</td><td>{{ money(j.capitalUtilized) }}</td><td>{{ j.marginUtilized }}%</td><td [style.color]="j.netProfitLoss >= 0 ? '#5eead4' : '#ff6b6b'">{{ money(j.netProfitLoss) }}</td><td><span class="chip">{{ j.outcome }}</span></td><td>{{ j.exitReason }}</td></tr>
           }
-          @if (!journal.length) { <tr><td colspan="17" style="text-align:center;color:#94a3b8">No trading journal records yet.</td></tr> }
+          @if (!journal.length) { <tr><td colspan="18" style="text-align:center;color:#94a3b8">No trading journal records yet.</td></tr> }
         </tbody></table></div>
       </section>
     }
@@ -250,8 +251,13 @@ export class TradingComponent implements OnInit, OnDestroy {
   };
   private liveSub?: Subscription;
 
-  constructor(private api: ApiService, private http: HttpClient, private livePrices: LivePriceService) {}
+  constructor(private api: ApiService, private http: HttpClient, private livePrices: LivePriceService,
+              private route: ActivatedRoute) {}
   ngOnInit() {
+    // The sidebar's "Executed Trades" links straight here. Without this it landed on the
+    // trade desk and the journal it promised was one unmarked click away.
+    const tab = this.route.snapshot.queryParamMap.get('tab');
+    if (tab === 'journal' || tab === 'checklist' || tab === 'desk') this.activeTab = tab;
     this.resetChecklistForm();
     this.load();
     this.livePrices.connect();

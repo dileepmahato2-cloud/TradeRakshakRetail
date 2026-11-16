@@ -81,6 +81,27 @@ if defined PGRESTORE_EXE (
         exit /b 1
     )
 )
+:: A dump can be readable, comfortably over the size floor, and still be missing almost
+:: everything. On 2026-09-07 the 00:15 run finished in 13 seconds and wrote 56 MB where the
+:: previous good dump was 884 MB: it held 3,121,819 candle rows against 53,307,859 in the
+:: live database - 6%% of the history - and passed both existing checks, because 56 MB clears
+:: a 100 KB floor and pg_restore could list its tables perfectly well. A backup that looks
+:: healthy but restores a gutted database is the most dangerous kind.
+::
+:: So compare against the best dump already held. A real database does not lose half its
+:: size between two runs; if it has, something went wrong during the dump and the file must
+:: not be trusted just because it exists.
+set "SIZECHECK=OK"
+for /f %%Z in ('powershell -NoProfile -Command "$new=[long]!OUTSIZE!; $prev=(Get-ChildItem '%BACKUP_ROOT%\%DB_NAME%-*.dump' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne '%OUTFILE%' } | Measure-Object -Property Length -Maximum).Maximum; if(-not $prev){'OK'}elseif($new -lt ($prev/2)){'SHRUNK'}else{'OK'}"') do set "SIZECHECK=%%Z"
+if /i "!SIZECHECK!"=="SHRUNK" (
+    echo  [!] This backup is less than half the size of the largest one already held.
+    echo      That normally means pg_dump stopped early and the dump is incomplete.
+    echo      Treating this as a FAILURE. The file is kept for inspection, and the
+    echo      earlier backups have NOT been rotated away.
+    echo      If the database really did shrink, delete the older dumps by hand and re-run.
+    exit /b 1
+)
+
 echo  [OK] Backup written and verified readable: %OUTMB% MB
 
 :: Retention. Keep the newest KEEP_COUNT dumps, remove older ones so E: does not

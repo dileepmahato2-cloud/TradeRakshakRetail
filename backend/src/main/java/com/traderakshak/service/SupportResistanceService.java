@@ -31,20 +31,65 @@ public class SupportResistanceService {
     @PersistenceContext
     private EntityManager em;
 
-    // ── Index → Market-data symbol mapping ────────────────────────────────────
-    private static final Map<String, String> INDEX_SYMBOLS = Map.of(
-        "NIFTY50",   "NIFTY 50",
-        "NIFTY500",  "NIFTY 500",
-        "FINNIFTY",  "NIFTY FIN SERVICE",
-        "BANKNIFTY", "NIFTY BANK"
-    );
+    private final AppConfigService appConfig;
 
-    private static final Map<String, String> INDEX_LABELS = Map.of(
-        "NIFTY50",   "Nifty 50",
-        "NIFTY500",  "Nifty 500",
-        "FINNIFTY",  "Fin Nifty",
-        "BANKNIFTY", "Bank Nifty"
-    );
+    // ── Indices resolved from the broker instrument master ────────────────────
+    // Nothing about an index is hardcoded here. The symbol its candle is stored under and the
+    // name shown in the UI both come from Dhan's own instrument master, so a rename or a newly
+    // listed index flows through without a code change. Only WHICH indices to publish is
+    // configuration (sr.indices), expressed in the broker's own symbols. The names used before
+    // ("NIFTY 50", "NIFTY BANK", "NIFTY FIN SERVICE") appear nowhere in the master.
+    private static final String DEFAULT_INDEX_SYMBOLS = "NIFTY,BANKNIFTY,FINNIFTY,NIFTY 500";
+
+    /** One index exactly as the broker's instrument master describes it. */
+    private record IndexRef(String key, String symbol, String label) {}
+
+    /** Upper-cased, space-stripped form used as the stable API key: "NIFTY 500" -> "NIFTY500". */
+    private String indexKeyOf(String value) {
+        return value == null ? "" : value.trim().toUpperCase(Locale.ROOT).replace(" ", "");
+    }
+
+    /**
+     * Look one index up in the broker master. {@code symbol_name} is what the historical backfill
+     * stamps on every stored candle, and {@code display_name} is the broker's own label
+     * ("Nifty 50", "Nifty Bank"). If the master has not been fetched yet the key is echoed back,
+     * so the endpoint degrades to a name instead of failing.
+     */
+    @SuppressWarnings("unchecked")
+    private IndexRef resolveIndex(String indexKey) {
+        String key = indexKeyOf(indexKey);
+        if (key.isBlank()) return new IndexRef("", "", "");
+        try {
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT TRIM(symbol_name), COALESCE(NULLIF(TRIM(display_name),''), TRIM(symbol_name)) " +
+                "FROM dhan_instruments " +
+                "WHERE UPPER(COALESCE(exchange_segment,'')) IN ('NSE_I','BSE_I','IDX_I') " +
+                "AND UPPER(COALESCE(instrument,''))='INDEX' " +
+                "AND REPLACE(UPPER(TRIM(COALESCE(symbol_name,''))),' ','')=:key " +
+                "ORDER BY CASE WHEN UPPER(COALESCE(exchange_segment,''))='NSE_I' THEN 0 ELSE 1 END")
+                .setParameter("key", key)
+                .getResultList();
+            if (!rows.isEmpty()) {
+                Object[] r = rows.get(0);
+                return new IndexRef(key, String.valueOf(r[0]), String.valueOf(r[1]));
+            }
+        } catch (Exception e) {
+            log.debug("Broker index master lookup failed for {}: {}", key, e.getMessage());
+        }
+        return new IndexRef(key, indexKey, indexKey);
+    }
+
+    /** The indices to publish, in configured order, each resolved against the broker master. */
+    private List<IndexRef> configuredIndices() {
+        String configured = appConfig.getString("sr.indices", DEFAULT_INDEX_SYMBOLS);
+        if (configured == null || configured.isBlank()) configured = DEFAULT_INDEX_SYMBOLS;
+        List<IndexRef> out = new ArrayList<>();
+        for (String raw : configured.split(",")) {
+            if (raw.isBlank()) continue;
+            out.add(resolveIndex(raw));
+        }
+        return out;
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     //  PUBLIC API — compute S&R for all 4 indices
@@ -52,15 +97,21 @@ public class SupportResistanceService {
 
     public Map<String, Object> getAllIndicesSR() {
         Map<String, Object> result = new LinkedHashMap<>();
-        for (String key : List.of("NIFTY50", "BANKNIFTY", "FINNIFTY", "NIFTY500")) {
-            result.put(key, computeForIndex(key));
+        List<String> keys = new ArrayList<>();
+        for (IndexRef ref : configuredIndices()) {
+            if (ref.key().isBlank()) continue;
+            keys.add(ref.key());
+            result.put(ref.key(), computeForIndex(ref));
         }
+        // The client no longer keeps its own list of indices or their names: it renders whatever
+        // the broker master returned here, in this order, using each entry's "label".
+        result.put("indexes", keys);
         result.put("computed_at", java.time.LocalDateTime.now().toString());
         return result;
     }
 
     public Map<String, Object> getIndexSR(String indexKey) {
-        return computeForIndex(indexKey.toUpperCase());
+        return computeForIndex(resolveIndex(indexKey));
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -68,12 +119,12 @@ public class SupportResistanceService {
     // ─────────────────────────────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
-    private Map<String, Object> computeForIndex(String indexKey) {
-        String symbol  = INDEX_SYMBOLS.getOrDefault(indexKey, indexKey);
-        String label   = INDEX_LABELS.getOrDefault(indexKey, indexKey);
+    private Map<String, Object> computeForIndex(IndexRef ref) {
+        String symbol = ref.symbol();
+        String label  = ref.label();
 
         Map<String, Object> result = new LinkedHashMap<>();
-        result.put("index",  indexKey);
+        result.put("index",  ref.key());
         result.put("label",  label);
         result.put("symbol", symbol);
 
@@ -81,9 +132,10 @@ public class SupportResistanceService {
         List<Object[]> rows;
         try {
             rows = em.createNativeQuery(
-                "SELECT trade_date, open, high, low, close, volume " +
-                "FROM market_data " +
-                "WHERE exchange='NSE' AND symbol=:sym " +
+                "SELECT trade_date, open, high, low, close, COALESCE(total_volume, volume, 0) " +
+                "FROM broker_market_candles " +
+                "WHERE exchange='NSE' AND symbol=:sym AND close IS NOT NULL " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "ORDER BY trade_date DESC LIMIT 90")
                 .setParameter("sym", symbol)
                 .getResultList();
@@ -92,15 +144,19 @@ public class SupportResistanceService {
             rows = new ArrayList<>();
         }
 
-        // Also try INDEX_DATA table as fallback (Sahi app uses both)
+        // The lookup above covers equities (NSE_EQ). Indices are stored in the same table under
+        // Dhan's index segment, IDX_I, so they need their own pass. Read them there rather than
+        // keeping a second copy in index_data: that table has no writer anywhere in the codebase,
+        // so it was always empty and this fallback never returned a row.
         if (rows.isEmpty()) {
             try {
                 rows = em.createNativeQuery(
-                    "SELECT trade_date, open, high, low, close, COALESCE(volume,0) " +
-                    "FROM index_data " +
-                    "WHERE symbol=:sym " +
+                    "SELECT trade_date, open, high, low, close, COALESCE(total_volume, volume, 0) " +
+                    "FROM broker_market_candles " +
+                    "WHERE UPPER(COALESCE(candle_mode,''))='DAILY' AND exchange_segment='IDX_I' " +
+                    "AND UPPER(TRIM(COALESCE(symbol,'')))=:sym AND close IS NOT NULL " +
                     "ORDER BY trade_date DESC LIMIT 90")
-                    .setParameter("sym", symbol)
+                    .setParameter("sym", symbol.toUpperCase(Locale.ROOT).trim())
                     .getResultList();
             } catch (Exception ignored) {}
         }
@@ -144,7 +200,7 @@ public class SupportResistanceService {
         allLevels.addAll(monthlyPivotLevels(highs, lows, closes));
         allLevels.addAll(fibRetracementLevels(highs, lows, closes));
         allLevels.addAll(fractalLevels(highs, lows, closes, dates));
-        allLevels.addAll(psychologicalLevels(cmp, indexKey));
+        allLevels.addAll(psychologicalLevels(cmp, ref.key()));
         allLevels.addAll(volumeProfileLevels(closes, volumes));
 
         // ── Cluster nearby levels (Sahi logic: merge levels within 0.2% band) ──
@@ -373,16 +429,29 @@ public class SupportResistanceService {
     //     FinNifty: every 500 / 100
     //     Nifty500: every 100 / 50
     // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * Round-number spacing for an index, derived from where the index actually trades rather than
+     * from a per-index table. A round level is only meaningful relative to the index's own scale:
+     * 1,000 points is a landmark on Bank Nifty (~2%) and noise on a 200-point index. This picks the
+     * 1-2-5 ladder step nearest 2% of the current price, which reproduces the spacings that were
+     * previously hardcoded (Bank Nifty 1000, Nifty 50 and Fin Nifty 500) without naming any index,
+     * so a newly added index is spaced correctly on its first render.
+     */
+    private double roundNumberStep(double cmp) {
+        if (!(cmp > 0)) return 500;
+        double target = cmp * 0.02;
+        double[] ladder = {1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+        double best = ladder[0];
+        for (double step : ladder) {
+            if (Math.abs(step - target) < Math.abs(best - target)) best = step;
+        }
+        return best;
+    }
+
     private List<Map<String, Object>> psychologicalLevels(double cmp, String indexKey) {
         List<Map<String, Object>> levels = new ArrayList<>();
 
-        double majorStep = switch (indexKey) {
-            case "BANKNIFTY" -> 1000;
-            case "NIFTY50"   -> 500;
-            case "FINNIFTY"  -> 500;
-            case "NIFTY500"  -> 100;
-            default -> 500;
-        };
+        double majorStep = roundNumberStep(cmp);
         double minorStep = majorStep / 5.0;
 
         // Generate ±10 major levels around CMP

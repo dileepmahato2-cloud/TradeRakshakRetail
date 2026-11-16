@@ -157,7 +157,16 @@ public class GlobalExceptionHandler {
             String cn = c.getClass().getName().toLowerCase();
             if (cn.contains("clientabortexception") || cn.contains("asyncrequestnotusable")) return true;
             String msg = c.getMessage() == null ? "" : c.getMessage().toLowerCase();
-            if (msg.contains("broken pipe")
+            // "Cannot start async: [ERROR]" is the same event seen one step later. The SSE
+            // live-price stream failed, Tomcat re-dispatched the request as an ERROR, and the
+            // handler mapping sent it back to a method that returns an SseEmitter - which tries
+            // to start async on a request that is already finished. Treating it as a real fault
+            // logged a full stack trace and then failed again inside the handler itself: the
+            // response Content-Type is pinned to text/event-stream by `produces`, so the JSON
+            // error body has no converter and throws HttpMessageNotWritableException on top.
+            // Returning no body at all is both correct and quiet - the socket is already gone.
+            if (msg.contains("cannot start async")
+                    || msg.contains("broken pipe")
                     || msg.contains("connection reset")
                     || msg.contains("aborted by the software in your host machine")
                     || msg.contains("an established connection was aborted")

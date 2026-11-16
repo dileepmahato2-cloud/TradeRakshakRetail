@@ -151,7 +151,14 @@ public class BlockingHttpService {
                 boolean benignData = low.contains("dh-905") || low.contains("no data present")
                     || low.contains("missing required fields") || low.contains("incorrect parameters");
                 if (benignData) {
-                    log.warn("HTTP {} {} status {} - symbol skipped (no data / bad params).", con.getRequestMethod(), con.getURL(), code);
+                    // DEBUG, not WARN. Dhan answers DH-907 "no data present" for every delisted,
+                    // suspended or never-traded instrument in the range, so a single backfill
+                    // across ~3,000 symbols emits hundreds of these and buries everything else -
+                    // it reads like a failing job when it is a job working exactly as intended.
+                    // Nothing is lost by quieting it: the backfill writes each skip to
+                    // dhan_historical_errors with the symbol, the dates, the request body and
+                    // Dhan's own message, which is where the detail belongs anyway.
+                    log.debug("HTTP {} {} status {} - symbol skipped (no data / bad params).", con.getRequestMethod(), con.getURL(), code);
                 } else {
                     log.error("HTTP {} {} failed with status {} response={}", con.getRequestMethod(), con.getURL(), code, text);
                 }

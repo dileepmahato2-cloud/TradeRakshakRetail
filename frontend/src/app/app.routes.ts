@@ -60,6 +60,7 @@ export const routes: Routes = [
 
       // ── Strategy Builder ────────────────────────────────────────────────────
       { path: 'strategy-builder',              loadComponent: () => import('./features/strategy-builder/strategy-hub.component').then(m => m.StrategyHubComponent) },
+      { path: 'strategy-tester',               loadComponent: () => import('./features/strategy-builder/strategy-tester.component').then(m => m.StrategyTesterComponent) },
       { path: 'strategy-builder/simple',       redirectTo: 'strategy-builder', pathMatch: 'full' },
       { path: 'strategy-builder/advanced',     redirectTo: 'strategy-builder', pathMatch: 'full' },
       { path: 'strategy-builder/ai',           redirectTo: 'strategy-builder', pathMatch: 'full' },

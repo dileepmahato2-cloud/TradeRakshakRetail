@@ -23,7 +23,7 @@ public class HealthController {
         try { em.createNativeQuery("SELECT COUNT(*) FROM users").getSingleResult(); }
         catch (Exception e) { dbStatus=UserMessage.of(e, "not reachable"); score-=30; issues.add("DB:"+UserMessage.of(e)); }
         try {
-            Object ld = em.createNativeQuery("SELECT MAX(trade_date) FROM market_data").getSingleResult();
+            Object ld = em.createNativeQuery("SELECT MAX(trade_date) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'").getSingleResult();
             if (ld == null) { dataStatus="no_data"; score-=10; issues.add("No market data"); }
             else {
                 long days = DateUtil.daysBetween(ld.toString(), DateUtil.today());

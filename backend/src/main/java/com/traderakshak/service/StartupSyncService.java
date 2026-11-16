@@ -167,7 +167,7 @@ public class StartupSyncService {
      * throws: a catch-up that cannot start must not take down whatever asked for it.
      */
     /**
-     * Fetches today's DAILY candles once the session has settled.
+     * Fetches the newest DAILY candles the broker will serve, once the session has settled.
      *
      * <p>Daily bars are published by the broker only after the close, so a job run during the day
      * silently fetches nothing for today. That is exactly what happened on 2026-08-27: a daily
@@ -182,15 +182,24 @@ public class StartupSyncService {
      * leaving the evening free to notice and retry if it fails.
      */
     @Scheduled(cron = "0 0 17 * * MON-FRI", zone = "Asia/Kolkata")
-    public void fetchTodaysDailyCandles() {
-        String today = DateUtil.today();
+    public void fetchLatestCompletedDailyCandles() {
+        // This asked for target, and could therefore never fetch anything. startHistoricalBackfill
+        // refuses any range starting after lastCompletedTradingDay(), and while
+        // sync.eod.same_day_available is false - which is its default, because Dhan does not
+        // publish same-day EOD - today is never a completed day. So the call threw "Nothing to
+        // fetch" on every single run and the job silently did nothing from the day that guard
+        // was added. Ask for the last day the broker will actually serve instead. Today's own
+        // bar arrives on tomorrow's run; until then screens use the intraday fold in
+        // StockTrackerService.gapSessionBars(), which already stands in for a session with no
+        // daily bar and steps aside once the real one lands.
+        String target = calendar.lastCompletedTradingDay().toString();
         try {
             User systemUser = userRepository.findAll().stream().findFirst().orElse(null);
             if (systemUser == null) return;
             Map<String, Object> req = new LinkedHashMap<>();
             req.put("mode", "DAILY");
-            req.put("fromDate", today);
-            req.put("toDate", today);
+            req.put("fromDate", target);
+            req.put("toDate", target);
             req.put("exchanges", "NSE");
             req.put("segments", "NSE_EQ");
             req.put("instrumentFilter", "ES");
@@ -198,20 +207,142 @@ public class StartupSyncService {
             req.put("continueOnMissingData", true);
             Map<String, Object> res = historical.startHistoricalBackfill(systemUser, req);
             log.info("[Sync] Post-close daily fetch for {} started: {}",
-                today, res.getOrDefault("message", "queued"));
+                target, res.getOrDefault("message", "queued"));
         } catch (Exception e) {
             String msg = e.getMessage() == null ? "" : e.getMessage();
             if (msg.toLowerCase(java.util.Locale.ROOT).contains("current activity")
                 || msg.contains("DATA-ACTIVE")) {
-                log.info("[Sync] Post-close daily fetch skipped for {} - another job is running.", today);
+                log.info("[Sync] Post-close daily fetch skipped for {} - another job is running.", target);
             } else {
-                log.warn("[Sync] Post-close daily fetch for {} could not start: {}", today, msg);
+                log.warn("[Sync] Post-close daily fetch for {} could not start: {}", target, msg);
             }
+        }
+    }
+
+    @org.springframework.beans.factory.annotation.Value("${livecandle.interval.minutes:60}")
+    private int liveCandleIntervalMinutes;
+
+    /** Marks a daily bar this service folded itself, so it can be told apart and cleaned up. */
+    private static final String DERIVED_DAILY_TYPE = "Daily Candles (derived from intraday)";
+
+    /**
+     * Folds today's intraday candles into one daily bar per symbol, right after the close.
+     *
+     * <p>Dhan does not publish a same-day daily candle: at 22:40 IST — seven hours after the
+     * bell — every same-day request still returned DH-907 "no data present". That is why
+     * {@link MarketCalendarService#lastCompletedTradingDay()} treats today as incomplete and why
+     * {@link #fetchLatestCompletedDailyCandles()} asks for yesterday. The consequence is that
+     * today has no daily bar until tomorrow evening, and everything keyed off daily candles —
+     * previous close, 20-day volume, chart bars — sits a day behind for the whole evening.
+     *
+     * <p>The session's own intraday bars already contain the answer, so derive it instead of
+     * waiting: first open, highest high, lowest low, last close, summed volume. The row is
+     * written on the same unique key the backfill uses, so when the broker's official bar for
+     * this date arrives tomorrow it upserts straight over this provisional one.
+     *
+     * <p>16:00 IST: after {@code LiveCandleAggregator.endOfSessionFlush()} at 15:45 has written
+     * the last partial bar, and before the 17:00 broker fetch.
+     */
+    @Scheduled(cron = "0 0 16 * * MON-FRI", zone = "Asia/Kolkata")
+    public void saveTodayDailyCandlesFromIntraday() {
+        String today = calendar.today().toString();
+        if (!calendar.isTradingDay(java.time.LocalDate.parse(today))) {
+            log.debug("[Sync] {} is not a trading day; no daily fold.", today);
+            return;
+        }
+        deriveDailyCandles(today, "post-close");
+    }
+
+    /**
+     * Writes the derived daily bar for one date. Separate from the schedule so a catch-up or a
+     * manual run can reuse it.
+     *
+     * @return how many daily rows were written, or -1 if the fold could not run.
+     */
+    public int deriveDailyCandles(String tradeDate, String reason) {
+        try {
+            return new TransactionTemplate(transactionManager).execute(tx -> {
+                // GROUP BY the storage key, not the symbol: the same company can sit under two
+                // Dhan security ids, and folding them together would blend two price series.
+                int written = em.createNativeQuery(
+                    "INSERT INTO broker_market_candles(" +
+                    " broker_name,broker_security_id,exchange,exchange_segment,segment,instrument_type," +
+                    " symbol,trading_symbol,candle_mode,interval_key,interval_minutes," +
+                    " candle_time,trade_date,open,high,low,close,volume,total_volume,source,data_type," +
+                    " created_at,updated_at) " +
+                    "SELECT broker_name, broker_security_id, MAX(exchange), exchange_segment," +
+                    "       MAX(segment), MAX(instrument_type), MAX(symbol), MAX(trading_symbol)," +
+                    "       'DAILY', 0, NULL," +
+                    "       ? , ?," +
+                    "       (ARRAY_AGG(open  ORDER BY candle_time ASC ))[1]," +
+                    "       MAX(high), MIN(low)," +
+                    "       (ARRAY_AGG(close ORDER BY candle_time DESC))[1]," +
+                    "       SUM(COALESCE(volume,0)), SUM(COALESCE(total_volume, volume, 0))," +
+                    "       'DERIVED', ?, ?, ? " +
+                    "FROM broker_market_candles " +
+                    "WHERE UPPER(COALESCE(candle_mode,''))='INTRADAY' AND trade_date = ? " +
+                    "  AND close IS NOT NULL AND close > 0 " +
+                    "GROUP BY broker_name, broker_security_id, exchange_segment " +
+                    "ON CONFLICT (broker_name,broker_security_id,exchange_segment,candle_mode,interval_key,candle_time) " +
+                    "DO UPDATE SET open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low," +
+                    "              close=EXCLUDED.close, volume=EXCLUDED.volume," +
+                    "              total_volume=EXCLUDED.total_volume, updated_at=EXCLUDED.updated_at " +
+                    // Never overwrite the broker's own daily bar with a folded one. Once the
+                    // official candle for this date has landed it is the better record, and the
+                    // fold would otherwise replace it every time this ran.
+                    "WHERE broker_market_candles.source = 'DERIVED'")
+                    .setParameter(1, tradeDate + "T00:00:00")
+                    .setParameter(2, tradeDate)
+                    .setParameter(3, DERIVED_DAILY_TYPE)
+                    .setParameter(4, java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()))
+                    .setParameter(5, java.sql.Timestamp.valueOf(java.time.LocalDateTime.now()))
+                    .setParameter(6, tradeDate)
+                    .executeUpdate();
+
+                // Dhan stamps its daily candles with its own time-of-day, so the official bar for
+                // a date does not necessarily collide with the 00:00:00 key used above. Drop the
+                // folded row once a real one exists for the same instrument and date, otherwise
+                // that date ends up with two daily bars and every reader double-counts volume.
+                int cleaned = em.createNativeQuery(
+                    "DELETE FROM broker_market_candles d " +
+                    "WHERE d.source='DERIVED' AND UPPER(COALESCE(d.candle_mode,''))='DAILY' " +
+                    "  AND EXISTS (SELECT 1 FROM broker_market_candles o " +
+                    "              WHERE o.broker_security_id = d.broker_security_id " +
+                    "                AND o.exchange_segment   = d.exchange_segment " +
+                    "                AND o.trade_date         = d.trade_date " +
+                    "                AND UPPER(COALESCE(o.candle_mode,''))='DAILY' " +
+                    "                AND COALESCE(o.source,'') <> 'DERIVED')")
+                    .executeUpdate();
+
+                log.info("[Sync] Daily fold for {} ({}): {} daily bar(s) written from intraday{}.",
+                    tradeDate, reason, written,
+                    cleaned > 0 ? ", " + cleaned + " superseded by the broker's own bar" : "");
+                return written;
+            });
+        } catch (Exception e) {
+            log.warn("[Sync] Daily fold for {} failed: {}", tradeDate, e.getMessage());
+            return -1;
         }
     }
 
     public String catchUpTodayIntraday(String reason) {
         try {
+            // Ask first, rather than starting and being refused.
+            //
+            // Only one backfill may run at a time - Dhan rate-limits per user - and a full
+            // historical fetch runs for hours. The watchdog behind this call fires every two
+            // minutes, so for the whole of that time every pass threw the concurrency refusal and
+            // logged it at WARN: a three-line entry, twenty times an hour, for a system working
+            // exactly as designed. That is the noise that hides a real fault.
+            //
+            // Nothing is lost by standing down. The running job is already importing candles, and
+            // the watchdog keeps checking, so today's gap is picked up on the first pass after the
+            // backfill finishes.
+            if (historical.isAnyJobActive()) {
+                log.debug("[Sync] Intraday catch-up ({}) deferred: a Dhan backfill is still running.", reason);
+                return "A Dhan data fetch is already running. Today's missing candles will be "
+                     + "fetched automatically once it finishes.";
+            }
             User systemUser = resolveSystemUser();
             if (systemUser == null) {
                 return "Cannot fetch today's missing candles: no connected Dhan broker. "
@@ -220,7 +351,10 @@ public class StartupSyncService {
             String today = calendar.today().toString();
             Map<String, Object> req = new LinkedHashMap<>();
             req.put("mode", "INTRADAY");
-            req.put("intervalMinutes", 5);
+            // The same width LiveCandleAggregator stores. Asking for 5 while the store holds
+            // hourly bars would fill the day with a second, finer set of rows that no reader
+            // filters apart, and the intraday fold sums volume across whatever it finds.
+            req.put("intervalMinutes", liveCandleIntervalMinutes);
             req.put("fromDate", today);
             req.put("toDate", today);
             req.put("exchanges", "NSE");
@@ -243,7 +377,9 @@ public class StartupSyncService {
             // Anything unexpected still warns.
             String lower = msg.toLowerCase(java.util.Locale.ROOT);
             if (lower.contains("not a completed trading day")
-                || lower.contains("nothing to fetch")) {
+                || lower.contains("nothing to fetch")
+                // A job that started between the check above and this call. Expected, not a fault.
+                || msg.contains(DhanHistoricalBackfillService.ANOTHER_JOB_RUNNING_MARKER)) {
                 log.debug("[Sync] Intraday catch-up not needed yet: {}", msg);
             } else {
                 log.warn("[Sync] Intraday catch-up could not start: {}", msg);

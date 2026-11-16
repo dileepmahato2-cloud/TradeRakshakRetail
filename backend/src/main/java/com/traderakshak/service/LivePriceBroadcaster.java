@@ -21,6 +21,27 @@ public class LivePriceBroadcaster {
     private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
     private final AtomicLong uiUpdates = new AtomicLong();
 
+    /**
+     * Delivery runs here, never on the caller's thread.
+     *
+     * <p>SseEmitter.send writes straight down the client's socket and blocks until it drains. It
+     * was being called from the broker feed's own receive thread, so one browser that had gone
+     * away - a closed tab, a sleeping laptop - stalled market-data ingestion for the full 20-second
+     * socket timeout. Dhan then dropped the connection, the service reconnected, the same dead
+     * subscriber stalled it again: 167 disconnects between 10:23 and 11:36 on 7 Sep 2026, each
+     * one starting within seconds of the previous subscribe. The per-emitter catch below did
+     * remove the bad client, but only after the stall had already cost the feed its connection.
+     *
+     * <p>One thread with a bounded queue: a slow client can now only delay other clients' updates,
+     * never the feed. When the queue is full the update is dropped, because live prices are worth
+     * nothing late and an unbounded queue would grow without limit behind a dead socket.
+     */
+    private final java.util.concurrent.ThreadPoolExecutor delivery =
+        new java.util.concurrent.ThreadPoolExecutor(1, 1, 0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(500),
+            r -> { Thread th = new Thread(r, "sse-delivery"); th.setDaemon(true); return th; },
+            new java.util.concurrent.ThreadPoolExecutor.DiscardPolicy());
+
     public SseEmitter register() {
         SseEmitter emitter = new SseEmitter(0L);
         emitters.add(emitter);
@@ -75,13 +96,19 @@ public class LivePriceBroadcaster {
             log.debug("Live price SSE payload serialization failed: {}", e.getMessage());
             return;
         }
-        for (SseEmitter emitter : emitters) {
-            try {
-                emitter.send(SseEmitter.event().name(eventName).data(json));
-                uiUpdates.incrementAndGet();
-            } catch (Exception e) {
-                emitters.remove(emitter);
+        final String body = json;
+        // Serialisation above is cheap and stays on the caller's thread; the socket writes do not.
+        delivery.execute(() -> {
+            for (SseEmitter emitter : emitters) {
+                try {
+                    emitter.send(SseEmitter.event().name(eventName).data(body));
+                    uiUpdates.incrementAndGet();
+                } catch (Exception e) {
+                    // Gone or wedged: drop it now so it cannot hold up the next broadcast.
+                    emitters.remove(emitter);
+                    try { emitter.completeWithError(e); } catch (Exception ignored) { }
+                }
             }
-        }
+        });
     }
 }

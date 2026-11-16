@@ -379,6 +379,29 @@ if not exist "%APP_DIR%\runtime-tmp" mkdir "%APP_DIR%\runtime-tmp" 2>nul
   -jar "%JAR_FILE%"
 
 echo.
+echo.
+echo  ============================================================
+echo    Configuration this install applies
+echo  ============================================================
+echo.
+echo    Candle store: 1 hour per bar, anchored on the 09:15 open,
+echo                  so bars start 09:15 10:15 ... 15:15. This is the
+echo                  same stamping Dhan uses for its own 60-minute
+echo                  candles, so live and backfilled bars share one row.
+echo.
+echo    Trade legs:   BUY 15:15, SELL 10:15 the next trading day.
+echo                  On an existing database the first start moves these
+echo                  once, from 15:20/11:00, and records that it has done
+echo                  so - it will not overwrite times you set yourself
+echo                  afterwards. Watch for this line in the log:
+echo                    [Config] Stock Upload trade legs retimed
+echo.
+echo    Both times are bar starts. If you change either one, keep it on
+echo    the hour from 09:15 - the price lookup takes the first candle at
+echo    or after the time given, so an off-grid time silently prices off
+echo    the next bar, and anything past 15:15 matches no candle at all.
+echo  ============================================================
+echo.
 echo  ============================================================
 echo    Two things worth doing once, on this machine
 echo  ============================================================

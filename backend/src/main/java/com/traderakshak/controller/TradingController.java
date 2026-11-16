@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.traderakshak.dto.response.ApiResponse;
 import com.traderakshak.entity.User;
+import com.traderakshak.service.AppConfigService;
+import com.traderakshak.service.StockTrackerService;
 import com.traderakshak.service.BlockingHttpService;
 import com.traderakshak.service.TradingGateClient;
 import com.traderakshak.util.DateUtil;
@@ -45,11 +47,89 @@ public class TradingController {
     private final BlockingHttpService http;
     private final ObjectMapper mapper;
     private final TradingGateClient tradingGate;
+    private final AppConfigService appConfig;
+    private final StockTrackerService stockTracker;
 
-    public TradingController(BlockingHttpService http, ObjectMapper mapper, TradingGateClient tradingGate) {
+    public TradingController(BlockingHttpService http, ObjectMapper mapper, TradingGateClient tradingGate,
+                             AppConfigService appConfig, StockTrackerService stockTracker) {
         this.tradingGate = tradingGate;
         this.http = http;
         this.mapper = mapper;
+        this.appConfig = appConfig;
+        this.stockTracker = stockTracker;
+    }
+
+    /**
+     * Mark still-open journal rows to market, in memory, on every read.
+     *
+     * <p>A journal row is written once when the order goes out and never touched again - there
+     * is no UPDATE against trading_journal anywhere - so net_profit_loss stayed at the 0.00 it
+     * was inserted with and the P&amp;L column never moved, however far the price did. All ten
+     * rows from 7 Sep 2026 read INR 0 with Win Rate 0%.
+     *
+     * <p>Computed here rather than written back, because a stored P&amp;L is stale the moment
+     * the next tick lands and would have to be re-saved forever to stay honest. The stored
+     * column stays the record of what was realised; this is the live view of it.
+     *
+     * <p>Only open BUY rows are touched. A row that has a sell price is finished and keeps the
+     * realised number it was closed with.
+     */
+    private void applyLivePnl(User user, List<Map<String, Object>> rows) {
+        List<String> open = new ArrayList<>();
+        for (Map<String, Object> r : rows) {
+            if (isOpenBuy(r)) open.add(text(r.get("symbol")));
+        }
+        if (open.isEmpty()) return;
+        Map<String, Double> live;
+        try {
+            live = stockTracker.resolveCurrentPricesBatch(open, user.getInstitutionId());
+        } catch (Exception e) {
+            return;   // No feed: leave the stored numbers rather than showing invented ones.
+        }
+        for (Map<String, Object> r : rows) {
+            if (!isOpenBuy(r)) continue;
+            // Keyed the way resolveCurrentPricesBatch keys it - BOSCH-HCIL keeps its hyphen,
+            // so anything that strips punctuation here silently finds nothing.
+            Double p = live.get(stockTracker.normalizeSymbol(text(r.get("symbol"))));
+            double price = p == null ? 0 : p;
+            if (price <= 0) continue;
+            double buy = dbl(r.get("buyPrice"), 0);
+            int qty = integer(r.get("quantity"), 0);
+            r.put("currentPrice", round(price));
+            r.put("netProfitLoss", round((price - buy) * qty));
+            r.put("returnPct", buy > 0 ? round((price - buy) / buy * 100) : 0);
+            r.put("livePnl", true);
+        }
+    }
+
+    /** An order that was bought and not yet sold - the only kind with an unrealised P&amp;L. */
+    private boolean isOpenBuy(Map<String, Object> r) {
+        return "BUY".equalsIgnoreCase(text(r.get("tradeType")))
+            && dbl(r.get("buyPrice"), 0) > 0
+            && dbl(r.get("sellPrice"), 0) <= 0;
+    }
+
+    /**
+     * Fill stop loss, trailing stop and target from Application Settings when the caller did
+     * not send them.
+     *
+     * <p>"Buy All 10" on Today top 10 Ranking Stocks posts allocation and timing only - the
+     * tracker has no risk fields on screen - so {@link #orderCalculation} received no
+     * percentages and wrote 0.00 into stop_loss, trailing_stop_loss and target_price on all ten
+     * journal rows. On 7 Sep 2026 every row read 0.00 for the three of them.
+     *
+     * <p>The numbers come from trading.default_stop_loss_pct / _target_pct, which were seeded
+     * but read by nothing, so the values on the Settings screen had no effect anywhere. Reading
+     * them here keeps one place to change them rather than a constant compiled into this class.
+     * Anything the caller does send wins, so the Trading desk form is untouched.
+     */
+    private void applyDefaultRiskPercentages(Map<String, Object> req) {
+        if (dbl(req.get("stopLossPct"), 0) <= 0)
+            req.put("stopLossPct", appConfig.getDouble("trading.default_stop_loss_pct", 5.0));
+        if (dbl(req.get("targetPct"), 0) <= 0)
+            req.put("targetPct", appConfig.getDouble("trading.default_target_pct", 10.0));
+        if (dbl(req.get("trailingStopLossPct"), 0) <= 0)
+            req.put("trailingStopLossPct", appConfig.getDouble("trading.default_trailing_stop_loss_pct", 2.0));
     }
 
     @GetMapping("/dashboard")
@@ -308,6 +388,8 @@ public class TradingController {
             return ResponseEntity.badRequest().body(ApiResponse.error("TRADING-SIDE", "Side must be BUY or SELL."));
         }
         String mode = upper(req.get("mode"), "PAPER");
+        // Before anything is priced or journalled: the tracker sends no risk fields.
+        applyDefaultRiskPercentages(req);
         List<Map<String, Object>> top10 = currentTop10(user);
         List<Map<String, Object>> results = new ArrayList<>();
         int success = 0;
@@ -818,22 +900,41 @@ public class TradingController {
             for (int i = 0; i < keys.length; i++) m.put(keys[i], r[i]);
             list.add(m);
         }
+        applyLivePnl(user, list);
         return list;
     }
 
+    /**
+     * The six tiles above the journal, over the same rows the table shows.
+     *
+     * <p>These used to be six independent SQL aggregates over net_profit_loss, a column nothing
+     * ever updates, so Net P&amp;L and Win Rate read 0 next to a table of live positions. Summing
+     * the marked-to-market rows instead keeps the tiles and the rows telling the same story.
+     *
+     * <p>Win and loss are now decided by the sign of the P&amp;L rather than by the outcome text.
+     * Average Profit and Average Loss were always split that way; the rates were not, so a
+     * profitable open position counted as neither.
+     */
     private Map<String, Object> journalAnalytics(User user) {
-        long total = q("SELECT COUNT(*) FROM trading_journal WHERE user_id=" + user.getId());
-        long wins = q("SELECT COUNT(*) FROM trading_journal WHERE user_id=" + user.getId() + " AND outcome IN ('Successful Trade','Target Achieved','Order Sent')");
-        long losses = q("SELECT COUNT(*) FROM trading_journal WHERE user_id=" + user.getId() + " AND outcome IN ('Failed Trade','Stop Loss Hit')");
-        double profit = qd("SELECT COALESCE(AVG(NULLIF(net_profit_loss,0)),0) FROM trading_journal WHERE user_id=" + user.getId() + " AND net_profit_loss>0");
-        double loss = qd("SELECT COALESCE(AVG(NULLIF(net_profit_loss,0)),0) FROM trading_journal WHERE user_id=" + user.getId() + " AND net_profit_loss<0");
+        List<Map<String, Object>> rows = journalRows(user, "", "", "", 10000);
+        long total = rows.size();
+        double netPnl = 0, profitSum = 0, lossSum = 0;
+        long wins = 0, losses = 0;
+        for (Map<String, Object> r : rows) {
+            double pnl = dbl(r.get("netProfitLoss"), 0);
+            netPnl += pnl;
+            if (pnl > 0) { wins++; profitSum += pnl; }
+            else if (pnl < 0) { losses++; lossSum += pnl; }
+        }
+        double profit = wins > 0 ? profitSum / wins : 0;
+        double loss = losses > 0 ? lossSum / losses : 0;
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("totalTrades", total);
         m.put("winRate", total > 0 ? round(wins * 100.0 / total) : 0);
         m.put("lossRate", total > 0 ? round(losses * 100.0 / total) : 0);
         m.put("averageProfit", round(profit));
         m.put("averageLoss", round(loss));
-        m.put("netPnl", round(qd("SELECT COALESCE(SUM(net_profit_loss),0) FROM trading_journal WHERE user_id=" + user.getId())));
+        m.put("netPnl", round(netPnl));
         m.put("strategySuccessRate", total > 0 ? round(wins * 100.0 / total) : 0);
         m.put("riskRewardRatio", Math.abs(loss) > 0 ? round(profit / Math.abs(loss)) : 0);
         return m;

@@ -21,6 +21,17 @@ public class Strategy {
     @Column(name="trailing_sl_ph1") @Builder.Default private Double trailingSlPh1=5.0;
     @Column(name="trailing_sl_ph2") @Builder.Default private Double trailingSlPh2=15.0;
     @Column(name="holding_days") @Builder.Default private Integer holdingDays=22;
+
+    /**
+     * When the base price is taken from. Null means "use the price uploaded with the stock",
+     * which is what every strategy did before this existed.
+     *
+     * <p>base_price_date is a yyyy-MM-dd session; base_price_time an optional HH:mm within it.
+     * With a time the base is the last 5-minute candle at or before it, without one the
+     * session's close.
+     */
+    @Column(name="base_price_date") private String basePriceDate;
+    @Column(name="base_price_time") private String basePriceTime;
     @Column(name="trade_window_start") @Builder.Default private String tradeWindowStart="15:10";
     @Column(name="trade_window_end") @Builder.Default private String tradeWindowEnd="15:20";
     @Builder.Default private String universe="ALL_CASH";

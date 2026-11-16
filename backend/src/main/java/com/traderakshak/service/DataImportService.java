@@ -16,7 +16,8 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.zip.*;
+import java.util.zip.*;
+
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
 
@@ -98,19 +99,31 @@ public class DataImportService {
                         .setParameter(8,series.isEmpty()?"EQ":series).setParameter(9,"Equity")
                         .setParameter(10,actionType).setParameter(11,nowTs).setParameter(12,nowTs).executeUpdate();
 
+                    // Bhavcopy rows land in broker_market_candles, the single candle store, keyed
+                    // exactly as the Dhan backfill keys a daily candle (interval_key 0, candle_time
+                    // = trade_date at midnight). The security id is resolved from the instrument
+                    // master so an imported row UPSERTs onto the broker's row for that symbol and
+                    // date rather than becoming a second copy of it; symbols the master does not
+                    // know fall back to the symbol itself, which still dedupes across re-imports.
                     em.createNativeQuery(
-                        "INSERT INTO market_data(exchange,symbol,trade_date,open,high,low,close,prev_close,vwap,volume,total_volume,delivery_volume,delivery_pct,sector,source,segment)" +
-                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
-                        "ON CONFLICT (exchange, symbol, trade_date) DO UPDATE SET " +
+                        "INSERT INTO broker_market_candles(broker_name,broker_security_id,data_type,exchange,exchange_segment,segment," +
+                        "symbol,candle_mode,interval_key,candle_time,trade_date,open,high,low,close,prev_close,vwap," +
+                        "volume,total_volume,delivery_volume,delivery_pct,source,created_at,updated_at) " +
+                        "VALUES('dhan'," +
+                        "COALESCE((SELECT security_id FROM dhan_instruments WHERE UPPER(TRIM(COALESCE(underlying_symbol,'')))=UPPER(TRIM(?)) " +
+                        "AND exchange_segment='NSE_EQ' LIMIT 1), UPPER(TRIM(?)))," +
+                        "'Daily Bhavcopy (OHLCV)','NSE','NSE_EQ','E',?,'DAILY',0,?||'T00:00:00',?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP) " +
+                        "ON CONFLICT (broker_name, broker_security_id, exchange_segment, candle_mode, interval_key, candle_time) DO UPDATE SET " +
                         "open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, " +
                         "prev_close=EXCLUDED.prev_close, vwap=EXCLUDED.vwap, volume=EXCLUDED.volume, " +
                         "total_volume=EXCLUDED.total_volume, delivery_volume=EXCLUDED.delivery_volume, " +
-                        "delivery_pct=EXCLUDED.delivery_pct, sector=EXCLUDED.sector, source=EXCLUDED.source, segment=EXCLUDED.segment")
-                        .setParameter(1,"NSE").setParameter(2,sym).setParameter(3,tradeDate)
-                        .setParameter(4,op).setParameter(5,hi).setParameter(6,lo).setParameter(7,cl)
-                        .setParameter(8,prev).setParameter(9,Math.round(vwap*100.0)/100.0)
-                        .setParameter(10,vol).setParameter(11,vol).setParameter(12,dv).setParameter(13,dp)
-                        .setParameter(14,"Unknown").setParameter(15,source).setParameter(16,"Equity").executeUpdate();
+                        "delivery_pct=EXCLUDED.delivery_pct, source=EXCLUDED.source, updated_at=EXCLUDED.updated_at")
+                        .setParameter(1,sym).setParameter(2,sym).setParameter(3,sym)
+                        .setParameter(4,tradeDate).setParameter(5,tradeDate)
+                        .setParameter(6,op).setParameter(7,hi).setParameter(8,lo).setParameter(9,cl)
+                        .setParameter(10,prev).setParameter(11,Math.round(vwap*100.0)/100.0)
+                        .setParameter(12,vol).setParameter(13,vol).setParameter(14,dv).setParameter(15,dp)
+                        .setParameter(16,source).executeUpdate();
                     count++;
                     if (count % BATCH_FLUSH_SIZE == 0) { em.flush(); em.clear(); }
                 } catch (Exception e) { log.debug("Row parse error: {}", e.getMessage()); }
@@ -126,7 +139,7 @@ public class DataImportService {
         if (type.contains("f&o") || type.contains("derivative")) return importFoBhavcopy(csvText, fallbackDate, source);
         if (type.contains("daily") || type.contains("bhavcopy") || type.contains("ohlcv")) {
             int imported = parseEquityBhav(csvText, fallbackDate, source);
-            return result("market_data", imported);
+            return result("broker_market_candles", imported);
         }
         if (type.contains("fii") || type.contains("dii")) return importFiiDii(csvText, source);
         if (type.contains("option")) return importOptionChain(csvText, source);
@@ -331,9 +344,12 @@ public class DataImportService {
                 double traded = firstNumber(row, "traded_qty", "traded_quantity", "volume", "Quantity Traded");
                 double delivered = firstNumber(row, "deliverable_qty", "delivery_quantity", "delivery_volume", "Deliverable Quantity(gross across client level)");
                 double pct = firstNumber(row, "delivery_pct", "delivery_percent", "% of Deliverable Quantity to Traded Quantity");
+                // Delivery figures go onto the candle itself and into broker_delivery_volumes below.
                 em.createNativeQuery(
-                    "UPDATE market_data SET delivery_volume=?, delivery_pct=?, source=? WHERE symbol=? AND trade_date=?")
-                    .setParameter(1, delivered).setParameter(2, pct).setParameter(3, source).setParameter(4, symbol).setParameter(5, tradeDate).executeUpdate();
+                    "UPDATE broker_market_candles SET delivery_volume=?, delivery_pct=? " +
+                    "WHERE UPPER(TRIM(COALESCE(symbol,'')))=UPPER(TRIM(?)) AND trade_date=? " +
+                    "AND UPPER(COALESCE(candle_mode,''))='DAILY'")
+                    .setParameter(1, delivered).setParameter(2, pct).setParameter(3, symbol).setParameter(4, tradeDate).executeUpdate();
                 em.createNativeQuery(
                     "INSERT INTO broker_delivery_volumes(broker_name,exchange,symbol,trade_date,traded_quantity,delivery_quantity,delivery_pct,raw_json,created_at) " +
                     "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT (broker_name, exchange, symbol, trade_date) DO UPDATE SET " +

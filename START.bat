@@ -240,6 +240,13 @@ echo  Open browser at:  http://localhost:%APP_PORT%
 echo  Login: superadmin@traderakshak.local / Admin@123
 echo  Startup log: %APP_DIR%logs\startup.log
 echo.
+echo  Candles:    1 hour, bars start 09:15 10:15 ... 15:15 ^(livecandle.interval.minutes^)
+echo  Trade legs: BUY 15:15  ^|  SELL 10:15 the next trading day
+echo              Both times are bar starts - they must stay on the hour from 09:15,
+echo              or the price lookup finds no candle and the trade is skipped.
+echo  Stopping:   use STOP.bat, or close this window. Either way the open candle is
+echo              saved on the way out; Task Manager End-task loses up to an hour.
+echo.
 echo  ================================================================
 echo   CLOSE THIS WINDOW = STOP THE APPLICATION
 echo  ================================================================

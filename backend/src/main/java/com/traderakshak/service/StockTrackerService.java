@@ -59,12 +59,15 @@ import java.util.stream.*;
 public class StockTrackerService {
 
     private final TechnicalIndicatorEngine indicator;
+    private final MarketCalendarService    marketCalendar;
     private final ObjectMapper             mapper;
     private final BlockingHttpService      http;
     private final DhanBrokerService        dhanBrokerService;
     private final PlatformTransactionManager transactionManager;
     private final AppConfigService          appConfig;
     private final LivePriceBroadcaster      liveBroadcaster;
+    /** Append-only upload log; owns Mode A (latest per symbol) and Mode B (as-of date). */
+    private final StockUploadHistoryService uploadHistory;
 
     @PersistenceContext
     private EntityManager em;
@@ -74,6 +77,15 @@ public class StockTrackerService {
     private double getEligibleMaxReturn()    { return appConfig.getDouble("stock_upload.eligible_max_return", 5.0); }
     private int    getMaxPerSector()         { return appConfig.getInt("top10.max_per_sector", 2); }
     private int    getTopN()                 { return appConfig.getInt("top10.count", 10); }
+
+    /**
+     * How many stocks the volume shortlist keeps - the RSI 45 section holds six.
+     *
+     * <p>Separate from top10.count, which is the ranked Top 10's size. These are two different
+     * questions: how many the ranking engine promotes, and how many of a screen's matches are
+     * worth holding. Tying them together would silently resize one when the other changed.
+     */
+    private int    getShortlistCount()       { return appConfig.getInt("shortlist.count", 6); }
     private String getDhanApi()              { return appConfig.getString("broker.dhan.api_endpoint", "https://api.dhan.co/v2"); }
     private long   getScreenRefreshGapMs()   { return appConfig.getLong("system.screen_refresh_gap_ms", 45_000L); }
     private long   getMarketOpenStaleSec()   { return appConfig.getLong("system.market_open_stale_sec", 60L); }
@@ -84,11 +96,16 @@ public class StockTrackerService {
     public int     getTop10AutoRefreshInterval() { return appConfig.getInt("top10.auto_refresh.interval_sec", 300); }
     /** INTERVAL = run every N minutes while the market is open; FIXED = run at set clock times. */
     public String  getTop10RefreshMode()         { return appConfig.getString("top10.auto_refresh.mode", "INTERVAL"); }
-    /** Comma-separated HH:mm list used when the mode is FIXED, e.g. "09:20,12:00,15:20". */
-    public String  getTop10RefreshTimes()        { return appConfig.getString("top10.auto_refresh.times", "09:20,15:20"); }
+    /** Comma-separated HH:mm list used when the mode is FIXED, e.g. "09:15,12:00,15:15". */
+    public String  getTop10RefreshTimes()        { return appConfig.getString("top10.auto_refresh.times", "09:15,15:15"); }
     /** Lock one run a day as that day's official Top 10 - the list that becomes tomorrow's Previous Top 10. */
     public boolean isTop10LockEnabled()          { return appConfig.getBoolean("top10.lock.enabled", false); }
-    public String  getTop10LockTime()            { return appConfig.getString("top10.lock.time", "15:20"); }
+    // 15:15, not 15:20: the session's last ranking run is the one that becomes that day's
+    // official Top 10, and it is also the price the Previous Top 10 buys at. Buy and sell then
+    // both fall on the final run of their respective days, so a held position is measured at
+    // the same point of the session on both sides.
+    public String  getTop10LockTime()            { return appConfig.getString("top10.lock.time", "15:15"); }
+
     /**
      * Time of day the previous day's Top 10 is treated as sold when it was not sold manually.
      * Defaults to the lock time: a position opened at the 15:20 ranking and left alone is
@@ -101,17 +118,23 @@ public class StockTrackerService {
      * moment of the session.
      */
     public String  getTradeBuyTime()             { return appConfig.getString("top10.trade.buy_time", getTop10LockTime()); }
-    // Sell is its own time, not the lock time: the position is bought at the 15:20 lock and closed
-    // just before the next day's, so defaulting it to the lock time would sell five minutes late.
-    public String  getTradeSellTime()            { return appConfig.getString("top10.trade.sell_time", "15:15"); }
+    /**
+     * Time of day a held position is closed, on the NEXT trading day after the buy.
+     *
+     * <p>15:00, fifteen minutes before the 15:15 buy that opens the following day's position, so
+     * the two never contend for the same moment. "Next trading day" is taken from the sessions
+     * that actually have data, so a Friday buy closes on Monday and a buy before a holiday
+     * closes when the market next opens - the calendar is never assumed.
+     */
+    public String  getTradeSellTime()            { return appConfig.getString("top10.trade.sell_time", "10:15"); }
     /** Auto-refresh for the Previous Top 10 panel and the average-return bars beneath it. */
     public boolean isPrevTop10AutoRefreshEnabled() { return appConfig.getBoolean("prevtop10.auto_refresh.enabled", false); }
     public int     getPrevTop10AutoRefreshSec()    { return appConfig.getInt("prevtop10.auto_refresh.interval_sec", 300); }
     public boolean isPrevTop10AutoCycleEnabled() { return appConfig.getBoolean("prevtop10.auto_cycle.enabled", false); }
     public boolean isPrevTop10AutoBuyEnabled()   { return appConfig.getBoolean("prevtop10.auto_buy.enabled", false); }
     public boolean isPrevTop10AutoSellEnabled()  { return appConfig.getBoolean("prevtop10.auto_sell.enabled", false); }
-    public String  getPrevTop10BuyTime()         { return appConfig.getString("prevtop10.buy_time", "15:20"); }
-    public String  getPrevTop10SellTime()        { return appConfig.getString("prevtop10.sell_time", "09:30"); }
+    public String  getPrevTop10BuyTime()         { return appConfig.getString("prevtop10.buy_time", "15:15"); }
+    public String  getPrevTop10SellTime()        { return appConfig.getString("prevtop10.sell_time", "10:15"); }
     public String  getPrevTop10ExecutionMode()   { return appConfig.getString("prevtop10.execution_mode", "PAPER"); }
     public boolean useRealPriceIfExecuted()      { return appConfig.getBoolean("prevtop10.use_real_price_if_executed", true); }
     private String getMarketHolidaysRaw()        { return appConfig.getString("market.holidays", ""); }
@@ -169,7 +192,7 @@ public class StockTrackerService {
                 val = "LIVE".equalsIgnoreCase(val) ? "LIVE" : "PAPER";
             }
             if (cfgKey.equals("prevtop10.buy_time") || cfgKey.equals("prevtop10.sell_time")) {
-                val = normalizeHhmm(val, cfgKey.endsWith("buy_time") ? "15:20" : "09:30");
+                val = normalizeHhmm(val, cfgKey.endsWith("buy_time") ? "15:15" : "10:15");
             }
             if (cfgKey.equals("prevtop10.auto_refresh.interval_sec")) {
                 int secs;
@@ -431,67 +454,51 @@ public class StockTrackerService {
             return Map.of("success", false, "error", "No valid rows in file");
         }
 
-        // Deduplicate: keep latest date per symbol
-        Map<String, Map<String, String>> deduped = new LinkedHashMap<>();
-        int dupCount = 0;
+        // ------------------------------------------------------------------ HISTORY
+        // Every row is kept. The same symbol on three different dates is three
+        // signals, not two duplicates, and the earlier two are what every
+        // historical / backtest screen is built to read back. The only row that
+        // is NOT stored is an exact repeat of one already present (same symbol,
+        // date, market cap and sector), which carries no new information —
+        // StockUploadHistoryService enforces that with ON CONFLICT DO NOTHING.
+        UUID uploadBatchId = UUID.randomUUID();
+        List<StockUploadHistoryService.UploadRow> historyRows = new ArrayList<>();
+        int badDateCount = 0, blankSymbolCount = 0;
+
         for (Map<String, String> row : rows) {
             String sym = clean(row.get("symbol"));
-            if (sym == null || sym.isBlank()) continue;
+            if (sym == null || sym.isBlank()) { blankSymbolCount++; continue; }
             sym = sym.toUpperCase().trim();
-            Map<String, String> normalizedRow = new LinkedHashMap<>(row);
-            normalizedRow.put("symbol", sym);
-            normalizedRow.put("date", parseDate(clean(row.get("date"))));
 
-            if (deduped.containsKey(sym)) {
-                // Keep the later date
-                String existingDate = deduped.get(sym).get("date");
-                String newDate      = normalizedRow.get("date");
-                if (compareDates(newDate, existingDate) > 0) {
-                    deduped.put(sym, normalizedRow);
-                }
-                dupCount++;
-            } else {
-                deduped.put(sym, normalizedRow);
-            }
-        }
+            // Strict on purpose: entry_date decides both the base price and which
+            // appearance is a symbol's latest, so a date we cannot read is reported
+            // rather than quietly stored as today.
+            String entryDate = StockUploadHistoryService.normalizeDate(clean(row.get("date")));
+            if (entryDate == null) { badDateCount++; continue; }
 
-        // Upsert into tracked_stocks
-        int newCount = 0, failCount = 0;
-        List<String> symbolsNeedingPrice = new ArrayList<>();
-
-        for (Map.Entry<String, Map<String, String>> entry : deduped.entrySet()) {
-            String sym = entry.getKey();
-            Map<String, String> row = entry.getValue();
-            String uploadDate = parseDate(clean(row.get("date")));
             String mcap   = clean(row.getOrDefault("marketcapname", row.getOrDefault("market_cap", "Unknown")));
             String sector = clean(row.getOrDefault("sector", "Unknown"));
-
-            try {
-                int affected = em.createNativeQuery(
-                    "INSERT INTO tracked_stocks(institution_id,user_id,upload_id,symbol," +
-                    "market_cap_name,sector,upload_date,is_active,created_at,updated_at,batch_id,is_deleted) " +
-                    "VALUES(?,?,?,?,?,?,?,1,?,?,?,0) " +
-                    "ON CONFLICT(institution_id,symbol) DO UPDATE SET " +
-                    "upload_id=excluded.upload_id, upload_date=excluded.upload_date, " +
-                    "market_cap_name=excluded.market_cap_name, sector=excluded.sector, " +
-                    "base_price=NULL, base_price_source=NULL, return_pct=0, is_active=1, " +
-                    "batch_id=excluded.batch_id, is_deleted=0, deleted_at=NULL, deleted_by=NULL, delete_type=NULL, " +
-                    "updated_at=excluded.updated_at")
-                    .setParameter(1, institutionId).setParameter(2, userId)
-                    .setParameter(3, uploadId).setParameter(4, sym)
-                    .setParameter(5, mcap).setParameter(6, sector)
-                    .setParameter(7, uploadDate).setParameter(8, DateUtil.now())
-                    .setParameter(9, DateUtil.now()).setParameter(10, batchId)
-                    .executeUpdate();
-                if (affected > 0) {
-                    newCount++;
-                    symbolsNeedingPrice.add(sym);
-                }
-            } catch (Exception e) {
-                failCount++;
-                log.debug("Insert tracked_stock {}: {}", sym, e.getMessage());
-            }
+            historyRows.add(new StockUploadHistoryService.UploadRow(sym, entryDate, mcap, sector));
         }
+
+        StockUploadHistoryService.RecordResult recorded =
+            uploadHistory.recordUpload(uploadBatchId, fileName, historyRows, userId, institutionId);
+
+        // ------------------------------------------------------------------ MODE A PROJECTION
+        // tracked_stocks is what every current-state screen reads, so it is
+        // rebuilt from the history as "latest entry_date per symbol". Sourcing it
+        // from the log rather than from this file's rows is what stops an upload
+        // of an OLDER date from dragging a symbol backwards.
+        int newCount  = recorded.inserted();
+        int dupCount  = recorded.duplicates();
+        int failCount = recorded.failed() + badDateCount + blankSymbolCount;
+        List<String> symbolsNeedingPrice =
+            uploadHistory.syncTrackedStocks(recorded.symbols(), uploadId, batchId, userId, institutionId);
+
+        // Price the new history rows off whatever candles are already stored. The Dhan job below
+        // only runs for symbols whose CURRENT row lost its base price, so an upload that adds only
+        // older dates would otherwise leave those rows unpriced until the next recovery tick.
+        uploadHistory.backfillBasePrices(institutionId);
 
         // Update upload record
         try {
@@ -521,16 +528,22 @@ public class StockTrackerService {
 
         auditLog(institutionId, userId, "STOCK_UPLOAD",
             "upload", uploadId,
-            Map.of("file", fileName, "total", rows.size(), "new", newCount, "dups", dupCount));
+            Map.of("file", fileName, "total", rows.size(), "new", newCount, "dups", dupCount,
+                   "upload_batch_id", uploadBatchId.toString()));
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("success", true);
         result.put("upload_id", uploadId);
         result.put("batch_id", batchId);
+        result.put("upload_batch_id", uploadBatchId.toString());
         result.put("total_rows", rows.size());
         result.put("new_records", newCount);
         result.put("duplicates", dupCount);
         result.put("failed", failCount);
+        // Broken out so a file with a bad Date column is visibly rejected rather
+        // than silently landing on today's date.
+        result.put("invalid_date_rows", badDateCount);
+        result.put("blank_symbol_rows", blankSymbolCount);
         result.put("processed_symbols", symbolsNeedingPrice);
         if (jobId != null) result.put("job_id", jobId);
         result.put("message", "Upload successful. Fetching Dhan upload-date closing prices in background...");
@@ -567,7 +580,20 @@ public class StockTrackerService {
                 }
                 if (job != null) { job.totalRecords = savedUpdated + remainingSymbols.size(); job.updateProgress(); }
 
-                Optional<DhanBrokerService.Credential> credential = findVerifiedDhanCredential(userId, institutionId);
+                // A historical backfill is already saturating Dhan's rate limit. Adding this job's
+            // per-symbol history calls on top produced nothing but HTTP 429s from both - the
+            // backfill on /charts/intraday and this on /charts/historical, each retrying and each
+            // making the other worse. Stored candles have already been tried above; the broker
+            // leg can wait for the next Refresh Prices.
+            if (isHistoricalBackfillRunning()) {
+                log.warn("[BasePrice] {} stock(s) still need a broker lookup, but a historical "
+                       + "backfill is running and Dhan is rate limiting. Skipping the broker leg - "
+                       + "press Refresh - Live Price once the backfill finishes.", remainingSymbols.size());
+                if (job != null) { job.status = "COMPLETED"; job.errorMessage = "Deferred: backfill running"; job.updateProgress(); }
+                return;
+            }
+
+            Optional<DhanBrokerService.Credential> credential = findVerifiedDhanCredential(userId, institutionId);
                 if (credential.isEmpty()) {
                     for (String symbol : remainingSymbols) {
                         markBasePriceError(symbol, institutionId, "DHAN_ERROR: verified Dhan broker token required for base price.");
@@ -591,6 +617,16 @@ public class StockTrackerService {
                 if (!ltpBatchSymbols.isEmpty()) {
                     int ltpUpdated = batchUpdateCurrentPrices(ltpBatchSymbols, ltpBatchPrices, institutionId);
                     log.info("Batch quote: {}/{} symbols got current price", ltpUpdated, symbols.size());
+                } else if (!symbols.isEmpty()) {
+                    // The silent branch. With no usable LTP this block simply did nothing and the
+                    // refresh went on to report its timing as though it had updated prices, so
+                    // "current price is not updating" had no corresponding line anywhere in the
+                    // log. Current prices keep their previous values - which is why the screen
+                    // showed a stale price rather than a blank one.
+                    log.warn("[Refresh] No current price could be updated for any of {} stock(s): "
+                           + "the broker returned no usable quote. Existing prices are left as "
+                           + "they were, so the screen keeps showing the last good value.",
+                        symbols.size());
                 }
 
                 Map<String, DhanInstrumentRef> refs = resolveDhanInstruments(remainingSymbols);
@@ -598,6 +634,7 @@ public class StockTrackerService {
                 List<Double> batchPrices = new ArrayList<>();
                 List<String> batchSources = new ArrayList<>();
                 int batchFlushSize = appConfig.getInt("upload.batch_flush_size", 500);
+                long lastBackfillCheckMs = System.currentTimeMillis();
 
                 for (String symbol : remainingSymbols) {
                     if (job != null && job.cancelRequested) {
@@ -619,6 +656,21 @@ public class StockTrackerService {
                         }
                     }
                     if (job != null && job.cancelRequested) break;
+                    // The backfill-running guard above runs once, before this loop - and this
+                    // loop can walk 966 symbols, one broker call each. On 2026-11-10 a backfill
+                    // started while it was part-way through, so both were on /charts/historical
+                    // at the same time and Dhan rate-limited every request from both. Re-check
+                    // as we go, but cheaply: a COUNT at most twice a minute, not once per symbol.
+                    long nowMs = System.currentTimeMillis();
+                    if (nowMs - lastBackfillCheckMs > 30_000L) {
+                        lastBackfillCheckMs = nowMs;
+                        if (isHistoricalBackfillRunning()) {
+                            log.warn("[BasePrice] Stopping the broker leg at {}: a historical backfill "
+                                   + "has started and Dhan rate-limits per user. Press Refresh - Live "
+                                   + "Price once it finishes.", symbol);
+                            break;
+                        }
+                    }
                     String normalized = normalizeSymbol(symbol);
                     if (!processedSymbols.add(normalized)) {
                         if (job != null) { job.skippedRecords.incrementAndGet(); job.updateProgress(); }
@@ -760,13 +812,44 @@ public class StockTrackerService {
                 JsonNode data = root.path("data");
                 if (data.isMissingNode() || data.isNull()) data = root;
 
+                int usable = 0;
                 for (DhanInstrumentRef ref : batch) {
                     String segment = normalizeDhanExchangeSegment(ref.exchangeSegment);
                     JsonNode quote = data.path(segment).path(ref.securityId);
                     double ltp = firstNumber(quote, "last_price", "ltp", "LTP", "lastPrice");
                     double close = firstNumber(quote.path("ohlc"), "close", "prev_close");
                     if (close <= 0) close = firstNumber(quote, "close", "prev_close");
-                    result.put(normalizeSymbol(ref.symbol), new double[]{ltp, close});
+                    // Only record a quote that actually carries a price.
+                    //
+                    // This used to put every instrument in the map whatever came back, so a
+                    // response with no quotes in it still produced 1,271 entries of {0,0} and the
+                    // summary below reported "fetched 1271/1271". The caller then dropped all of
+                    // them on its own ltp > 0 test and never called batchUpdateCurrentPrices, so
+                    // prices silently stopped moving while every log line said the refresh had
+                    // worked. Counting only usable quotes makes that visible instead.
+                    if (ltp > 0 || close > 0) {
+                        result.put(normalizeSymbol(ref.symbol), new double[]{ltp, close});
+                        usable++;
+                    }
+                }
+                if (usable == 0) {
+                    // The one piece of information needed to diagnose this was being discarded.
+                    //
+                    // Observed 2026-11-01 onwards: every call returned HTTP 200 with a 41-byte
+                    // body - {"status":"success","data":{"NSE_EQ":{}}} - so it is neither a token
+                    // failure (401/DH-901) nor a rate limit (DH-904), both of which are handled
+                    // below. The request succeeded and carried no quotes. Meanwhile the same
+                    // token kept importing candles from /charts/historical perfectly well, which
+                    // is the signature of a live-market-data entitlement problem rather than a
+                    // broken credential, because Dhan sells live quotes separately from history.
+                    log.warn("[Refresh] Dhan /marketfeed/quote returned no usable price for any of "
+                           + "{} instrument(s). The call succeeded, so this is not a token or "
+                           + "rate-limit error - the response carried no quotes. Check the Dhan "
+                           + "Data API (live market feed) subscription on the broker account; "
+                           + "historical candles use a different entitlement and keep working. "
+                           + "Response was: {}",
+                        batch.size(), json == null ? "(empty)"
+                            : json.length() > 400 ? json.substring(0, 400) + "..." : json);
                 }
             } catch (Exception e) {
                 if (isDhanAuthenticationError(e.getMessage())) {
@@ -821,10 +904,115 @@ public class StockTrackerService {
         log.info("Flushed base price batch: {} symbols in single transaction", symbols.size());
     }
 
+    /**
+     * Oldest stored close still allowed to stand in for a current price, in days.
+     *
+     * <p>A close from last quarter is not a current price by any reading, and silently presenting
+     * one would trade a visible staleness problem for an invisible one. Past this age the row is
+     * left alone: it keeps whatever it had, and the Last Update column goes on reporting that
+     * value's real session date, which is the honest outcome.
+     */
+    private static final int CLOSE_FALLBACK_MAX_AGE_DAYS = 30;
+
+    /**
+     * Fills current_price from the newest stored daily close wherever no live quote is available.
+     *
+     * <p>current_price is written only by the two live paths - the REST quote endpoint and the
+     * WebSocket feed - so when the live feed stops, the column freezes at whatever it last held
+     * and the screen presents that figure as current indefinitely. Measured on 2026-11-11, nine
+     * days after the feed went silent: 3MINDIA displayed 28,990, the 2026-10-30 close captured by
+     * the last successful fetch on 2026-11-01, while the newest stored session - Monday
+     * 2026-11-09 - closed at 28,070. The screen was 920 points, 3.3%, above the real level, and
+     * carried that error into the return it showed, -12.98% against a true figure near -15.9%.
+     * The correct number was already in broker_market_candles the whole time; nothing read it.
+     *
+     * <p>So this is not a new source of data, it is the data already fetched being allowed to
+     * reach the screen. The row records where the price came from - BROKER_DAILY_CLOSE, with
+     * current_price_date set to that candle's own session - so a close is never passed off as a
+     * live tick, and the Last Update column names the session the number belongs to.
+     *
+     * <p>Three guards keep it from ever degrading a better price:
+     * <ul>
+     *   <li>it only writes where the stored session is strictly newer than the row's own
+     *       current_price_date, so a live quote from today is never replaced by yesterday's
+     *       close, whatever order the two run in;</li>
+     *   <li>it also writes where current_price is missing or zero, since any dated close beats
+     *       no price at all;</li>
+     *   <li>it ignores candles older than {@link #CLOSE_FALLBACK_MAX_AGE_DAYS}, which also
+     *       bounds the scan to recent rows rather than the whole candle table.</li>
+     * </ul>
+     *
+     * <p>One statement for every symbol, joined on the normalised symbol the way the rest of this
+     * class matches tracked stocks to candles. DISTINCT ON picks each symbol's latest session.
+     *
+     * <p>It also resolves the two rows that looked like unadjusted corporate actions. GNRL and
+     * CONCORDBIO sat exactly 10x and 2x away from their stored closes, which reads as a split
+     * missing from the candle history - but the scale error was in the frozen quote, not in the
+     * candles. GNRL's base price is 9.62 and its stored close 11.79, consistent with each other;
+     * it was the stale current_price of 96.23 that was off by a factor of ten, which is what
+     * produced the +900% return on the screen. CONCORDBIO is the same shape: base 604.95, stored
+     * close 596.80, frozen quote 1245.60, and a reported +105.9% that becomes -1.35%. Because
+     * base prices are themselves derived from these candles, pricing both sides from one source
+     * makes the two agree by construction.
+     *
+     * @return the number of rows filled from a stored close
+     */
+    private int fillCurrentPriceFromStoredClose(Long institutionId) {
+        String now = DateUtil.now();
+        String floor = java.time.LocalDate.now(IST).minusDays(CLOSE_FALLBACK_MAX_AGE_DAYS).toString();
+        String candleKey = normalizedSql("c.symbol");
+        String trackedKey = normalizedSql("t.symbol");
+        final int[] filled = {0};
+        try {
+            runInTransaction(() -> {
+                int rows = em.createNativeQuery(
+                    "UPDATE tracked_stocks t SET " +
+                    "current_price=s.close_price, last_traded_price=s.close_price, " +
+                    "current_price_source='BROKER_DAILY_CLOSE', current_price_date=s.trade_date, " +
+                    "price_updated_at=?, last_refreshed=?, updated_at=?, " +
+                    "return_pct=CASE WHEN t.base_price IS NOT NULL AND t.base_price>0 " +
+                    "THEN ((s.close_price - t.base_price)/t.base_price)*100 ELSE 0 END " +
+                    "FROM (SELECT DISTINCT ON (" + candleKey + ") " + candleKey + " AS key, " +
+                    "c.close AS close_price, c.trade_date AS trade_date " +
+                    "FROM broker_market_candles c " +
+                    "WHERE c.close IS NOT NULL AND c.close>0 AND c.trade_date>=? " +
+                    "AND (c.candle_mode IS NULL OR UPPER(c.candle_mode)='DAILY') " +
+                    "ORDER BY " + candleKey + ", c.trade_date DESC) s " +
+                    "WHERE " + trackedKey + "=s.key AND t.institution_id=? AND t.is_active=1 " +
+                    "AND COALESCE(t.is_deleted,0)=0 " +
+                    "AND (t.current_price_date IS NULL OR t.current_price_date='' " +
+                    "     OR t.current_price_date < s.trade_date " +
+                    "     OR t.current_price IS NULL OR t.current_price<=0)")
+                    .setParameter(1, now)
+                    .setParameter(2, now)
+                    .setParameter(3, now)
+                    .setParameter(4, floor)
+                    .setParameter(5, institutionId)
+                    .executeUpdate();
+                filled[0] = rows;
+            });
+            if (filled[0] > 0) {
+                log.info("[Refresh] {} stock(s) filled from the most recent stored daily close "
+                       + "(no live quote available). Source recorded as BROKER_DAILY_CLOSE with "
+                       + "that session's date, so the screen shows which session each price is from.",
+                    filled[0]);
+            }
+        } catch (Exception e) {
+            // A fallback that cannot run must not fail the refresh - the live path's own result
+            // still stands, and the rows simply keep the values they had.
+            log.warn("[Refresh] Could not fill current price from stored closes: {}", safeError(e.getMessage()));
+            return 0;
+        }
+        return filled[0];
+    }
+
     private int batchUpdateCurrentPrices(List<String> symbols, List<Double> prices, Long institutionId) {
         if (symbols.isEmpty()) return 0;
         String now = DateUtil.now();
-        String today = DateUtil.today();
+        // The session the price belongs to, not the day this thread runs on - see
+        // priceSessionDate(). Named "today" when it was DateUtil.today(), which is precisely how
+        // a Sunday ended up stamped on every row.
+        String session = priceSessionDate();
         final int[] updated = {0};
         runInTransaction(() -> {
             for (int i = 0; i < symbols.size(); i++) {
@@ -841,7 +1029,7 @@ public class StockTrackerService {
                     .setParameter(2, prices.get(i))
                     .setParameter(3, now)
                     .setParameter(4, prices.get(i))
-                    .setParameter(5, today)
+                    .setParameter(5, session)
                     .setParameter(6, now)
                     .setParameter(7, now)
                     .setParameter(8, normalized)
@@ -1079,6 +1267,7 @@ public class StockTrackerService {
     public void scheduledPriceRefresh() {
         java.time.ZonedDateTime tickNow = java.time.ZonedDateTime.now(IST);
         backfillMissedTop10Locks();
+        recoverMissingBasePrices();
         boolean lockThisTick = isTop10LockTick(tickNow);
         // The lock minute always runs, whatever the interval works out to - the whole point
         // is that the locked list is the one priced at exactly that time.
@@ -1141,6 +1330,106 @@ public class StockTrackerService {
      * the cut-off: today is left to the live path, which is the only one that can freeze a list at
      * the moment it actually mattered.
      */
+    /**
+     * When the base-price recovery last did any work. Not a one-shot flag.
+     *
+     * <p>It was a boolean, set on the first pass and never cleared - which meant the recovery
+     * protected against exactly one wipe per application run and then stood down. That is the
+     * wrong shape: an upload clears base_price EVERY time it runs, so a second upload in the same
+     * session left all 1,232 stocks empty with the guard already spent, the ranking loading 0 rows
+     * and every screen that depends on it blank. Exactly that happened - a 12:41 upload was
+     * recovered, and the 20:40 upload was not.
+     */
+    private volatile long lastBasePriceRecoveryMs = 0;
+
+    /**
+     * Refills base prices that an interrupted upload left empty.
+     *
+     * <p>A CSV upload deliberately clears base_price - a new upload date means a new base price,
+     * so the old one has to go and be re-derived. The refill then runs on a background worker.
+     * That worker does not survive the process: an application restart, a crash or a power cut
+     * part-way through leaves the remaining stocks with base_price NULL and nothing to resume
+     * them. It happened here - an upload at 12:41 was refilling when the application was
+     * restarted two minutes later, and all 1,232 tracked stocks were left without a base price.
+     *
+     * <p>That is not a cosmetic gap. Base price is half of the ranking entry test
+     * (Current Price &gt;= Base Price), so with it empty the ranking has no candidates at all and
+     * Today Top 10 silently falls back to the last stored run - showing yesterday's answer as
+     * though it were today's.
+     *
+     * <p>Only the local pass runs here: base prices are read from candles already stored, which is
+     * an indexed lookup per symbol and needs no broker call. Stocks that genuinely have no candle
+     * on or before their upload date are left for the explicit Refresh Prices action, which is
+     * allowed to spend Dhan requests. That keeps startup cheap and cannot trip a rate limit.
+     *
+     * <p>Driven from the per-minute scheduler rather than ApplicationReadyEvent, for the reason
+     * documented on {@link #backfillMissedTop10Locks()}: on the ready event the configuration
+     * cache is not populated yet. One pass per run.
+     */
+    public void recoverMissingBasePrices() {
+        try {
+            // Cheap indexed count first: on a healthy system this is the only work done, so the
+            // check can run on every tick without costing anything.
+            List<String> missing = getSymbolsMissingBasePrice(1L);
+            if (missing.isEmpty()) return;
+
+            // Something IS missing. Throttle the repair itself so a genuinely unresolvable set -
+            // the three symbols Dhan does not list, for instance - cannot turn into a refill
+            // attempt every single minute.
+            long now = System.currentTimeMillis();
+            if (now - lastBasePriceRecoveryMs < 120_000L) return;
+            lastBasePriceRecoveryMs = now;
+
+            long started = now;
+            int fixed = backfillBasePricesFromSavedMarketData(missing, 1L);
+            int stillMissing = getSymbolsMissingBasePrice(1L).size();
+
+            if (fixed > 0) {
+                log.info("[BasePriceRecovery] Refilled {} of {} stock(s) from stored daily candles "
+                       + "in {} ms. {} still without a base price - use Refresh Prices to fetch "
+                       + "those from the broker.",
+                    fixed, missing.size(), System.currentTimeMillis() - started, stillMissing);
+            } else if (shouldReportUnresolvedBasePrices(missing.size())) {
+                log.warn("[BasePriceRecovery] {} stock(s) have no base price and none could be "
+                       + "resolved from stored candles. Their upload dates are likely outside the "
+                       + "stored candle range - use Refresh Prices, or fetch that period first.",
+                    missing.size());
+            } else {
+                log.debug("[BasePriceRecovery] {} stock(s) still unresolved (already reported).",
+                    missing.size());
+            }
+        } catch (Exception e) {
+            // Never let this stop the tick that also refreshes prices and rebuilds the Top 10.
+            log.warn("[BasePriceRecovery] Could not run: {}", e.getMessage());
+        }
+    }
+
+    /** Size of the unresolvable set the last WARN described, and when it was written. */
+    private volatile int lastUnresolvedBasePriceCount = -1;
+    private volatile long lastUnresolvedBasePriceWarnMs = 0;
+    private static final long UNRESOLVED_WARN_REPEAT_MS = 30 * 60_000L;
+
+    /**
+     * Whether an unresolvable base-price set is worth another WARN.
+     *
+     * <p>The repair runs every two minutes, and a set it cannot resolve - stocks whose upload date
+     * sits outside the stored candle range, which is the normal state while a backfill is still
+     * working towards those months - stays unresolvable for hours. Warning on every pass turned
+     * one standing condition into thirty log entries an hour.
+     *
+     * <p>Report it when the number changes, since that is new information, and otherwise repeat it
+     * at most every half hour so a persistent gap is still visible to anyone reading the log.
+     */
+    private synchronized boolean shouldReportUnresolvedBasePrices(int count) {
+        long now = System.currentTimeMillis();
+        boolean changed = count != lastUnresolvedBasePriceCount;
+        boolean stale = now - lastUnresolvedBasePriceWarnMs >= UNRESOLVED_WARN_REPEAT_MS;
+        if (!changed && !stale) return false;
+        lastUnresolvedBasePriceCount = count;
+        lastUnresolvedBasePriceWarnMs = now;
+        return true;
+    }
+
     private volatile boolean lockBackfillDone = false;
 
     public void backfillMissedTop10Locks() {
@@ -1377,6 +1666,49 @@ public class StockTrackerService {
         try {
             for (String m : modules) liveBroadcaster.sendModuleRefresh(m);
         } catch (Exception ignored) {}
+    }
+
+    /**
+     * Keeps current_price level with the newest stored close, on its own schedule.
+     *
+     * <p>{@link #fillCurrentPriceFromStoredClose} was originally reachable only from
+     * {@link #refreshAllPrices}, which is the wrong gate for it: that method exists to call the
+     * broker, so everything that calls it is scheduled around market hours and a live token.
+     * {@link #scheduledPriceRefresh} returns early via isTop10RunDue, which refuses outside
+     * 09:15-15:30 IST; the startup path is off whenever sync.enabled=false; the remaining trigger
+     * is a 15:35 MON-FRI cron. Between a close and the next open - and right through weekends and
+     * holidays - nothing ran, so the screen kept showing whatever the last live fetch left behind.
+     * Measured 2026-11-11 08:15 IST, with Monday's closes already stored: 3MINDIA still displayed
+     * 28,990 from 2026-10-30 because no tick was due for another hour.
+     *
+     * <p>Filling from a stored close needs none of that. There is no broker call, no token and no
+     * rate limit - it is one statement over rows already fetched, so it can run whenever the
+     * candle table has something newer than the screen, which is precisely when the market is
+     * shut. That is also when a stale price is least likely to be noticed and most likely to be
+     * acted on, since the figure stops moving and so stops looking suspect.
+     *
+     * <p>Safe to run on any tick. The statement only writes where the stored session is newer
+     * than the row's own current_price_date, so during market hours, when live quotes carry the
+     * current session, it matches nothing and writes nothing; once it has filled a session it
+     * will not fill it again. It stands aside during a historical backfill for the same reason
+     * {@link #scheduledPriceRefresh} does - the two would contend for the same tables - and while
+     * a live refresh is mid-flight, to keep their writes off each other's locks.
+     */
+    @Scheduled(fixedDelay = 300_000L, initialDelay = 30_000L)
+    public void scheduledStoredCloseFill() {
+        if (priceRefreshInProgress.get()) {
+            log.debug("[Refresh] Stored-close fill skipped: a live price refresh is running.");
+            return;
+        }
+        if (isHistoricalBackfillRunning()) {
+            log.debug("[Refresh] Stored-close fill skipped: a historical backfill is running.");
+            return;
+        }
+        try {
+            fillCurrentPriceFromStoredClose(1L);
+        } catch (Exception e) {
+            log.warn("[Refresh] Stored-close fill tick failed: {}", safeError(e.getMessage()));
+        }
     }
 
     /** Post-market EOD refresh at 15:35 IST */
@@ -1694,6 +2026,18 @@ public class StockTrackerService {
             String currentPriceDate = asText(r[3]);
             if (latest.isBlank()) return true;
             if (isMarketOpen() && !DateUtil.today().equals(normalizeStoredDate(currentPriceDate))) return true;
+
+            // Outside a session, stored prices that already match the newest session are not
+            // stale - they are final. Ageing them out after fifteen minutes meant every screen
+            // load through the evening, the weekend and every holiday fired a full Dhan refresh
+            // to fetch numbers that cannot have changed. Age only means something while the
+            // market can still move the price.
+            if (!isMarketOpen()) {
+                String stored = normalizeStoredDate(currentPriceDate);
+                String newest = lastTradedAtIST();
+                String newestDay = newest == null || newest.length() < 10 ? null : newest.substring(0, 10);
+                if (stored != null && stored.equals(newestDay)) return false;
+            }
             java.time.LocalDateTime updated = parseDateTime(latest);
             if (updated == null) return true;
             long age = java.time.Duration.between(updated, java.time.LocalDateTime.now(IST)).getSeconds();
@@ -1731,6 +2075,16 @@ public class StockTrackerService {
         DhanPriceRefreshOutcome dhanOutcome = refreshPricesFromDhan(symbols, triggeredBy, institutionId);
         long tDhanMs = System.currentTimeMillis() - tDhan0;
         updated += dhanOutcome.updated;
+
+        // Whatever the live feed could not price, price from the newest stored close.
+        //
+        // Runs after the live path and never against it: the statement only touches rows whose
+        // stored session is newer than what they already hold, so a live quote always wins. It
+        // runs on every refresh rather than only when the feed is down, because a feed that
+        // returns some symbols and not others leaves exactly the same hole for the rest.
+        int closeFallbackUpdated = fillCurrentPriceFromStoredClose(institutionId);
+        updated += closeFallbackUpdated;
+
         failed = Math.max(0, symbols.size() - updated);
         List<String> missingBasePrices = getSymbolsMissingBasePrice(triggeredBy, institutionId);
         if (!missingBasePrices.isEmpty()) {
@@ -1741,6 +2095,11 @@ public class StockTrackerService {
         long tSnap0 = System.currentTimeMillis();
         runInTransaction(() -> storeDailyPriceSnapshot(institutionId));
         long tSnapMs = System.currentTimeMillis() - tSnap0;
+
+        // Prices have just moved, so the memoised candidate set is now wrong. Dropping it here -
+        // before the ranking engine runs - means the ranking recomputes against the new prices and
+        // the panels then share that fresh result instead of each rebuilding it.
+        invalidateCandidateCache();
 
         // Recalculate rankings for the same user scope that triggered the refresh (own transaction)
         long tRank0 = System.currentTimeMillis();
@@ -1764,11 +2123,17 @@ public class StockTrackerService {
         result.put("source", "Dhan LTP");
         result.put("dhan_connected", dhanOutcome.connected);
         result.put("dhan_updated", dhanOutcome.updated);
-        result.put("fallback_updated", 0);
+        result.put("fallback_updated", closeFallbackUpdated);
         result.put("dhan_missing_instruments", dhanOutcome.missingInstruments);
         result.put("dhan_api_calls", dhanOutcome.apiCalls);
         result.put("base_price_retry_started", missingBasePrices.size());
-        result.put("message", dhanOutcome.message);
+        String message = dhanOutcome.message;
+        if (closeFallbackUpdated > 0) {
+            message = message + " " + closeFallbackUpdated + " stock(s) were filled from their "
+                + "most recent stored closing price instead, each shown with the date of the "
+                + "session it came from.";
+        }
+        result.put("message", message);
         return result;
         } finally {
             priceRefreshInProgress.set(false);
@@ -1824,9 +2189,21 @@ public class StockTrackerService {
         }
 
         if (outcome.message.isBlank()) {
-            outcome.message = outcome.updated > 0
-                ? "Dhan LTP refreshed live prices. Unmapped or failed symbols were not updated."
-                : "Dhan is connected, but no live prices were returned.";
+            if (outcome.updated > 0) {
+                outcome.message = "Dhan LTP refreshed live prices. Unmapped or failed symbols were not updated.";
+            } else if (outcome.emptyQuoteBatches > 0) {
+                // "no live prices were returned" was true but gave nothing to act on, and the
+                // screen went on showing the last good price with no hint of its age. Naming the
+                // one thing that distinguishes this from an expired token - that the call
+                // succeeded - points at the subscription rather than at reconnecting, which is
+                // what an unexplained empty refresh invites you to try first.
+                outcome.message = "Dhan accepted the request but returned no quotes, so current "
+                    + "prices are unchanged and still show their last known value. The broker "
+                    + "token is working - historical candles still import - so check the Dhan "
+                    + "Data API (live market feed) subscription on your broker account.";
+            } else {
+                outcome.message = "Dhan is connected, but no live prices were returned.";
+            }
         }
         return outcome;
     }
@@ -1882,6 +2259,31 @@ public class StockTrackerService {
                 int batchUpdated = batchUpdateCurrentPrices(priceSymbols, priceValues, institutionId);
                 outcome.updated += batchUpdated;
                 batchUpsertLiveQuotes(quoteRefs, quoteOhlcv);
+            } else {
+                // The silent branch on the path that refreshes every tracked stock.
+                //
+                // A successful call carrying no quotes leaves priceSymbols empty, so the block
+                // above is skipped, nothing is written, and the only trace left was
+                // outcome.apiCalls++ below - which made the refresh read as though it had worked.
+                // Observed from 2026-11-01: both batches of the 1,271-stock refresh returned
+                // HTTP 200 with a 41-byte body, {"data":{"NSE_EQ":{}},"status":"success"}, and
+                // nothing anywhere said so. The same token kept importing candles from
+                // /charts/historical, which is the signature of a live-market-data entitlement
+                // rather than a broken credential, since Dhan sells live quotes separately.
+                //
+                // This is not an exception, so none of the handling below sees it: not
+                // isDhanAuthenticationError (no DH-901), not isDhanRateLimit (no DH-904), and not
+                // the bisecting retry - splitting a batch that is answered correctly only asks
+                // the same question twice.
+                outcome.emptyQuoteBatches++;
+                log.warn("[Refresh] Dhan /marketfeed/quote answered {} instrument(s) with no "
+                       + "usable price. The call succeeded, so this is neither a token nor a "
+                       + "rate-limit failure - the response carried no quotes. Check the Dhan "
+                       + "Data API (live market feed) subscription on the broker account; "
+                       + "historical candles use a different entitlement and keep working. "
+                       + "Response was: {}",
+                    batch.size(), json == null ? "(empty)"
+                        : json.length() > 400 ? json.substring(0, 400) + "..." : json);
             }
 
             outcome.apiCalls++;
@@ -2018,44 +2420,11 @@ public class StockTrackerService {
             .filter(s -> !s.isBlank())
             .distinct()
             .toList();
+        // dhan_instruments is the single instrument master. broker_instruments held a
+        // byte-for-byte copy of the same rows, so this fallback could never resolve a symbol
+        // the master had already missed.
         resolved.putAll(findDhanInstruments(normalized));
-        List<String> missing = normalized.stream()
-            .filter(s -> !resolved.containsKey(s))
-            .toList();
-        resolved.putAll(findBrokerInstruments(missing));
         return resolved;
-    }
-
-    private Map<String, DhanInstrumentRef> findBrokerInstruments(List<String> symbols) {
-        Map<String, DhanInstrumentRef> found = new LinkedHashMap<>();
-        if (symbols.isEmpty()) return found;
-        try {
-            Map<String, String> aliasToSymbol = aliasToTrackedSymbol(symbols);
-            List<String> aliases = new ArrayList<>(aliasToSymbol.keySet());
-            String in = IntStream.range(0, aliases.size()).mapToObj(i -> "?").collect(Collectors.joining(","));
-            var query = em.createNativeQuery(
-                "SELECT symbol, trading_symbol, display_name, underlying_symbol, " +
-                "broker_security_id, COALESCE(NULLIF(exchange_segment,''),'NSE_EQ') AS exchange_segment, instrument_type " +
-                "FROM broker_instruments WHERE broker_name='dhan' " +
-                "AND broker_security_id IS NOT NULL AND broker_security_id<>'' " +
-                "AND UPPER(COALESCE(exchange_segment,'')) IN ('NSE_EQ','BSE_EQ') " +
-                "AND UPPER(COALESCE(instrument_type,'')) IN ('EQUITY','ES','EQ') " +
-                "AND UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(underlying_symbol,''),'-EQ',''),'-BE',''),'-BZ',''),'.NS',''),' ','')) IN (" + in + ") " +
-                "ORDER BY CASE WHEN exchange_segment='NSE_EQ' THEN 0 WHEN exchange_segment='BSE_EQ' THEN 1 ELSE 2 END");
-            int p = 1;
-            for (String alias : aliases) query.setParameter(p++, alias);
-            @SuppressWarnings("unchecked")
-            List<Object[]> rows = query.getResultList();
-            for (Object[] row : rows) {
-                String symbol = matchTrackedSymbol(aliasToSymbol, row[3]);
-                if (!symbol.isBlank() && !found.containsKey(symbol)) {
-                    found.put(symbol, new DhanInstrumentRef(symbol, String.valueOf(row[4]), String.valueOf(row[5]), String.valueOf(row[6])));
-                }
-            }
-        } catch (Exception e) {
-            log.debug("Broker instrument batch lookup: {}", e.getMessage());
-        }
-        return found;
     }
 
     private Map<String, DhanInstrumentRef> findDhanInstruments(List<String> symbols) {
@@ -2095,37 +2464,10 @@ public class StockTrackerService {
             String symbol = normalizeSymbol(rawSymbol);
             if (symbol.isBlank() || resolved.containsKey(symbol)) continue;
 
-            Optional<DhanInstrumentRef> ref = findBrokerInstrument(symbol);
-            if (ref.isEmpty()) ref = findDhanInstrument(symbol);
+            Optional<DhanInstrumentRef> ref = findDhanInstrument(symbol);
             ref.ifPresent(r -> resolved.put(symbol, r));
         }
         return resolved;
-    }
-
-    private Optional<DhanInstrumentRef> findBrokerInstrument(String symbol) {
-        try {
-            Map<String, String> aliasToSymbol = aliasToTrackedSymbol(List.of(symbol));
-            List<String> aliases = new ArrayList<>(aliasToSymbol.keySet());
-            if (aliases.isEmpty()) return Optional.empty();
-            String in = IntStream.range(0, aliases.size()).mapToObj(i -> "?").collect(Collectors.joining(","));
-            var query = em.createNativeQuery(
-                "SELECT broker_security_id, COALESCE(NULLIF(exchange_segment,''),'NSE_EQ'), instrument_type, underlying_symbol " +
-                "FROM broker_instruments WHERE broker_name='dhan' " +
-                "AND broker_security_id IS NOT NULL AND broker_security_id<>'' " +
-                "AND UPPER(COALESCE(exchange_segment,'')) IN ('NSE_EQ','BSE_EQ') " +
-                "AND UPPER(COALESCE(instrument_type,'')) IN ('EQUITY','ES','EQ') " +
-                "AND UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(underlying_symbol,''),'-EQ',''),'-BE',''),'-BZ',''),'.NS',''),' ','')) IN (" + in + ") " +
-                "ORDER BY CASE WHEN exchange_segment='NSE_EQ' THEN 0 WHEN exchange_segment='BSE_EQ' THEN 1 ELSE 2 END LIMIT 1");
-            for (int i = 0; i < aliases.size(); i++) query.setParameter(i + 1, aliases.get(i));
-            @SuppressWarnings("unchecked")
-            List<Object[]> rows = query.getResultList();
-            if (rows.isEmpty()) return Optional.empty();
-            Object[] row = rows.get(0);
-            return Optional.of(new DhanInstrumentRef(symbol, String.valueOf(row[0]), String.valueOf(row[1]), String.valueOf(row[2])));
-        } catch (Exception e) {
-            log.debug("Broker instrument lookup {}: {}", symbol, e.getMessage());
-            return Optional.empty();
-        }
     }
 
     private Optional<DhanInstrumentRef> findDhanInstrument(String symbol) {
@@ -2153,7 +2495,8 @@ public class StockTrackerService {
         }
     }
 
-    private String normalizeSymbol(String symbol) {
+    /** Public alongside {@link #resolveCurrentPricesBatch}: callers must key on the same form. */
+    public String normalizeSymbol(String symbol) {
         if (symbol == null) return "";
         String s = symbol.trim().toUpperCase(Locale.ROOT)
             .replace(".NS", "")
@@ -2243,6 +2586,14 @@ public class StockTrackerService {
         int missingInstruments;
         int apiCalls;
         int failedBatches;
+        /**
+         * Batches Dhan answered successfully but with no quote in them.
+         *
+         * <p>Distinct from failedBatches, which counts calls that threw. An empty-but-successful
+         * response is the case that had no counter at all, so a refresh that updated nothing
+         * reported apiCalls=2, failedBatches=0 and looked healthy.
+         */
+        int emptyQuoteBatches;
         String message = "";
         Set<String> updatedSymbols = new HashSet<>();
     }
@@ -2261,7 +2612,7 @@ public class StockTrackerService {
             .setParameter(2, price)
             .setParameter(3, DateUtil.now())
             .setParameter(4, price)
-            .setParameter(5, DateUtil.today())
+            .setParameter(5, priceSessionDate())
             .setParameter(6, DateUtil.now())
             .setParameter(7, DateUtil.now())
             .setParameter(8, normalizeSymbol(symbol))
@@ -2274,7 +2625,21 @@ public class StockTrackerService {
         try {
             runInTransaction(() -> {
                 String now = DateUtil.now();
-                for (int i = 0; i < refs.size(); i++) {
+                // Written in conflict-key order, and the live feed's flush uses the same order.
+                //
+                // Two independent writers upsert this table: the WebSocket flush on its scheduler
+                // and this refresh on an HTTP thread. Both touch the same rows, and each iterated
+                // in whatever order its own collection happened to yield - so one could hold the
+                // lock on row A while waiting for B, and the other the exact reverse. Postgres
+                // broke the tie by killing a transaction: "deadlock detected ... while inserting
+                // index tuple in relation live_price_quotes" during the 09:15 refresh on 7 Sep
+                // 2026, losing that whole batch of prices. Locks taken in one agreed order cannot
+                // form that cycle.
+                List<Integer> order = new ArrayList<>();
+                for (int i = 0; i < refs.size(); i++) order.add(i);
+                order.sort((x, y) -> liveQuoteKey(refs.get(x)).compareTo(liveQuoteKey(refs.get(y))));
+                for (int oi = 0; oi < order.size(); oi++) {
+                    int i = order.get(oi);
                     DhanInstrumentRef ref = refs.get(i);
                     double[] ohlcv = ohlcvList.get(i);
                     em.createNativeQuery(
@@ -2313,6 +2678,16 @@ public class StockTrackerService {
         } catch (Exception e) {
             log.debug("Batch live quote upsert failed for {} quotes: {}", refs.size(), e.getMessage());
         }
+    }
+
+    /**
+     * The live_price_quotes conflict key, as a sortable string.
+     *
+     * <p>Every writer of this table must order its batch by this, so concurrent upserts take row
+     * locks in the same sequence and cannot deadlock against each other.
+     */
+    static String liveQuoteKey(DhanInstrumentRef ref) {
+        return String.valueOf(ref.exchangeSegment) + '|' + String.valueOf(ref.securityId);
     }
 
     private void upsertLiveQuoteFromRefresh(DhanInstrumentRef ref, double ltp,
@@ -2676,36 +3051,54 @@ public class StockTrackerService {
      *        by the same endpoint, so this has to travel with the request rather than be fixed
      *        inside the method.
      */
-    @SuppressWarnings("unchecked")
     public List<Map<String, Object>> reconstructTop10AsOf(Long userId, Long institutionId,
                                                           String asOf, Double maxPrice,
                                                           boolean applyReturnBand,
                                                           boolean requireCrossing,
                                                           boolean capPerSector) {
+        return reconstructTop10AsOf(userId, institutionId, asOf, maxPrice, applyReturnBand,
+                                    requireCrossing, capPerSector, true);
+    }
+
+    /**
+     * @param requireVolume keep "Current Volume &gt; 20-Day Average Volume" in the entry test.
+     *        Volume is always reported either way; this only controls whether it can exclude a
+     *        stock. Sections that ask for false are saying the price rules alone define them.
+     */
+    public List<Map<String, Object>> reconstructTop10AsOf(Long userId, Long institutionId,
+                                                          String asOf, Double maxPrice,
+                                                          boolean applyReturnBand,
+                                                          boolean requireCrossing,
+                                                          boolean capPerSector,
+                                                          boolean requireVolume) {
+        return reconstructTop10AsOf(userId, institutionId, asOf, maxPrice, applyReturnBand,
+                                    requireCrossing, capPerSector, requireVolume, true);
+    }
+
+    /**
+     * @param applyRanking score the qualifying stocks and keep the best ten. With it off the
+     *        method is a screen: every stock meeting the entry test is returned, ordered by the
+     *        size of its move, with no composite score and no top-ten cut.
+     */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> reconstructTop10AsOf(Long userId, Long institutionId,
+                                                          String asOf, Double maxPrice,
+                                                          boolean applyReturnBand,
+                                                          boolean requireCrossing,
+                                                          boolean capPerSector,
+                                                          boolean requireVolume,
+                                                          boolean applyRanking) {
         Map<String, Double> weights = loadTrackerWeights(institutionId);
 
-        StringBuilder sql = new StringBuilder(
-            "SELECT ts.symbol, ts.base_price, COALESCE(ts.sector,''), COALESCE(ts.market_cap_name,''), " +
-            "ts.upload_date, c.close " +
-            "FROM tracked_stocks ts " +
-            "JOIN LATERAL (SELECT bmc.close FROM broker_market_candles bmc " +
-            "  WHERE UPPER(COALESCE(bmc.symbol,'')) = UPPER(ts.symbol) " +
-            "    AND UPPER(COALESCE(bmc.candle_mode,'')) = 'DAILY' " +
-            "    AND bmc.trade_date = ? AND bmc.close IS NOT NULL AND bmc.close > 0 " +
-            "  LIMIT 1) c ON TRUE " +
-            "WHERE ts.institution_id = ? AND ts.upload_date <= ? " +
-            "  AND ts.base_price IS NOT NULL AND ts.base_price > 0");
-        if (userId != null) sql.append(" AND ts.user_id = ").append(userId);
-
-        List<Object[]> rows;
-        try {
-            rows = em.createNativeQuery(sql.toString())
-                .setParameter(1, asOf).setParameter(2, institutionId).setParameter(3, asOf)
-                .getResultList();
-        } catch (Exception e) {
-            log.warn("Reconstruction for {} failed: {}", asOf, e.getMessage());
-            return List.of();
-        }
+        // MODE B — the upload log as it stood on `asOf`, not as it stands today.
+        //
+        // This used to read tracked_stocks, which holds only each symbol's CURRENT row. Rebuilding
+        // a past day from it priced every stock off the base price it has now: a symbol re-flagged
+        // last week was backtested against last week's base all the way back through the chart, and
+        // a symbol first flagged after `asOf` appeared in a run that could not have known about it.
+        // Both are look-ahead bias. The as-of query below returns each symbol's most recent flag on
+        // or before `asOf`, carrying that flag's own base price.
+        List<Object[]> rows = reconstructionUniverse(userId, institutionId, asOf);
         if (rows.isEmpty()) return List.of();
 
         // ------------------------------------------------------------------ IDENTIFICATION
@@ -2763,17 +3156,68 @@ public class StockTrackerService {
                 if (bars.get(i).volume() > 0) { avg20 += bars.get(i).volume(); n++; }
             }
             avg20 = n == 0 ? 0 : avg20 / n;
-            if (todayVol <= 0 || avg20 <= 0 || todayVol <= avg20) continue;   // Volume > 20D Avg
+            // Volume > 20D Avg, when the caller wants it as a filter. The figures below are
+            // stored regardless, so a section that drops the rule still shows the numbers.
+            if (requireVolume && (todayVol <= 0 || avg20 <= 0 || todayVol <= avg20)) continue;
+
+            // ATR14 over the sessions behind D-1, as a percentage of the D-1 close - the same
+            // measure the ATR Base Price Crossover screen filters on, so a number here and a
+            // number there mean the same thing. Reported on every row; whether it excludes a
+            // stock is the caller's choice.
+            double atr14 = 0, atrPct = 0;
+            // Off by one: the guard admitted a 16-bar series and the loop then read index 16,
+            // which needs 17. It only bites when a symbol has exactly 16 sessions behind the
+            // as-of day - common for early dates, where less history precedes the day being
+            // rebuilt - and it threw straight out of the request, so asking the chart for
+            // anything older than about a month returned a 500 and drew nothing at all.
+            //
+            // Clamped rather than simply requiring 17: with 16 bars, indices 15..1 still give
+            // fifteen bars and therefore the fourteen true ranges ATR14 needs, so that series
+            // yields a real ATR instead of being silently dropped.
+            int atrStart = Math.min(16, bars.size() - 1);
+            if (atrStart >= 15) {
+                List<Double> hs = new ArrayList<>(), ls = new ArrayList<>(), cs = new ArrayList<>();
+                for (int i = atrStart; i >= 1; i--) {    // oldest-first, ending at D-1
+                    DayBar bar = bars.get(i);
+                    hs.add(bar.high()); ls.add(bar.low()); cs.add(bar.close());
+                }
+                atr14 = indicator.atr(hs, ls, cs, 14);
+                if (atr14 > 0 && prevClose > 0) {
+                    atrPct = Math.round((atr14 / prevClose) * 10000.0) / 100.0;
+                }
+            }
 
             s.put("previous_close", prevClose);
             s.put("volume", todayVol);
             s.put("avg_20d_volume", Math.round(avg20));
+            s.put("atr14", Math.round(atr14 * 100.0) / 100.0);
+            s.put("atr_pct", atrPct);
             // Change measured against the previous close, matching the Eligible Stocks export.
             s.put("price_change_pct",
                 Math.round(((getD(s, "current_price") - prevClose) / prevClose) * 10000.0) / 100.0);
             candidates.add(s);
         }
         if (candidates.isEmpty()) return List.of();
+
+        // A section can ask to be a screen rather than a ranking. Scoring answers "which are the
+        // best ten of these"; a screen answers "which ones qualify", and imposing a top-ten cut
+        // on it silently hides qualifying stocks. With ranking off, every candidate is returned,
+        // strongest move first, and no composite score is attached to pretend otherwise.
+        if (!applyRanking) {
+            // Not a ranking - a shortlist. Every stock here has already passed the entry test,
+            // so what remains is deciding which of them to actually hold, and that is decided on
+            // the day's traded volume: the most heavily traded names are the ones a position can
+            // be opened and closed in without moving the price against you.
+            //
+            // Volume is the sole sort key, so a stock with a bigger percentage move but thin
+            // trading ranks below a heavier one. That is deliberate; sorting by move would put
+            // illiquid names at the top of a list meant to be tradeable.
+            candidates.sort((a, b) -> Double.compare(getD(b, "volume"), getD(a, "volume")));
+            int keep = getShortlistCount();
+            return candidates.size() > keep
+                ? new ArrayList<>(candidates.subList(0, keep))
+                : candidates;
+        }
 
         // Relative Strength is a percentile against the same run's cohort, so the cohort has to be
         // that day's candidates - not today's, which would score every past day against the present.
@@ -2788,16 +3232,319 @@ public class StockTrackerService {
         return scored.size() > getTopN() ? new ArrayList<>(scored.subList(0, getTopN())) : scored;
     }
 
+    /**
+     * The candidate universe for a rebuilt day: [symbol, base_price, sector, market_cap, entry_date,
+     * close-on-asOf], one row per symbol.
+     *
+     * <p>Read from stock_upload_history in Mode B (each symbol's latest flag on or before
+     * {@code asOf}, with that flag's own base price). Falls back to the old tracked_stocks read when
+     * the log is empty or has no priced rows for that window — a deployment whose base-price
+     * backfill has not caught up yet keeps its existing charts rather than rendering them blank.
+     */
+    @SuppressWarnings("unchecked")
+    /**
+     * Every symbol this institution has ever flagged on or before {@code asOf}.
+     *
+     * <p>A superset of any single day's reconstruction universe, which is what the trend's bar
+     * window needs: the universe is re-derived per simulated day, and a symbol that has since
+     * dropped out of it still has to have its bars available for the days it was in.
+     */
+    /**
+     * The oldest date a day can be rebuilt for: the first upload, since before it the universe
+     * this strategy selects from did not exist. Candle history reaches further back (to
+     * 2025-08-01), but a day with no flagged stocks has nothing to rank.
+     */
+    private String earliestReconstructableDate(Long userId, Long institutionId) {
+        try {
+            StringBuilder sql = new StringBuilder(
+                "SELECT MIN(entry_date) FROM stock_upload_history " +
+                "WHERE institution_id = ?1 AND base_price IS NOT NULL AND base_price > 0");
+            if (userId != null) sql.append(" AND user_id = ").append(userId);
+            Object v = em.createNativeQuery(sql.toString())
+                .setParameter(1, institutionId).getSingleResult();
+            if (v != null) return v.toString().substring(0, 10);
+        } catch (Exception e) {
+            log.debug("Earliest reconstructable date lookup failed: {}", e.getMessage());
+        }
+        return java.time.LocalDate.now(IST).minusDays(30).toString();
+    }
+
+    private List<String> universeSymbols(Long userId, Long institutionId, String asOf) {
+        try {
+            StringBuilder sql = new StringBuilder(
+                "SELECT DISTINCT symbol FROM stock_upload_history " +
+                "WHERE institution_id = ? AND entry_date <= CAST(? AS DATE) " +
+                "AND base_price IS NOT NULL AND base_price > 0");
+            if (userId != null) sql.append(" AND user_id = ").append(userId);
+            @SuppressWarnings("unchecked")
+            List<Object> rows = em.createNativeQuery(sql.toString())
+                .setParameter(1, institutionId).setParameter(2, asOf).getResultList();
+            List<String> out = new ArrayList<>();
+            for (Object r : rows) if (r != null) out.add(String.valueOf(r));
+            return out;
+        } catch (Exception e) {
+            log.debug("Universe symbol list failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    private List<Object[]> reconstructionUniverse(Long userId, Long institutionId, String asOf) {
+        StringBuilder historySql = new StringBuilder(
+            "SELECT h.symbol, h.base_price, COALESCE(h.sector,''), COALESCE(h.marketcap_name,''), " +
+            "to_char(h.entry_date,'YYYY-MM-DD'), c.close " +
+            "FROM (SELECT DISTINCT ON (symbol) symbol, entry_date, sector, marketcap_name, base_price " +
+            "      FROM stock_upload_history " +
+            "      WHERE institution_id = ? AND entry_date <= CAST(? AS DATE)");
+        if (userId != null) historySql.append(" AND user_id = ").append(userId);
+        historySql.append(
+            "      ORDER BY symbol, entry_date DESC, uploaded_at DESC, id DESC) h " +
+            "JOIN LATERAL (SELECT bmc.close FROM broker_market_candles bmc " +
+            "  WHERE UPPER(COALESCE(bmc.symbol,'')) = UPPER(h.symbol) " +
+            "    AND UPPER(COALESCE(bmc.candle_mode,'')) = 'DAILY' " +
+            "    AND bmc.trade_date = ? AND bmc.close IS NOT NULL AND bmc.close > 0 " +
+            "  LIMIT 1) c ON TRUE " +
+            "WHERE h.base_price IS NOT NULL AND h.base_price > 0");
+
+        try {
+            List<Object[]> rows = em.createNativeQuery(historySql.toString())
+                .setParameter(1, institutionId).setParameter(2, asOf).setParameter(3, asOf)
+                .getResultList();
+            if (!rows.isEmpty()) return rows;
+        } catch (Exception e) {
+            log.debug("Upload-history reconstruction for {} unavailable: {}", asOf, e.getMessage());
+        }
+
+        StringBuilder legacySql = new StringBuilder(
+            "SELECT ts.symbol, ts.base_price, COALESCE(ts.sector,''), COALESCE(ts.market_cap_name,''), " +
+            "ts.upload_date, c.close " +
+            "FROM tracked_stocks ts " +
+            "JOIN LATERAL (SELECT bmc.close FROM broker_market_candles bmc " +
+            "  WHERE UPPER(COALESCE(bmc.symbol,'')) = UPPER(ts.symbol) " +
+            "    AND UPPER(COALESCE(bmc.candle_mode,'')) = 'DAILY' " +
+            "    AND bmc.trade_date = ? AND bmc.close IS NOT NULL AND bmc.close > 0 " +
+            "  LIMIT 1) c ON TRUE " +
+            "WHERE ts.institution_id = ? AND ts.upload_date <= ? " +
+            "  AND ts.base_price IS NOT NULL AND ts.base_price > 0");
+        if (userId != null) legacySql.append(" AND ts.user_id = ").append(userId);
+        try {
+            return em.createNativeQuery(legacySql.toString())
+                .setParameter(1, asOf).setParameter(2, institutionId).setParameter(3, asOf)
+                .getResultList();
+        } catch (Exception e) {
+            log.warn("Reconstruction for {} failed: {}", asOf, e.getMessage());
+            return List.of();
+        }
+    }
+
     /** One symbol's recent daily bars as of a date: [trade_date, close, volume], newest first. */
-    private record DayBar(String date, double close, double volume) {}
+    /**
+     * Each symbol's first recorded price for a day.
+     *
+     * <p>tracked_stock_prices is written once per symbol per day - the insert uses ON CONFLICT DO
+     * NOTHING, so the first refresh of the session wins and later ones cannot overwrite it. That
+     * makes it the opening reference for "how far has today moved", with no new storage needed.
+     *
+     * <p>One honest limit: it is the first run the application actually made, which equals 09:15
+     * only when the application was running then. On a day it started late, the reference is that
+     * later moment, and the figure means what it says rather than what the clock suggests.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, Double> firstRunPrices(Long institutionId, String day) {
+        Map<String, Double> out = new HashMap<>();
+        try {
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT symbol, close_price FROM tracked_stock_prices " +
+                "WHERE institution_id=? AND price_date=? AND close_price > 0")
+                .setParameter(1, institutionId).setParameter(2, day).getResultList();
+            for (Object[] r : rows) {
+                out.put(normalizeSymbol(String.valueOf(r[0])), ((Number) r[1]).doubleValue());
+            }
+        } catch (Exception e) {
+            log.debug("First-run prices for {} unavailable: {}", day, e.getMessage());
+        }
+        return out;
+    }
+
+    private volatile Map<String, List<DayBar>> gapBarsCache = Map.of();
+    private volatile long gapBarsCacheTs = 0L;
+    private static final long GAP_BARS_TTL_MS = 5 * 60 * 1000L;
+
+    /** How far back a missing session is still the screens' problem rather than a backfill's. */
+    private static final int GAP_LOOKBACK_DAYS = 21;
+
+    /**
+     * Daily bars a complete session carries. A normal day stores about 3,000; anything under
+     * this is a partial fetch, whatever its cause, and the session is reconstructed instead.
+     */
+    private static final long MIN_DAILY_SYMBOLS_PER_SESSION = 2000L;
+
+    /** The width LiveCandleAggregator stores; preferred by the gap-session fold above. */
+    @org.springframework.beans.factory.annotation.Value("${livecandle.interval.minutes:60}")
+    private int liveCandleIntervalMinutes;
+
+    /**
+     * One folded bar per (symbol, session) for sessions that exist in intraday but never got a
+     * daily bar, across the recent window - computed once and cached.
+     *
+     * <p>On 5 Sep 2026 the daily feed stopped at 28 Aug while intraday held five complete
+     * sessions after it. Those sessions are real and the screens should show them, but folding
+     * them per caller is far too expensive: the whole 45-day window takes 8.2 seconds, against
+     * 2.3 for just the missing days across every symbol. So the missing days are folded once for
+     * the entire universe and shared. When the daily feed catches up the gap set empties, the
+     * query becomes trivial, and this quietly stops doing anything.
+     */
+    @SuppressWarnings("unchecked")
+    /**
+     * The current fold, refreshed in the background - a request never waits for it.
+     *
+     * <p>Blocking on this was catastrophic. Three page loads arrived while the fold was running
+     * and all three returned in the same millisecond as it finished, each reporting
+     * bars-batch 100,743ms. The fold is inherently expensive against a 52-million-row table, so
+     * the answer is not to make callers queue behind it: a screen showing bars that are one
+     * refresh cycle behind is fine, a screen that hangs for a minute and a half is not.
+     *
+     * <p>So a stale cache is served immediately and a single background refresh is kicked off.
+     * The first call after startup returns empty, which simply means no reconstructed sessions
+     * that once - the daily bars are still there and correct.
+     */
+    private Map<String, List<DayBar>> gapSessionBars() {
+        if (System.currentTimeMillis() - gapBarsCacheTs >= GAP_BARS_TTL_MS
+            && gapBarsRefreshing.compareAndSet(false, true)) {
+            java.util.concurrent.CompletableFuture.runAsync(() -> {
+                try { computeGapSessionBars(); }
+                catch (Exception e) { log.warn("Gap fold refresh failed: {}", e.getMessage()); }
+                finally { gapBarsRefreshing.set(false); }
+            });
+        }
+        return gapBarsCache;
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean gapBarsRefreshing =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private Map<String, List<DayBar>> computeGapSessionBars() {
+        long now = System.currentTimeMillis();
+
+        Map<String, List<DayBar>> out = new HashMap<>();
+        try {
+            // A session is a gap when its daily coverage is far short of a normal session -
+            // 31 Aug 2026 held 291 daily bars against 2,909 symbols traded, present by the letter
+            // of "does a daily bar exist" and missing for 90% of the market.
+            //
+            // The comparison used to count DISTINCT symbols on BOTH sides across 200 days. That
+            // aggregation over roughly 40 million intraday rows measured 72 seconds - the whole
+            // of the reported slowness. Two changes fix it: judge daily coverage against a fixed
+            // floor instead of counting intraday symbols, and look back three weeks rather than
+            // seven months. Daily-side counts take 233ms, the intraday date list 2.5s, and a
+            // gap older than three weeks is a backfill job, not something a screen should carry.
+            String since = java.time.LocalDate.now(IST).minusDays(GAP_LOOKBACK_DAYS).toString();
+
+            List<?> intradayDays = em.createNativeQuery(
+                "SELECT DISTINCT trade_date FROM broker_market_candles " +
+                "WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY' AND trade_date >= ?")
+                .setParameter(1, since).getResultList();
+
+            List<Object[]> dailyCounts = em.createNativeQuery(
+                "SELECT trade_date, COUNT(DISTINCT symbol) FROM broker_market_candles " +
+                "WHERE UPPER(COALESCE(candle_mode,'')) = 'DAILY' AND trade_date >= ? " +
+                "GROUP BY trade_date")
+                .setParameter(1, since).getResultList();
+
+            Map<String, Long> daily = new HashMap<>();
+            for (Object[] r : dailyCounts) {
+                daily.put(String.valueOf(r[0]), ((Number) r[1]).longValue());
+            }
+            List<Object> gapDays = new ArrayList<>();
+            for (Object d : intradayDays) {
+                if (d == null) continue;
+                if (daily.getOrDefault(String.valueOf(d), 0L) < MIN_DAILY_SYMBOLS_PER_SESSION) {
+                    gapDays.add(d);
+                }
+            }
+
+            List<String> days = new ArrayList<>();
+            for (Object d : gapDays) if (d != null) days.add(d.toString());
+            if (!days.isEmpty()) {
+                String norm = normalizedSql("symbol");
+                // One bar width per symbol per session, never a sum across widths.
+                //
+                // SUM(volume) used to run over every INTRADAY row for the day. While 5 minutes was
+                // the only width stored that was the same thing as the session total. It stops being
+                // true the moment a second width exists - a day holding both 5-minute and hourly rows
+                // would report roughly twice the volume it traded, and silently, because the fold is
+                // a read-time stand-in that nothing reconciles against the official daily bar. So
+                // group by width as well, then keep one: the width the live aggregator is storing if
+                // the session has it, otherwise the finest the session does have.
+                List<Object[]> rows = em.createNativeQuery(
+                    "SELECT sym, trade_date, close, high, low, vol FROM (" +
+                    "SELECT " + norm + " AS sym, trade_date, " +
+                    "(ARRAY_AGG(close ORDER BY candle_time DESC))[1] AS close, " +
+                    "MAX(high) AS high, MIN(low) AS low, " +
+                    "SUM(COALESCE(total_volume, volume)) AS vol, " +
+                    "ROW_NUMBER() OVER (PARTITION BY " + norm + ", trade_date ORDER BY " +
+                    "  (COALESCE(interval_minutes, 0) = :pref) DESC, COALESCE(interval_minutes, 0) ASC" +
+                    ") AS pick " +
+                    "FROM broker_market_candles " +
+                    "WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY' " +
+                    "AND trade_date IN (:days) AND close IS NOT NULL AND close > 0 " +
+                    "GROUP BY " + norm + ", trade_date, COALESCE(interval_minutes, 0)" +
+                    ") z WHERE pick = 1")
+                    .setParameter("days", days)
+                    .setParameter("pref", liveCandleIntervalMinutes).getResultList();
+                for (Object[] r : rows) {
+                    out.computeIfAbsent(String.valueOf(r[0]), k -> new ArrayList<>())
+                       .add(new DayBar(String.valueOf(r[1]),
+                                       ((Number) r[2]).doubleValue(),
+                                       r[3] == null ? 0 : ((Number) r[3]).doubleValue(),
+                                       r[4] == null ? 0 : ((Number) r[4]).doubleValue(),
+                                       r[5] == null ? 0 : ((Number) r[5]).doubleValue()));
+                }
+                log.info("[GapBars] {} session(s) with no daily bar folded from intraday for {} "
+                       + "symbol(s): {}", days.size(), out.size(), days);
+            }
+        } catch (Exception e) {
+            log.warn("Gap-session fold failed: {}", e.getMessage());
+        }
+        gapBarsCache = out;
+        gapBarsCacheTs = now;
+        return out;
+    }
+
+    private record DayBar(String date, double close, double high, double low, double volume) {}
+
+    /**
+     * Daily history for a whole date range, held for the duration of one multi-day rebuild.
+     *
+     * <p>The trend loop asks for bars once per simulated day. Each of those calls is its own scan
+     * of the candle table - measured at 430 ms for the tracked universe over 45 sessions - so a
+     * thirty-day chart paid it twenty-two times and the panel sat on its spinner. The range is a
+     * superset of every day in the loop, so it can be loaded once and sliced.
+     */
+    private record BarWindow(String from, String to, Map<String, List<DayBar>> bars) {}
+
+    /** Set only while a multi-day rebuild is in progress on this thread; never shared. */
+    private final ThreadLocal<BarWindow> barWindow = new ThreadLocal<>();
+
+    /**
+     * Finished trading days, keyed by the day and the entry rules used to rebuild it.
+     *
+     * <p>Entries are immutable and never expire: a settled day is history. The bound is a memory
+     * guard, not a freshness one - 301 sessions across a handful of rule combinations sits well
+     * inside it. Cleared on restart, which is also when a backfill that added candles for a past
+     * session takes effect.
+     */
+    private static final int SETTLED_DAY_CACHE_MAX = 5000;
+    private final java.util.concurrent.ConcurrentHashMap<String, Map<String, Object>>
+        settledDayCache = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Daily bars up to and including a date, for many symbols in one query.
      *
-     * <p>Used by the as-of identification, which needs three things per stock that a single close
-     * cannot give: the previous close (to see a crossing), that day's volume, and the twenty-day
-     * average volume behind it. Reading a 45-day window covers twenty trading days with room for
-     * holidays, and grouping in memory avoids a query per symbol per day.
+     * <p>Used by the as-of identification, which needs more per stock than a single close can
+     * give: the previous close (to see a crossing), that day's volume, the twenty-day average
+     * volume behind it, and the daily range for ATR. Reading a 45-day window covers twenty
+     * trading days with room for holidays, and grouping in memory avoids a query per symbol
+     * per day.
      */
     @SuppressWarnings("unchecked")
     private Map<String, List<DayBar>> dailyBarsUpTo(List<String> symbols, String asOf, int lookbackDays) {
@@ -2805,9 +3552,30 @@ public class StockTrackerService {
         if (symbols == null || symbols.isEmpty()) return out;
         try {
             String from = java.time.LocalDate.parse(asOf).minusDays(lookbackDays).toString();
+
+            // A rebuild covering this range has already loaded these bars - slice, do not re-query.
+            BarWindow w = barWindow.get();
+            if (w != null && from.compareTo(w.from()) >= 0 && asOf.compareTo(w.to()) <= 0) {
+                for (String sym : symbols) {
+                    String key = normalizeSymbol(sym);
+                    List<DayBar> all = w.bars().get(key);
+                    if (all == null) continue;
+                    // Held newest-first, so the window opens at the first bar on or before asOf
+                    // and closes at the first one older than `from`.
+                    List<DayBar> slice = new ArrayList<>();
+                    for (DayBar d : all) {
+                        if (d.date().compareTo(asOf) > 0) continue;
+                        if (d.date().compareTo(from) < 0) break;
+                        slice.add(d);
+                    }
+                    if (!slice.isEmpty()) out.put(key, slice);
+                }
+                return out;
+            }
             String norm = normalizedSql("symbol");
             List<Object[]> rows = em.createNativeQuery(
-                "SELECT " + norm + ", trade_date, close, COALESCE(total_volume, volume) " +
+                "SELECT " + norm + ", trade_date, close, high, low, " +
+                "COALESCE(total_volume, volume) " +
                 "FROM broker_market_candles " +
                 "WHERE " + norm + " IN (:syms) " +
                 "AND UPPER(COALESCE(candle_mode,'')) = 'DAILY' " +
@@ -2822,13 +3590,78 @@ public class StockTrackerService {
                 out.computeIfAbsent(String.valueOf(r[0]), k -> new ArrayList<>())
                    .add(new DayBar(String.valueOf(r[1]),
                                    ((Number) r[2]).doubleValue(),
-                                   r[3] == null ? 0 : ((Number) r[3]).doubleValue()));
+                                   r[3] == null ? 0 : ((Number) r[3]).doubleValue(),
+                                   r[4] == null ? 0 : ((Number) r[4]).doubleValue(),
+                                   r[5] == null ? 0 : ((Number) r[5]).doubleValue()));
+            }
+
+            // Sessions the daily feed never produced are folded in from intraday - but from a
+            // shared cache, not from this query.
+            //
+            // Doing it inline as a UNION cost 8.2 seconds per call, because it re-folded all 45
+            // days of intraday every time when only a handful of sessions were actually missing.
+            // This method runs once per simulated day, so that turned a chart into minutes of
+            // waiting. The cache folds only the genuinely missing sessions, once, and every day
+            // in the loop reads the same result.
+            Map<String, List<DayBar>> gaps = gapSessionBars();
+            for (Map.Entry<String, List<DayBar>> e : gaps.entrySet()) {
+                List<DayBar> add = new ArrayList<>();
+                for (DayBar g : e.getValue()) {
+                    if (g.date().compareTo(from) >= 0 && g.date().compareTo(asOf) <= 0) add.add(g);
+                }
+                if (add.isEmpty()) continue;
+                List<DayBar> series = out.computeIfAbsent(e.getKey(), k -> new ArrayList<>());
+                series.addAll(add);
+                series.sort((x, y) -> y.date().compareTo(x.date()));   // newest first
             }
         } catch (Exception e) {
             log.debug("Daily bars up to {} failed: {}", asOf, e.getMessage());
         }
         return out;
     }
+
+    /**
+     * Day 1 to Day 5 returns for one trade, measured from the price it was actually entered at.
+     *
+     * <p>This is a lookup, not a strategy. It re-reads nothing about entry, exit, stop, target or
+     * any filter: it takes the entry price already recorded for the trade and the stored closes of
+     * the next five TRADING sessions, and reports what the position was worth on each. Every day
+     * is measured from the entry - Day 2 is entry to day two, not day one to day two - so the
+     * figures are directly comparable rather than chained.
+     *
+     * <p>Sessions come from the same in-memory window the rest of the rebuild uses, so this costs
+     * no queries. A holding day that has not traded yet is reported as null and never as zero: a
+     * zero would enter an average as a flat trade and quietly drag the whole bar towards nothing.
+     */
+    private void putHoldingDayReturns(Map<String, Object> row, String symbol,
+                                      String buyDate, double buyPrice) {
+        for (int k = 1; k <= HOLDING_DAYS; k++) {
+            row.put("day" + k + "_return", null);
+            row.put("day" + k + "_price", null);
+        }
+        BarWindow w = barWindow.get();
+        if (w == null || buyPrice <= 0 || symbol == null) return;
+        List<DayBar> all = w.bars().get(normalizeSymbol(symbol));
+        if (all == null || all.isEmpty()) return;
+
+        // The window holds each series newest-first, so walking it backwards yields the sessions
+        // in date order; everything strictly after the entry date is a holding day.
+        List<DayBar> after = new ArrayList<>();
+        for (int i = all.size() - 1; i >= 0 && after.size() < HOLDING_DAYS; i--) {
+            DayBar d = all.get(i);
+            if (d.date().compareTo(buyDate) > 0) after.add(d);
+        }
+        for (int k = 1; k <= HOLDING_DAYS && k <= after.size(); k++) {
+            double close = after.get(k - 1).close();
+            if (close <= 0) continue;
+            row.put("day" + k + "_price", Math.round(close * 100.0) / 100.0);
+            row.put("day" + k + "_return",
+                Math.round(((close - buyPrice) / buyPrice) * 10000.0) / 100.0);
+        }
+    }
+
+    /** Holding days reported per trade: Day 1 is the first trading session after entry. */
+    private static final int HOLDING_DAYS = 5;
 
     /**
      * The trades behind every chart bar, one row per stock per day, as CSV.
@@ -2952,6 +3785,23 @@ public class StockTrackerService {
     @SuppressWarnings("unchecked")
     public Map<String, Object> getBelowPriceTop10(Long userId, Long institutionId, Double maxPrice,
                                                   boolean requireCrossing) {
+        return getBelowPriceTop10(userId, institutionId, maxPrice, requireCrossing, true);
+    }
+
+    public Map<String, Object> getBelowPriceTop10(Long userId, Long institutionId, Double maxPrice,
+                                                  boolean requireCrossing, boolean requireVolume) {
+        return getBelowPriceTop10(userId, institutionId, maxPrice, requireCrossing, requireVolume, true);
+    }
+
+    /**
+     * @param requireVolume see {@link #reconstructTop10AsOf}
+     * @param applyRanking  when false the panel is a screen, not a Top 10: every qualifying
+     *        stock is listed, strongest move first, and the pipeline text says so.
+     */
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> getBelowPriceTop10(Long userId, Long institutionId, Double maxPrice,
+                                                  boolean requireCrossing, boolean requireVolume,
+                                                  boolean applyRanking) {
         Map<String, Object> out = new LinkedHashMap<>();
         try {
             // As-of date: the newest day that actually has prices. During a session that is today;
@@ -2965,13 +3815,29 @@ public class StockTrackerService {
                 out.put("top10", List.of());
                 return out;
             }
-            String asOf = days.get(days.size() - 1);
-            String prevDay = days.size() > 1 ? days.get(days.size() - 2) : null;
+            // The section shows what is HELD, which was selected on the session BEFORE the
+            // newest one - not the newest itself.
+            //
+            // A stock that crosses on Friday is a candidate for Friday's 15:15 selection, so on
+            // Friday it belongs under "Heading into tomorrow - provisional". It becomes the held
+            // position on the next market day, and only then does it belong in this table. Using
+            // the newest session for both meant Friday's crossings appeared here on Friday - the
+            // provisional and the holding showing the same list, with nothing ever moving from
+            // one to the other.
+            //
+            // days comes from tradingDaysWithData, so "the session before" already skips
+            // weekends and holidays: after Friday it is Thursday, and on Monday it is Friday.
+            boolean haveTwo = days.size() > 1;
+            String asOf = haveTwo ? days.get(days.size() - 2) : days.get(days.size() - 1);
+            String prevDay = days.size() > 2 ? days.get(days.size() - 3) : null;
+            // The session whose selection is still only provisional - shown by the panel above.
+            String provisionalDay = days.get(days.size() - 1);
 
             // ---- IDENTIFY -> RANK (both inside reconstructTop10AsOf, in that order) ----
             // false: identification here is exactly the four stated conditions, no return band.
-            List<Map<String, Object>> top =
-                reconstructTop10AsOf(userId, institutionId, asOf, maxPrice, false, requireCrossing);
+            List<Map<String, Object>> top = reconstructTop10AsOf(
+                userId, institutionId, asOf, maxPrice, false, requireCrossing, false,
+                requireVolume, applyRanking);
 
             // ---- Live prices while the session is running ----
             //
@@ -3038,6 +3904,12 @@ public class StockTrackerService {
                 row.put("price_change_pct", s.get("price_change_pct"));
                 row.put("volume", s.get("volume"));
                 row.put("avg_20d_volume", s.get("avg_20d_volume"));
+                // ATR is computed during identification and was being dropped here: this method
+                // builds a fresh row and copies named fields, so anything not listed never
+                // reaches the screen. The columns rendered "-" on every line while the numbers
+                // existed a few frames earlier.
+                row.put("atr14", s.get("atr14"));
+                row.put("atr_pct", s.get("atr_pct"));
                 row.put("score", s.get("composite_score"));
 
                 Object fs = s.get("factor_scores");
@@ -3073,8 +3945,9 @@ public class StockTrackerService {
             // ---- Previous run, for the trend ----
             Double avgPrevious = null;
             if (prevDay != null) {
-                List<Map<String, Object>> prevTop =
-                    reconstructTop10AsOf(userId, institutionId, prevDay, maxPrice, false, requireCrossing);
+                List<Map<String, Object>> prevTop = reconstructTop10AsOf(
+                    userId, institutionId, prevDay, maxPrice, false, requireCrossing, false,
+                    requireVolume, applyRanking);
                 if (!prevTop.isEmpty()) {
                     // Same measure for the comparison, or the trend would be an artefact of two
                     // different definitions: entry at the previous day's cut-off, valued at the
@@ -3112,10 +3985,32 @@ public class StockTrackerService {
             out.put("success", true);
             out.put("as_of", asOf);
             out.put("previous_day", prevDay);
+            // So the screen can say which session is held and which is still only provisional.
+            out.put("provisional_day", provisionalDay);
+            out.put("held_from", asOf);
             out.put("max_price", maxPrice);
             out.put("top10", rows);
             out.put("count", rows.size());
             out.put("avg_return_current", avgCurrent);
+
+            // Today's move: first run of the day -> now. tracked_stock_prices is written once per
+            // symbol per day, on the first refresh, so it already holds the opening reference
+            // without anything new having to be stored. "Now" is the same current price the rest
+            // of the screen uses, which outside market hours is the last completed close - so the
+            // figure settles at the close rather than drifting against a stale quote.
+            Map<String, Double> firstRun = firstRunPrices(institutionId, DateUtil.today());
+            double frSum = 0; int frCount = 0;
+            for (Map<String, Object> r : rows) {
+                Double open = firstRun.get(normalizeSymbol(String.valueOf(r.get("symbol"))));
+                double cur = getD(r, "current_price");
+                if (open == null || open <= 0 || cur <= 0) continue;
+                double pct = Math.round(((cur - open) / open) * 10000.0) / 100.0;
+                r.put("return_from_first_run", pct);
+                frSum += pct; frCount++;
+            }
+            out.put("avg_return_from_first_run",
+                    frCount == 0 ? null : Math.round((frSum / frCount) * 100.0) / 100.0);
+            out.put("first_run_priced", frCount);
             out.put("avg_return_previous", avgPrevious);
             out.put("trend_pct", trendPct);
             out.put("trend_direction", direction);
@@ -3136,12 +4031,16 @@ public class StockTrackerService {
             out.put("sell_count", sells);
             out.put("hold_count", holds);
             out.put("require_crossing", requireCrossing);
+            out.put("require_volume", requireVolume);
+            out.put("apply_ranking", applyRanking);
             out.put("pipeline", "Identify: "
               + (requireCrossing
-                  ? "Previous Close < Base Price AND Current Price >= Base Price (the crossing) AND "
-                  : "Current Price >= Base Price AND ")
-              + "Current Volume > 20-Day Average Volume "
-              + "-> Rank (existing engine, existing weights) -> Buy/Sell (existing logic)");
+                  ? "Previous Close < Base Price AND Current Price >= Base Price (the crossing)"
+                  : "Current Price >= Base Price")
+              + (requireVolume ? " AND Current Volume > 20-Day Average Volume" : "")
+              + (applyRanking
+                  ? " -> Rank (existing engine, existing weights) -> Buy/Sell (existing logic)"
+                  : " -> list every match, strongest move first (no ranking)"));
             out.put("scope", maxPrice == null ? "All stocks"
                                               : "Stocks with a base price below " + maxPrice);
             if (rows.isEmpty()) {
@@ -3177,6 +4076,18 @@ public class StockTrackerService {
     @SuppressWarnings("unchecked")
     public Map<String, Object> getProvisionalTop10(Long userId, Long institutionId,
                                                    boolean requireCrossing) {
+        return getProvisionalTop10(userId, institutionId, requireCrossing, true);
+    }
+
+    /**
+     * @param applyRanking rank by score and keep the Top 10, as the ranked sections do. With it
+     *        off the pool is shortlisted the way the RSI 45 section shortlists - most traded
+     *        first, top six - so the provisional list is drawn from the same rule that will
+     *        select tomorrow's holding, not from a different one.
+     */
+    public Map<String, Object> getProvisionalTop10(Long userId, Long institutionId,
+                                                   boolean requireCrossing,
+                                                   boolean applyRanking) {
         Map<String, Object> out = new LinkedHashMap<>();
         try {
             Map<String, Double> weights = loadTrackerWeights(institutionId);
@@ -3196,15 +4107,26 @@ public class StockTrackerService {
                 return out;
             }
 
-            double[] cohort = pool.stream().mapToDouble(c -> getD(c, "return_pct")).sorted().toArray();
-            // Raw top N by score - no sector cap. The cap is applied to the three ranking sections
-            // only (see selectTop10WithDiversification), so this preview stays a straight read of
-            // what scores highest right now.
-            List<Map<String, Object>> ranked = pool.stream()
-                .map(s -> scoreTrackedStock(s, weights, cohort))
-                .sorted((a, b) -> Double.compare(getD(b, "composite_score"), getD(a, "composite_score")))
-                .limit(getTopN())
-                .collect(Collectors.toList());
+            List<Map<String, Object>> ranked;
+            if (!applyRanking) {
+                // Shortlist, not ranking: heaviest traded first, top six - identical to the
+                // selection the section itself makes, so what is previewed here is what will
+                // actually be held.
+                ranked = pool.stream()
+                    .sorted((a, b) -> Double.compare(getD(b, "volume"), getD(a, "volume")))
+                    .limit(getShortlistCount())
+                    .collect(Collectors.toList());
+            } else {
+                double[] cohort = pool.stream().mapToDouble(c -> getD(c, "return_pct")).sorted().toArray();
+                // Raw top N by score - no sector cap. The cap is applied to the three ranking
+                // sections only (see selectTop10WithDiversification), so this preview stays a
+                // straight read of what scores highest right now.
+                ranked = pool.stream()
+                    .map(s -> scoreTrackedStock(s, weights, cohort))
+                    .sorted((a, b) -> Double.compare(getD(b, "composite_score"), getD(a, "composite_score")))
+                    .limit(getTopN())
+                    .collect(Collectors.toList());
+            }
 
             List<Map<String, Object>> rows = new ArrayList<>();
             int rank = 0;
@@ -3217,8 +4139,18 @@ public class StockTrackerService {
                 row.put("sector", s.get("sector"));
                 row.put("base_price", s.get("base_price"));
                 row.put("previous_close", s.get("previous_close"));
-                row.put("current_price", s.get("current_price"));
-                row.put("return_pct", s.get("return_pct"));
+                // Rounded here, not left to the template: the raw quote is a float and reached the
+                // screen as 126.41999816894531 beside neighbours printed to two places.
+                row.put("current_price", round2(getD(s, "current_price")));
+                // Fresh row map, named fields only - so anything not listed silently never
+                // arrives. That is how ATR came to render "-" on every line once already.
+                row.put("atr14", s.get("atr14"));
+                row.put("atr_pct", s.get("atr_pct"));
+                // Prev Close -> Current, matching the two columns either side of it. return_pct
+                // (from the base price) is kept alongside for anything still reading it.
+                row.put("return_pct", s.getOrDefault("price_change_pct", s.get("return_pct")));
+                row.put("return_from_base_pct", s.get("return_pct"));
+                row.put("price_change_pct", s.get("price_change_pct"));
                 row.put("score", s.get("composite_score"));
                 Object fs = s.get("factor_scores");
                 if (fs instanceof Map<?, ?> fm) row.put("weight_used", fm.get("_weight_used"));
@@ -3252,10 +4184,38 @@ public class StockTrackerService {
     @SuppressWarnings("unchecked")
     private List<String> tradingDaysWithData(String from, String to) {
         try {
+            // Either feed counts. Restricting this to DAILY made the rebuild blind to sessions
+            // the database plainly holds: on 5 Sep 2026 the daily feed stopped at 28 Aug while
+            // intraday carried five complete sessions after it - 31 Aug and 1-4 Sep, about
+            // 208,000 candles each. The chart ended on 28 Aug and looked stale, when in fact the
+            // data was there and only this lookup could not see it.
+            // Walked one date at a time through the index, not scanned.
+            //
+            // SELECT DISTINCT over this table costs a parallel sequential scan: UPPER(COALESCE(
+            // candle_mode,'')) cannot use an index, so Postgres read 4.5M rows and sorted 1.5M
+            // per worker to return 21 dates - measured at 20,455 ms, on a query that runs before
+            // every rebuild and on section loads besides. It was the largest single wait on the
+            // page and it never appeared in the timings, because the method's own clock starts
+            // after this call.
+            //
+            // The recursive form is the standard loose index scan: take the first date in range,
+            // then repeatedly take the next one after it. That is about twenty index probes
+            // against idx_bmc_trade_date. Same 21 dates, verified against the old query, in
+            // 16.6 ms. The mode test is kept inside both halves, so a third candle_mode arriving
+            // later still changes the answer exactly as it would have before.
             List<?> days = em.createNativeQuery(
-                "SELECT DISTINCT trade_date FROM broker_market_candles " +
-                "WHERE UPPER(COALESCE(candle_mode,'')) = 'DAILY' AND trade_date >= ? AND trade_date <= ? " +
-                "ORDER BY trade_date")
+                "WITH RECURSIVE d AS ( " +
+                "  SELECT (SELECT MIN(b.trade_date) FROM broker_market_candles b " +
+                "           WHERE b.trade_date >= ?1 AND b.trade_date <= ?2 " +
+                "             AND UPPER(COALESCE(b.candle_mode,'')) IN ('DAILY','INTRADAY')" +
+                "         ) AS trade_date " +
+                "  UNION ALL " +
+                "  SELECT (SELECT MIN(b.trade_date) FROM broker_market_candles b " +
+                "           WHERE b.trade_date > d.trade_date AND b.trade_date <= ?2 " +
+                "             AND UPPER(COALESCE(b.candle_mode,'')) IN ('DAILY','INTRADAY')) " +
+                "  FROM d WHERE d.trade_date IS NOT NULL " +
+                ") " +
+                "SELECT trade_date FROM d WHERE trade_date IS NOT NULL ORDER BY trade_date")
                 .setParameter(1, from).setParameter(2, to).getResultList();
             List<String> out = new ArrayList<>();
             for (Object d : days) if (d != null) out.add(d.toString());
@@ -3389,10 +4349,32 @@ public class StockTrackerService {
                                                      boolean applyReturnBand,
                                                      boolean requireCrossing,
                                                      boolean capPerSector) {
+        return getReconstructedTrend(userId, institutionId, from, to, maxPrice, buyTime, sellTime,
+                                     applyReturnBand, requireCrossing, capPerSector, true);
+    }
+
+    /**
+     * @param applyRanking rebuild each past day the way the section that shows it selects today.
+     *        A section that has dropped ranking must drop it here too, or its bars are the average
+     *        of a ranked ten while its table lists every match - two different populations under
+     *        one heading, which is worse than either on its own.
+     */
+    public Map<String, Object> getReconstructedTrend(Long userId, Long institutionId,
+                                                     String from, String to, Double maxPrice,
+                                                     String buyTime, String sellTime,
+                                                     boolean applyReturnBand,
+                                                     boolean requireCrossing,
+                                                     boolean capPerSector,
+                                                     boolean applyRanking) {
         final String bt = (buyTime  == null || buyTime.isBlank())  ? getTradeBuyTime()  : buyTime;
         final String st = (sellTime == null || sellTime.isBlank()) ? getTradeSellTime() : sellTime;
         Map<String, Object> out = new LinkedHashMap<>();
         List<Map<String, Object>> bars = new ArrayList<>();
+        // No range given means the whole of what can honestly be rebuilt.
+        String coverageFrom = earliestReconstructableDate(userId, institutionId);
+        if (from == null || from.isBlank()) from = coverageFrom;
+        if (to == null || to.isBlank()) to = DateUtil.today();
+        out.put("coverage_from", coverageFrom);
         List<String> days = tradingDaysWithData(from, to);
 
         // Look a little past the range so the last day can still be settled if the market has
@@ -3401,28 +4383,103 @@ public class StockTrackerService {
             to, java.time.LocalDate.parse(to).plusDays(10).toString());
 
         long started = System.currentTimeMillis();
+
+        // Load every day's history in one pass before the loop starts.
+        //
+        // Each simulated day used to run its own 45-session candle scan, so the cost of the chart
+        // was the number of bars on it - twenty-two scans for a thirty-day range, on top of two
+        // intraday lookups per day. That is what left the panel on "Running..." with nothing drawn
+        // beneath it. The window below is a superset of every day in the loop, so each day now
+        // slices what is already in memory. Primed from the upload history rather than from any
+        // one day's universe, because a symbol can drop out of the universe mid-range and must
+        // still have its bars when the earlier days ask for them.
+        boolean primed = false;
+        if (!days.isEmpty()) {
+            try {
+                String wFrom = java.time.LocalDate.parse(days.get(0)).minusDays(60).toString();
+                // Two weeks past the last signal date. Holding-day returns look FORWARD from the
+                // entry, so a window that stops at the last signal leaves the newest trades with
+                // nothing to measure Day 1-5 against. Only the cache bound moves; the days the
+                // loop iterates over are unchanged, so this adds no signal and removes none.
+                String wTo = java.time.LocalDate.parse(days.get(days.size() - 1))
+                    .plusDays(14).toString();
+                List<String> allSyms = universeSymbols(userId, institutionId, wTo);
+                if (!allSyms.isEmpty()) {
+                    long tw = System.currentTimeMillis();
+                    // Loaded with the window unset, so this call does the real query - and picks
+                    // up the intraday gap fold on the way, exactly as the per-day calls did.
+                    int span = (int) java.time.temporal.ChronoUnit.DAYS.between(
+                        java.time.LocalDate.parse(wFrom), java.time.LocalDate.parse(wTo)) + 1;
+                    Map<String, List<DayBar>> all = dailyBarsUpTo(allSyms, wTo, span);
+                    barWindow.set(new BarWindow(wFrom, wTo, all));
+                    primed = true;
+                    log.info("[TrendWindow] {} symbol(s) over {}..{} loaded once in {} ms "
+                           + "for {} simulated day(s)",
+                        all.size(), wFrom, wTo, System.currentTimeMillis() - tw, days.size());
+                }
+            } catch (Exception e) {
+                // A window is an optimisation, never a requirement: fall back to per-day loads.
+                log.debug("Trend bar window skipped: {}", e.getMessage());
+            }
+        }
+        try {
+        int reused = 0;
         for (int i = 0; i < days.size(); i++) {
             final String day = days.get(i);
             String next = (i + 1 < days.size()) ? days.get(i + 1)
                 : forward.stream().filter(d -> d.compareTo(day) > 0).findFirst().orElse(null);
 
+            // A settled day is finished history and cannot change.
+            //
+            // Its ten are chosen from stored candles up to that date and its return is measured
+            // between two prints that have both already happened - so rebuilding it on every
+            // request is pure repetition. At roughly 300 ms a day that repetition is the whole
+            // reason the chart could only afford a 30-day window while the database holds 301
+            // sessions. Cached, the first build of a range pays for it and every later one is
+            // near-free, which is what makes the full back history usable at all.
+            //
+            // Only settled days are stored. The newest day is an open position valued at the
+            // live price and must be recomputed every time, so it never enters this map.
+            String dayKey = userId + "|" + institutionId + "|" + day + "|" + next + "|" + bt + "|"
+                + st + "|" + maxPrice + "|" + applyReturnBand + "|" + requireCrossing + "|"
+                + capPerSector + "|" + applyRanking;
+            Map<String, Object> cached = settledDayCache.get(dayKey);
+            if (cached != null) { bars.add(cached); reused++; continue; }
+
             List<Map<String, Object>> top = reconstructTop10AsOf(
-                userId, institutionId, day, maxPrice, applyReturnBand, requireCrossing, capPerSector);
+                userId, institutionId, day, maxPrice, applyReturnBand, requireCrossing,
+                capPerSector, true, applyRanking);
             Map<String, Object> bar = new LinkedHashMap<>();
             bar.put("date", day);
             bar.put("stocks_ranked", top.size());
 
             if (top.isEmpty()) {
                 bar.put("trade_avg_return", null);
-                bar.put("trade_source", "no_data");
-                bar.put("note", "No stock met the entry rules on this day.");
+                // "Nothing qualified" and "the day is not finished" are different facts, and
+                // saying the first when the second is true reads as a strategy that found nothing
+                // rather than as a session still in progress. Selection needs the official daily
+                // close for the day being rebuilt, and that is published after the session - so
+                // mid-session today has intraday candles but no daily bar, and ranks nothing yet.
+                boolean sessionIncomplete = day.compareTo(DateUtil.today()) >= 0;
+                bar.put("trade_source", sessionIncomplete ? "pending" : "no_data");
+                bar.put("note", sessionIncomplete
+                    ? "Today is still trading. This bar fills in once the session's daily close "
+                    + "is published."
+                    : "No stock met the entry rules on this day.");
                 bars.add(bar);
                 continue;
             }
             List<String> syms = top.stream().map(s -> String.valueOf(s.get("symbol"))).toList();
             bar.put("symbols", syms);
 
-            if (next == null) {
+            // A position is open until its EXIT has actually happened - which is not the same as
+            // being the last day in the list. The moment today appeared as a day of its own, the
+            // previous session stopped being the last row and was treated as settled, so it tried
+            // to price an 11:00 exit that is still hours away, found nothing, and reported
+            // "no_data" - six ranked stocks showing a blank bar. That is the newest meaningful bar
+            // on the chart, so the chart looked stuck one session back.
+            boolean exitPending = next == null || next.compareTo(DateUtil.today()) >= 0;
+            if (exitPending) {
                 // The most recent ranking day has no following session yet, so the trade it opened
                 // is still running. Reporting it as blank made an open position with ten stocks in
                 // it indistinguishable from a day on which nothing qualified - the two could not be
@@ -3443,13 +4500,14 @@ public class StockTrackerService {
                 }
                 bar.put("trade_avg_return", null);        // not settled, so it never enters the average
                 bar.put("trade_source", "open");
+                bar.put("sell_date", next);
                 bar.put("open_return_pct", m > 0 ? Math.round((s2 / m) * 100.0) / 100.0 : null);
                 bar.put("open_priced", m);
                 bar.put("trade_winners", up);
                 bar.put("trade_losers", down);
                 bar.put("note", m > 0
                     ? "Open position, valued at the current price. Settles at " + st
-                      + " on the next trading day."
+                      + (next == null ? " on the next trading day." : " on " + next + ".")
                     : "Open position. No current price available for these stocks yet.");
                 bars.add(bar);
                 continue;
@@ -3501,6 +4559,7 @@ public class StockTrackerService {
                 row.put("sell_time",  st);
                 row.put("sell_price", Math.round(sell * 100.0) / 100.0);
                 row.put("return_pct", Math.round(r * 100.0) / 100.0);
+                putHoldingDayReturns(row, symbol, day, buy);
                 priced.add(row);
                 sum += r;
                 n++;
@@ -3525,8 +4584,19 @@ public class StockTrackerService {
                 bar.put("trade_losers", loss);
                 bar.put("trade_symbol_count", n);
                 bar.put("sell_date", next);
+                // Settled: both legs are in the past, so this bar is now permanent.
+                if (settledDayCache.size() < SETTLED_DAY_CACHE_MAX) {
+                    settledDayCache.put(dayKey, java.util.Collections.unmodifiableMap(bar));
+                }
             }
             bars.add(bar);
+        }
+        if (reused > 0) {
+            log.info("[TrendCache] {} of {} day(s) served from settled history", reused, days.size());
+        }
+        } finally {
+            // Pooled thread: the window must never outlive this rebuild.
+            if (primed) barWindow.remove();
         }
 
         List<Double> measured = bars.stream()
@@ -3931,13 +5001,24 @@ public class StockTrackerService {
             .limit(getTopN())
             .collect(Collectors.toList());
 
+        // Two places, both money: round before it leaves. These are float quotes and reached the
+        // Today top 10 table as 724.0999755859375 next to neighbours printed to two places.
+        for (Map<String, Object> s : scored) {
+            if (s.get("current_price") != null)  s.put("current_price",  round2(getD(s, "current_price")));
+            if (s.get("previous_close") != null) s.put("previous_close", round2(getD(s, "previous_close")));
+            if (s.get("base_price") != null)     s.put("base_price",     round2(getD(s, "base_price")));
+            if (s.get("return_pct") != null)     s.put("return_pct",     round2(getD(s, "return_pct")));
+        }
+
         double avgReturn = scored.stream().mapToDouble(s -> getD(s, "return_pct")).average().orElse(0);
         long positive = scored.stream().filter(s -> getD(s, "return_pct") >= 0).count();
         Map<String, Long> sectorDist = scored.stream().collect(
             Collectors.groupingBy(s -> String.valueOf(s.getOrDefault("sector", "Unknown")), Collectors.counting()));
 
         Map<String, Object> result = buildRankingResponse(
-            "FALLBACK-" + System.currentTimeMillis(),
+            // Not a fallback any more - this is how Today top 10 is produced. The old prefix
+            // told the screen a saved run was missing when nothing was missing at all.
+            "LIVE-" + System.currentTimeMillis(),
             scored, List.of(), scored,
             avgReturn, 0, scored.isEmpty() ? 0 : positive * 100.0 / scored.size(), 0,
             (int) positive, 0, candidates.size(), weights, sectorDist);
@@ -4295,7 +5376,7 @@ public class StockTrackerService {
             double base = getNumber(r[4]);
             double cur = getNumber(r[5]);
             DailyTrackerPrice dp = liteDaily.get(normalizeSymbol(String.valueOf(r[0])));
-            m.put("close_price", dp != null && dp.close > 0 ? dp.close : null);
+            m.put("close_price", dp != null && dp.close > 0 ? round2(dp.close) : null);
             m.put("close_date", dp != null ? normalizeStoredDate(dp.tradeDate) : null);
             m.put("volume", dp != null && dp.volume > 0 ? dp.volume : null);
             m.put("symbol", String.valueOf(r[0]));
@@ -4303,9 +5384,27 @@ public class StockTrackerService {
             m.put("market_cap_name", r[2]);
             m.put("mcap", r[2]);
             m.put("upload_date", r[3]);
-            m.put("base_price", base > 0 ? base : null);
-            m.put("current_price", cur > 0 ? cur : null);
-            m.put("return_pct", getNumber(r[6]));
+            m.put("base_price", base > 0 ? round2(base) : null);
+            m.put("current_price", cur > 0 ? round2(cur) : null);
+            m.put("return_pct", round2(getNumber(r[6])));
+
+            // Previous Close, under the name the screen actually reads.
+            //
+            // The close was returned as "close_price" while the table binds "previous_close", so
+            // that column rendered "-" on every row and the Today % beside it - which only shows
+            // when previous_close is set - stayed blank with it. The value was in the payload the
+            // whole time under a different name.
+            //
+            // Only offered when the close is from an EARLIER session than the current price.
+            // Once the day's own daily bar lands, close_price IS today's close, and calling that
+            // "previous" would compare the price with itself and report a flat 0.00%.
+            String curDate = r[11] == null ? null : String.valueOf(r[11]);
+            String closeDate = dp != null ? normalizeStoredDate(dp.tradeDate) : null;
+            Double prevClose = (dp != null && dp.close > 0 && closeDate != null && curDate != null
+                                && closeDate.compareTo(curDate) < 0) ? dp.close : null;
+            m.put("previous_close", prevClose == null ? null : round2(prevClose));
+            m.put("today_return_pct", prevClose != null && prevClose > 0 && cur > 0
+                ? round2(((cur - prevClose) / prevClose) * 100.0) : null);
             m.put("last_refreshed", r[7]);
             m.put("is_active", r[8]);
             m.put("base_price_source", r[9]);
@@ -4492,10 +5591,22 @@ public class StockTrackerService {
             // last valid, not when we polled for it. In session it is the live tick. Once
             // the market shuts, the current price IS the last close, so report that close
             // - opening the app on a Sunday shows Friday 15:30, not the Sunday fetch time.
+            // Out of session, prefer the session the displayed price actually came from over the
+            // calendar. lastSessionCloseIST() is pure arithmetic - most recent weekday at 15:30 -
+            // so while prices were frozen at the 2026-11-01 fetch and the newest stored daily bar
+            // was 2026-10-30, this column still read "10-Nov 15:30" and presented a nine-day-old
+            // price as current. The daily bar's own date is the honest answer: a close price IS
+            // that session's 15:30 price, and an LTP fetched when the market is shut is the same
+            // close. Only when there is no stored bar at all does the calendar stand in.
+            String closedUpdate = lastSessionCloseIST();
+            if (daily != null && daily.tradeDate != null) {
+                String session = normalizeStoredDate(daily.tradeDate);
+                if (session != null && !session.isBlank()) closedUpdate = session + " 15:30:00";
+            }
             String lastUpdate = marketOpen
                 ? (live != null && live.lastTradeTime != null
                     ? String.valueOf(live.lastTradeTime) : DateUtil.now())
-                : lastSessionCloseIST();
+                : closedUpdate;
             m.put("last_update", lastUpdate);
             m.put("price_type", selectedPriceType.isBlank() ? "Stored" : selectedPriceType);
             if (normalizedSymbol.isBlank()) {
@@ -4660,13 +5771,6 @@ public class StockTrackerService {
 
         mergeDailyPrices(prices, aliasToSymbol, aliases,
             "SELECT k.sym,x.trade_date,x.open,x.high,x.low,x.close,x.volume " + lateralFrom +
-            "SELECT m.trade_date,m.open,m.high,m.low,m.close,COALESCE(m.total_volume,m.volume) AS volume " +
-            "FROM market_data m WHERE " + normalizedSql("m.symbol") + "=k.sym " +
-            "AND (m.exchange IS NULL OR UPPER(m.exchange) IN ('NSE','NSE_EQ')) " +
-            "ORDER BY m.trade_date DESC LIMIT 1) x");
-
-        mergeDailyPrices(prices, aliasToSymbol, aliases,
-            "SELECT k.sym,x.trade_date,x.open,x.high,x.low,x.close,x.volume " + lateralFrom +
             "SELECT b.trade_date,b.open,b.high,b.low,b.close,COALESCE(b.total_volume,b.volume) AS volume " +
             "FROM broker_market_candles b WHERE " + normalizedSql("b.symbol") + "=k.sym " +
             // Predicate written to MATCH idx_bmc_norm_daily_date exactly. Written as
@@ -4746,9 +5850,26 @@ public class StockTrackerService {
                     DailyTrackerPrice candidate = new DailyTrackerPrice(asText(r[1]), getNumber(r[2]), getNumber(r[3]),
                         getNumber(r[4]), getNumber(r[5]), getNumber(r[6]));
                     DailyTrackerPrice existing = prices.get(tracked);
-                    if (existing == null || candidate.tradeDate.compareTo(existing.tradeDate) > 0) {
-                        prices.put(tracked, candidate);
-                    }
+                    if (existing != null
+                        && candidate.tradeDate.compareTo(existing.tradeDate) <= 0) continue;
+
+                    // Newer is not automatically better.
+                    //
+                    // Two lookups feed this map: the stored daily bar, and a fallback that folds
+                    // intraday rows into one bar per day. Daily bars currently stop at 27 Aug for
+                    // most stocks while intraday reaches 28 Aug, so the fallback is always the
+                    // newer of the two and used to win outright. The 28 Aug intraday rows exist
+                    // but carry no volume at all - 66 bars for 360ONE summing to zero - so a
+                    // complete 27 Aug bar showing 317,442 was being replaced by an empty one, and
+                    // the Volume column on Uploaded Stock Details rendered "-" for every row.
+                    //
+                    // A bar with no price is not a bar. A bar with a price but no volume is
+                    // usable for price and useless for volume, so it may only take over from a
+                    // bar that had no volume either.
+                    if (candidate.close <= 0) continue;
+                    if (existing != null && candidate.volume <= 0 && existing.volume > 0) continue;
+
+                    prices.put(tracked, candidate);
                 }
             } catch (Exception e) {
                 log.debug("Daily price lookup skipped: {}", e.getMessage());
@@ -4930,6 +6051,66 @@ public class StockTrackerService {
     private List<Map<String, Object>> selectTrackedCandidates(Long userId, Long institutionId,
                                                              boolean requireCrossing,
                                                              boolean applyReturnBand) {
+        // Shared result, computed once.
+        //
+        // Three panels on the tracker page ask this same question on load, and the logs caught two
+        // of them running it concurrently to the millisecond - the same 794 candidates, the same
+        // 6.6-second candle batch, twice over. Leaving the section and returning re-ran the lot
+        // again, which is exactly the "takes just as long the second time" complaint: nothing was
+        // being reused, so every visit paid full price.
+        //
+        // A short entry is enough. Callers get their own copy, so a caller that sorts or annotates
+        // its list cannot disturb another's; the maps are copied too, because the ranking stage
+        // writes scores into them.
+        String key = userId + "|" + institutionId + "|" + requireCrossing + "|" + applyReturnBand;
+        long ttl = isMarketOpen() ? CANDIDATE_TTL_OPEN_MS : CANDIDATE_TTL_CLOSED_MS;
+        CandidateCacheEntry hit = candidateCache.get(key);
+        if (hit != null && (System.currentTimeMillis() - hit.at) < ttl) {
+            return copyCandidates(hit.rows);
+        }
+        // Single-flight: the second caller waits for the first rather than starting its own scan.
+        Object lock = candidateLocks.computeIfAbsent(key, k -> new Object());
+        synchronized (lock) {
+            CandidateCacheEntry again = candidateCache.get(key);
+            if (again != null && (System.currentTimeMillis() - again.at) < ttl) {
+                return copyCandidates(again.rows);
+            }
+            List<Map<String, Object>> fresh =
+                computeTrackedCandidates(userId, institutionId, requireCrossing, applyReturnBand);
+            candidateCache.put(key, new CandidateCacheEntry(System.currentTimeMillis(), fresh));
+            return copyCandidates(fresh);
+        }
+    }
+
+    /** While the market is moving the answer goes stale quickly; once it shuts it cannot change. */
+    private static final long CANDIDATE_TTL_OPEN_MS = 60_000L;
+    private static final long CANDIDATE_TTL_CLOSED_MS = 10 * 60_000L;
+
+    private record CandidateCacheEntry(long at, List<Map<String, Object>> rows) {}
+
+    private final java.util.concurrent.ConcurrentHashMap<String, CandidateCacheEntry>
+        candidateCache = new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<String, Object>
+        candidateLocks = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * A caller's own copy. The rows are handed to ranking and to CSV builders, both of which write
+     * into them, so sharing the stored maps would let one panel's scores appear in another's.
+     */
+    private List<Map<String, Object>> copyCandidates(List<Map<String, Object>> rows) {
+        List<Map<String, Object>> out = new ArrayList<>(rows.size());
+        for (Map<String, Object> r : rows) out.add(new LinkedHashMap<>(r));
+        return out;
+    }
+
+    /** Drops the memo so the next read recomputes - used whenever prices or uploads change. */
+    private void invalidateCandidateCache() {
+        candidateCache.clear();
+    }
+
+    private List<Map<String, Object>> computeTrackedCandidates(Long userId, Long institutionId,
+                                                             boolean requireCrossing,
+                                                             boolean applyReturnBand) {
         long tLoad = System.currentTimeMillis();
         List<Map<String, Object>> stocks;
         currentAboveBaseOnly.set(true);
@@ -4961,17 +6142,57 @@ public class StockTrackerService {
         log.info("[RankTiming] tracked-load {} ms ({} rows), bars-batch {} ms ({} candidates)",
             loadMs, stocks.size(), barsMs, candidates.size());
 
+        // When each candidate's price was last stamped. The row maps this path builds do not
+        // carry current_price_date - only the lite uploaded-stocks view does - so the staleness
+        // test below had nothing to read and silently passed everything. One query for the
+        // institution, reused for every candidate.
+        Map<String, String> candidatePriceDates = trackedPriceDates(
+            candidates.stream().map(s -> String.valueOf(s.getOrDefault("symbol", ""))).toList(),
+            institutionId);
+
         List<Map<String, Object>> filtered = new ArrayList<>();
         Map<String, double[]> volData = new HashMap<>();
+        // Why candidates drop out. "0 eligible" on its own cannot distinguish a genuinely quiet
+        // day from missing bars, an unusable volume feed, or a filter that is simply wrong - and
+        // that difference is the whole diagnosis.
+        int noBars = 0, noPrevClose = 0, notCrossing = 0, noTodayVol = 0, volUnmeasurable = 0,
+            volBelowAvg = 0, stalePrice = 0;
         for (Map<String, Object> s : candidates) {
             String sym = String.valueOf(s.getOrDefault("symbol", ""));
             double basePrice = getD(s, "base_price");
             List<CandleBar> bars = barsBySymbol.getOrDefault(normalizeSymbol(sym), List.of());
             boolean latestBarIsCurrent = currentPriceIsLatestBar(bars);
-            int prevIdx = previousBarIndex(bars);
+            // The bar BEFORE the one the current price came from.
+            //
+            // previousBarIndex steps back only when the newest bar is TODAY'S. Outside market
+            // hours the newest bar is an earlier completed session and the current price IS its
+            // close, so prevClose and currentPrice became the same number. Candidates reach this
+            // loop precisely because currentPrice >= basePrice, so "prevClose >= basePrice" was
+            // then true for all of them and the crossing test could never fire: 793 of 794
+            // rejected as "not crossing" on 6 Sep 2026, which is every evening and every weekend.
+            // Against the real previous session 23 of those 794 genuinely cross.
+            int prevIdx = latestBarIsCurrent ? 1 : 0;
+            if (bars.isEmpty()) { noBars++; continue; }
+
+            // The stored price must be at least as recent as the price history it is judged
+            // against. RUBYMILLS ranked FIRST in Today top 10 on a price last stamped 31 Aug,
+            // seven sessions stale: its Current read 384.35 against a Previous Close of 428.30
+            // from 4 Sep - a stock shown as today's strongest pick while quoted below the very
+            // bar it was being compared with, and a 92% "return" measured from a week-old number.
+            // A price older than the newest stored bar cannot be today's price, and every figure
+            // derived from it - return, crossing, rank - is fiction.
+            Object priceDateRaw = s.get("current_price_date");
+            String priceDate = priceDateRaw != null ? String.valueOf(priceDateRaw)
+                : candidatePriceDates.get(normalizeSymbol(sym));
+            String newestBarDate = normalizeStoredDate(bars.get(0).tradeDate);
+            if (priceDate != null && !priceDate.isBlank() && newestBarDate != null
+                && priceDate.compareTo(newestBarDate) < 0) {
+                stalePrice++;
+                continue;
+            }
             double prevClose = bars.size() > prevIdx ? bars.get(prevIdx).close : 0;
-            if (prevClose <= 0) continue;
-            if (requireCrossing && prevClose >= basePrice) continue;
+            if (prevClose <= 0) { noPrevClose++; continue; }
+            if (requireCrossing && prevClose >= basePrice) { notCrossing++; continue; }
             // Traded volume for the current session. Mid-session the live quote carries it.
             // Outside market hours the quote has no volume at all, so fall back to the newest
             // stored bar - otherwise the stock is dropped for having "no volume" whenever the
@@ -4979,24 +6200,88 @@ public class StockTrackerService {
             // the close is almost always (MAMATA: quote 420.35 against a 421 bar close).
             double quoteVol = getD(s, "volume");
             boolean useBarVolume = latestBarIsCurrent || (quoteVol <= 0 && !bars.isEmpty());
-            // The 20-day average must exclude whichever bar the volume came from, otherwise
-            // the comparison includes the very volume it is being judged against.
-            int avgFrom = useBarVolume ? 1 : 0;
-            double avg20Vol = bars.size() > avgFrom + 1
-                ? averageVolume(bars, avgFrom, Math.min(20, bars.size() - avgFrom)) : 0;
-            double todayVol = useBarVolume ? bars.get(0).volume : quoteVol;
+
+            // The newest bar is not always one that can answer a volume question.
+            //
+            // Sessions missing from the daily feed are now reconstructed from intraday candles,
+            // and 28 Aug 2026 is a complete price session carrying no traded volume whatsoever.
+            // Taking bars.get(0) as "today's volume" therefore read 0 for every stock whose
+            // 28 Aug bar was reconstructed, and made the 20-day average unmeasurable for the
+            // rest - because a reconstructed bar is its own source, so the same-source average
+            // had a single bar to work with. The result was all 794 candidates failing the
+            // volume test in one run, and not one of them for having low volume.
+            //
+            // So the volume test is anchored to the newest bar that actually carries volume,
+            // and the average is taken from behind THAT bar. Price still comes from the newest
+            // bar - the crossover is a price question and the reconstruction answers it well.
+            int volIdx = 0;
+            while (volIdx < bars.size() && bars.get(volIdx).volume <= 0) volIdx++;
+            boolean haveBarVolume = volIdx < bars.size();
+
+            // The average must exclude whichever bar the volume came from, otherwise the
+            // comparison includes the very volume it is being judged against.
+            int avgFrom = useBarVolume ? volIdx + 1 : 0;
+            double avg20Vol = haveBarVolume && bars.size() > avgFrom + 1
+                ? sameSourceAverageVolume(bars, avgFrom, Math.min(20, bars.size() - avgFrom),
+                                          bars.get(volIdx), MIN_SAME_SOURCE_VOL_BARS) : 0;
+            double todayVol = useBarVolume ? (haveBarVolume ? bars.get(volIdx).volume : 0) : quoteVol;
             volData.put(normalizeSymbol(sym), new double[]{todayVol, avg20Vol});
-            if (todayVol > 0 && avg20Vol > 0 && todayVol > avg20Vol) {
+            // "Cannot be measured" is not "failed" - the same distinction the ATR and
+            // Eligible exports already make. A stock with no comparable volume history is
+            // reported without a volume verdict rather than silently dropped, so a thin feed
+            // shortens the evidence rather than emptying the screen.
+            boolean volMeasurable = todayVol > 0 && avg20Vol > 0;
+            if (todayVol <= 0)             noTodayVol++;
+            else if (avg20Vol <= 0)        volUnmeasurable++;
+            else if (todayVol <= avg20Vol) volBelowAvg++;
+
+            if (!volMeasurable || todayVol > avg20Vol) {
                 // Record the three values the entry test was actually decided on. They were computed
                 // here and then thrown away, so any screen showing this candidate had to display 0
                 // for previous close - which makes the crossing impossible to verify by eye, and
                 // makes a correct list look broken.
                 s.put("previous_close", Math.round(prevClose * 100.0) / 100.0);
+                // Move since the previous close - the two columns shown beside it. The stored
+                // return_pct is measured from the BASE price, which is a different question and
+                // made Return % look unrelated to the Prev Close and Current on the same row.
+                double curPx = getD(s, "current_price");
+                s.put("price_change_pct", prevClose > 0
+                    ? Math.round(((curPx - prevClose) / prevClose) * 10000.0) / 100.0 : 0);
                 s.put("volume", Math.round(todayVol));
                 s.put("avg_20d_volume", Math.round(avg20Vol));
+                s.put("volume_tested", volMeasurable ? "Yes" : "n/a");
+                // ATR14 over the sessions behind the previous close, as a percentage of it.
+                //
+                // Only the as-of reconstruction computed this, so every panel fed by the LIVE
+                // selection - the provisional list inside the RSI 45 section among them - had no
+                // ATR to show and printed "-" on every row. Same window and same denominator as
+                // the reconstruction, so the two screens cannot disagree about one stock.
+                double atr14 = 0, atrPct = 0;
+                int atrEnd = prevIdx + 15;
+                if (bars.size() > atrEnd) {
+                    List<Double> hs = new ArrayList<>(), ls = new ArrayList<>(), cs = new ArrayList<>();
+                    for (int i = atrEnd; i >= prevIdx; i--) {      // oldest-first, ending at D-1
+                        CandleBar bar = bars.get(i);
+                        hs.add(bar.high); ls.add(bar.low); cs.add(bar.close);
+                    }
+                    atr14 = indicator.atr(hs, ls, cs, 14);
+                    if (atr14 > 0 && prevClose > 0) {
+                        atrPct = Math.round((atr14 / prevClose) * 10000.0) / 100.0;
+                    }
+                }
+                s.put("atr14", Math.round(atr14 * 100.0) / 100.0);
+                s.put("atr_pct", atrPct);
                 filtered.add(s);
             }
         }
+        if (filtered.isEmpty() && !candidates.isEmpty()) {
+            log.warn("[RankFunnel] {} candidate(s) above base, none eligible. "
+                   + "no bars {}, price older than newest bar {}, no prev close {}, not crossing {}, "
+                   + "zero volume today {}, 20d average not measurable {}, volume below average {}.",
+                candidates.size(), noBars, stalePrice, noPrevClose, notCrossing,
+                noTodayVol, volUnmeasurable, volBelowAvg);
+        }
+
         filtered.sort((a, b) -> {
             String symA = normalizeSymbol(String.valueOf(a.getOrDefault("symbol", "")));
             String symB = normalizeSymbol(String.valueOf(b.getOrDefault("symbol", "")));
@@ -5201,7 +6486,7 @@ public class StockTrackerService {
                 "SELECT DISTINCT ON (run_date) run_date, curr_positive_count, curr_negative_count, " +
                 "ranked_count, curr_avg_return " +
                 "FROM tracker_rankings WHERE institution_id=?");
-            if (userId != null) histSql.append(" AND user_id=?");
+        if (userId != null) histSql.append(" AND user_id=?");
             histSql.append(" ORDER BY run_date DESC, id DESC LIMIT 30");
             var hq = em.createNativeQuery(histSql.toString()).setParameter(1, institutionId);
             if (userId != null) hq.setParameter(2, userId);
@@ -5250,6 +6535,34 @@ public class StockTrackerService {
      */
     @SuppressWarnings("unchecked")
     public Map<String, Object> getLatestRankingFull(Long userId, Long institutionId, boolean allowFallbackRanking) {
+        // Today top 10 is CALCULATED, never read back from a stored run.
+        //
+        // Rankings were being written to tracker_rankings and the screen then read the newest row
+        // back. That made the list a record rather than a calculation, and it went wrong in two
+        // ways at once. The scheduled job writes its runs with no user_id while a run triggered on
+        // a user's own request carries theirs, so this read - which matches user_id exactly, as it
+        // must while the institution and retail apps are separate - only ever saw the user-scoped
+        // rows. Today top 10 sat on the 09:15 run for the whole morning while fresh runs landed
+        // every five minutes behind it. Worse, a list frozen at 09:15 keeps whatever it selected
+        // then: RUBYMILLS stayed at rank 1 on a price last stamped 31 August.
+        //
+        // Computing it here from the current entry rules removes both problems and matches how
+        // this section is specified: derive it, show it, and let the download carry the same
+        // figures. Stored runs are left alone for anything historical that still refers to them.
+        if (allowFallbackRanking) {
+            Map<String, Object> live = buildFallbackTop10Ranking(userId, institutionId);
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> liveTop =
+                (List<Map<String, Object>>) live.getOrDefault("current_top10", List.of());
+            if (!liveTop.isEmpty()) {
+                live.remove("fallback_ranking");
+                live.put("computed_live", true);
+                live.put("message", "Calculated now from the current entry rules.");
+                live.put("last_updated", DateUtil.now());
+                return live;
+            }
+        }
+
         // Get latest run_id
         StringBuilder latestSql = new StringBuilder(
             "SELECT run_id, run_date, curr_avg_return, curr_win_ratio, curr_positive_count," +
@@ -5307,7 +6620,9 @@ public class StockTrackerService {
             m.put("company_name", names[1]);
             m.put("sector",      r[2]); m.put("market_cap", r[3]);
             m.put("score",       r[4]); m.put("upload_date",r[5]);
-            m.put("base_price",  r[6]); m.put("current_price", displayPrice);
+            // Rounded: these are float quotes and reached the Today top 10 table as
+            // 384.3500061035156 beside neighbours printed to two places.
+            m.put("base_price",  round2(getNumber(r[6]))); m.put("current_price", round2(displayPrice));
             m.put("return_pct",  returnPct);
             m.put("days_since_upload", r[9]);
             m.put("factor_scores", parseJsonSafe(r[10]));
@@ -5326,7 +6641,7 @@ public class StockTrackerService {
             }
             double todayReturn = prevClose > 0 && displayPrice > 0
                 ? Math.round(((displayPrice - prevClose) / prevClose) * 10000.0) / 100.0 : 0;
-            m.put("previous_close", prevClose > 0 ? prevClose : null);
+            m.put("previous_close", prevClose > 0 ? round2(prevClose) : null);
             m.put("today_return_pct", todayReturn);
             double volume = 0;
             if (lq != null && lq.volume > 0) volume = lq.volume;
@@ -5429,9 +6744,12 @@ public class StockTrackerService {
         result.put("eligible_count",  curr[10]);
         result.put("ranked_count",    curr[11]);
         // Market time, not wall-clock. In session this is the live tick; once the market
-        // shuts the prices stop moving, so the honest answer is the last session close -
-        // otherwise the header claims a Sunday morning timestamp for Friday's prices.
-        result.put("last_updated",    isMarketOpen() ? DateUtil.now() : lastSessionCloseIST());
+        // shuts the prices stop moving, so the honest answer is when the last price actually
+        // traded - otherwise the header claims a Sunday morning timestamp for Friday's prices.
+        result.put("last_updated",    isMarketOpen() ? DateUtil.now() : lastTradedAtIST());
+        // Always the traded time, whether or not a session is running, so the screen can say
+        // which it is showing rather than leaving the reader to guess.
+        result.put("last_traded_at",  lastTradedAtIST());
         result.put("market_open",     isMarketOpen());
         result.putAll(rankingQualitySummary(top10));
         result.put("disclaimer", "TradeRakshak™ rankings are for EDUCATIONAL purposes only. Not SEBI investment advice.");
@@ -5580,7 +6898,7 @@ public class StockTrackerService {
             if (buy != null && buy.price > 0 && sell == null) {
                 double live = resolveCurrentPrice(symbol, institutionId);
                 if (live > 0) {
-                    sell = new TradeQuote(live, getTradeSellTime(), "live_price");
+                    sell = new TradeQuote(live, getPrevTop10SellTime(), "live_price");
                     stillOpen = true;
                     source = "open_at_live_price";
                 }
@@ -5602,6 +6920,12 @@ public class StockTrackerService {
             row.put("buy_time", buy.time);
             row.put("sell_price", Math.round(sell.price * 100.0) / 100.0);
             row.put("sell_time", sell.time);
+            // The sell happens on a LATER session than the buy, and only the timestamp knew it.
+            // The row exposed sell_time alone, so the screen paired 11:00 with the buy's date and
+            // showed a sell four and a half hours BEFORE the purchase it closed. TradeQuote.time
+            // is the whole candle_time, so the date is already here - it just was not passed on.
+            row.put("sell_date", stampDatePart(sell.time));
+            row.put("buy_date", stampDatePart(buy.time));
             row.put("return_pct", ret);
             row.put("status", stillOpen ? "OPEN" : "CLOSED");
             row.put("source", source);
@@ -5619,7 +6943,8 @@ public class StockTrackerService {
         result.put("winners", winners);
         result.put("losers", losers);
         result.put("source", source);
-        result.put("rule", "Buy Current Top 10 at 15:20 and sell next trading day at 10:00");
+        result.put("rule", "Buy Current Top 10 at " + getPrevTop10BuyTime()
+                         + " and sell next trading day at " + getPrevTop10SellTime());
         result.put("details", details);
         return result;
     }
@@ -5669,7 +6994,10 @@ public class StockTrackerService {
             // 'T', not a space. candle_time is stored ISO-style ("2026-08-04T15:20:00"), and a
             // space sorts BELOW 'T', so the space form compared lower than every candle of the day
             // and matched all of them - the first row back was the 00:00 bar, never the 15:20 price.
-            symbol, runDate, runDate + "T" + getTradeBuyTime(), "broker_intraday", 2);
+            // The Previous Top 10's own buy time (15:20), not the shared trade time. The RSI 45
+            // section buys at 15:15 and these two must be able to move independently - one
+            // global setting meant a change to either silently repriced the other.
+            symbol, runDate, runDate + "T" + getPrevTop10BuyTime(), "broker_intraday", 2);
         return quote;
     }
 
@@ -5679,30 +7007,26 @@ public class StockTrackerService {
         TradeQuote quote = queryQuoteByNormalizedSymbol(
             "SELECT close,candle_time FROM broker_market_candles " +
             "WHERE (" + brokerSymbol + "=? OR " + brokerTrading + "=?) AND trade_date > ? " +
-            "AND close IS NOT NULL AND close>0 AND candle_time::text >= (trade_date::text || 'T" + getTradeSellTime() + "') " +
+            // 11:00 on the NEXT trading day. trade_date > runDate takes the first session
+            // that actually has data, so weekends and holidays are skipped without the calendar
+            // being consulted - a Friday buy sells on Monday.
+            "AND close IS NOT NULL AND close>0 AND candle_time::text >= (trade_date::text || 'T" + getPrevTop10SellTime() + "') " +
             "ORDER BY trade_date ASC, candle_time ASC LIMIT 1",
             symbol, runDate, null, "broker_intraday", 2);
         return quote;
     }
 
     private TradeQuote[] findDailyFallbackQuotes(String symbol, String runDate) {
-        String marketSymbol = normalizedSql("symbol");
         String candleSymbol = normalizedSql("symbol");
         String candleTrading = normalizedSql("trading_symbol");
+        // broker_market_candles is the only daily store; the market_data pass that ran first here
+        // read a copy of these same rows and so could never resolve a quote the candles missed.
         TradeQuote buy = queryQuoteByNormalizedSymbol(
-            "SELECT close,trade_date FROM market_data WHERE " + marketSymbol + "=? AND trade_date=? " +
-            "AND close IS NOT NULL AND close>0 ORDER BY trade_date DESC LIMIT 1",
-            symbol, runDate, null, "market_daily_close", 1);
-        if (buy == null) buy = queryQuoteByNormalizedSymbol(
             "SELECT close,trade_date FROM broker_market_candles WHERE (" + candleSymbol + "=? OR " + candleTrading + "=?) AND trade_date=? " +
             "AND close IS NOT NULL AND close>0 AND (candle_mode IS NULL OR UPPER(candle_mode)='DAILY') ORDER BY trade_date DESC LIMIT 1",
             symbol, runDate, null, "broker_daily_close", 2);
 
         TradeQuote sell = queryQuoteByNormalizedSymbol(
-            "SELECT close,trade_date FROM market_data WHERE " + marketSymbol + "=? AND trade_date>? " +
-            "AND close IS NOT NULL AND close>0 ORDER BY trade_date ASC LIMIT 1",
-            symbol, runDate, null, "market_daily_close", 1);
-        if (sell == null) sell = queryQuoteByNormalizedSymbol(
             "SELECT close,trade_date FROM broker_market_candles WHERE (" + candleSymbol + "=? OR " + candleTrading + "=?) AND trade_date>? " +
             "AND close IS NOT NULL AND close>0 AND (candle_mode IS NULL OR UPPER(candle_mode)='DAILY') ORDER BY trade_date ASC LIMIT 1",
             symbol, runDate, null, "broker_daily_close", 2);
@@ -5796,6 +7120,25 @@ public class StockTrackerService {
     }
 
     public byte[] exportEligibleStocksCsv(Long userId, Long institutionId) {
+        return exportEligibleStocksCsv(userId, institutionId, false);
+    }
+
+    /**
+     * @param requireVolume treat "Current Volume &gt; 20-Day Average Volume" as a filter rather
+     *        than a reported column. Off by default.
+     *
+     *        <p>The three price rules - return within the band, current at or above base, and the
+     *        previous close below it - are what define this screen. Volume was removing almost
+     *        everything they selected: on 30 Aug 2026, 154 stocks were in the band, 9 of those
+     *        crossed, and not one of the 9 also traded above its 20-day average, so the file came
+     *        out empty. That is not a coincidence to tune around. A 0-5% band selects stocks that
+     *        have barely moved, and stocks that barely move trade quietly, so demanding a small
+     *        return AND heavier-than-usual volume asks for two things that rarely occur together.
+     *
+     *        <p>The ratio is still on every row, so a volume-led reading of the same list is one
+     *        sort away, and requireVolume=true restores the old behaviour exactly.
+     */
+    public byte[] exportEligibleStocksCsv(Long userId, Long institutionId, boolean requireVolume) {
         // No signal enrichment needed (those columns were removed) \u2192 faster query.
         List<Map<String, Object>> eligible = getAllTrackedStocksScoped(userId, institutionId, null, null,
             getEligibleMinReturn(), getEligibleMaxReturn(), "return_pct", "asc", 0, 50000, false);
@@ -5822,7 +7165,14 @@ public class StockTrackerService {
 
             List<CandleBar> bars = barsBySymbol.getOrDefault(normalizeSymbol(symbol), List.of());
             boolean latestBarIsCurrent = currentPriceIsLatestBar(bars);
-            int prevIdx = previousBarIndex(bars);
+            // The bar BEFORE whichever one the current price came from.
+            //
+            // previousBarIndex answers a different question - "which bar should a live quote be
+            // compared against" - and returns bar 0 whenever there is no bar for today. Outside
+            // market hours the current price IS bar 0's close, so Prev Close and Current came out
+            // identical: 1,222 of 1,229 tracked stocks on 6 Sep 2026. That makes the crossing test
+            // compare a number with itself and any move measured between them exactly zero.
+            int prevIdx = latestBarIsCurrent ? 1 : 0;
             double prevClose = bars.size() > prevIdx ? bars.get(prevIdx).close : 0;
             if (prevClose <= 0 || prevClose >= basePrice) continue;
 
@@ -5832,10 +7182,14 @@ public class StockTrackerService {
             boolean useBarVolume = latestBarIsCurrent || (quoteVol <= 0 && !bars.isEmpty());
             int avgFrom = useBarVolume ? 1 : 0;
             double avg20Vol = bars.size() > avgFrom + 1
-                ? averageVolume(bars, avgFrom, Math.min(20, bars.size() - avgFrom)) : 0;
+                ? sameSourceAverageVolume(bars, avgFrom, Math.min(20, bars.size() - avgFrom),
+                                          bars.get(0), MIN_SAME_SOURCE_VOL_BARS) : 0;
             double todayVol = useBarVolume ? bars.get(0).volume : quoteVol;
-            boolean volAboveAvg = todayVol > 0 && avg20Vol > 0 && todayVol > avg20Vol;
-            if (!volAboveAvg) continue;
+            // Same distinction as the ATR export above: only exclude on a comparison that
+            // could actually be made.
+            boolean volMeasurable = todayVol > 0 && avg20Vol > 0;
+            boolean volAboveAvg = volMeasurable && todayVol > avg20Vol;
+            if (requireVolume && volMeasurable && !volAboveAvg) continue;
 
             // Price Change % is now measured against the PREVIOUS CLOSE, not the base price.
             double priceChangePct = prevClose > 0
@@ -5844,8 +7198,21 @@ public class StockTrackerService {
             s.put("previous_close", round2(prevClose));
             s.put("price_change_pct", priceChangePct);
             s.put("current_volume", todayVol > 0 ? round2(todayVol) : null);
-            s.put("vol_above_20d_avg", "Yes");
+            // n/a says the test did not run - not enough same-feed history to compare against.
+            s.put("vol_above_20d_avg", volMeasurable ? (volAboveAvg ? "Yes" : "No") : "n/a");
+            s.put("avg_20d_volume", avg20Vol > 0 ? round2(avg20Vol) : null);
+            s.put("vol_ratio", avg20Vol > 0 ? Math.round((todayVol / avg20Vol) * 100.0) / 100.0 : null);
             s.put("source", s.getOrDefault("current_price_source", ""));
+
+            // Which SESSION the Current Price belongs to. "Last Updated" already says when the
+            // row was fetched, but a row fetched this evening can still be carrying Friday's
+            // close - and those two dates disagreeing is exactly the thing worth seeing. During
+            // a live session the price is today's tick; outside one it is the newest stored
+            // bar, so that bar's own trade date is the honest answer.
+            String priceDate = isMarketOpen() && !bars.isEmpty() && latestBarIsCurrent
+                ? DateUtil.today()
+                : (bars.isEmpty() ? null : normalizeStoredDate(bars.get(0).tradeDate));
+            s.put("current_price_date", priceDate);
             enriched.add(s);
         }
 
@@ -5859,12 +7226,17 @@ public class StockTrackerService {
         StringBuilder csv = new StringBuilder();
         csv.append("\uFEFF");
         csv.append("TradeRakshak\u2122 \u2014 Eligible Stocks (0% to 5%)\n");
-        csv.append("Filter: Price crossing above Base Price, Return 0% to 5%, Volume > 20D Avg\n");
+        csv.append("Filter: Price crossing above Base Price, Return 0% to 5%" + (requireVolume ? ", Volume > 20D Avg" : "") + "\n");
+        if (!requireVolume) {
+            csv.append("Volume is reported, not filtered on - see Volume Ratio. Add requireVolume=true to the download URL to filter on it.\n");
+        }
         csv.append("Condition: Previous Close < Base Price AND Current Price >= Base Price\n");
         csv.append("Note: Price Change % = (Current Price - Previous Close) / Previous Close\n");
         csv.append("Generated: ").append(generatedAt).append(",Total: ").append(enriched.size()).append("\n");
         csv.append("DISCLAIMER: For educational purposes only. Not SEBI investment advice.\n\n");
-        csv.append("Symbol,Base Price,Base Price Date,Previous Close,Current Price,Price Change %,Current Volume,Volume Above 20D Avg,Source,Last Updated,Generated Date & Time\n");
+        csv.append("Symbol,Base Price,Base Price Date,Previous Close,Current Price,"
+                 + "Current Price Date,Price Change %,Current Volume,Volume Above 20D Avg,"
+                 + "Source,Last Updated,Generated Date & Time\n");
 
         for (Map<String, Object> s : enriched) {
             csv.append(safe(s.get("symbol"))).append(",")
@@ -5872,6 +7244,7 @@ public class StockTrackerService {
                .append(safe(s.get("upload_date"))).append(",")
                .append(fmtNum(s.get("previous_close"))).append(",")
                .append(fmtNum(s.get("current_price"))).append(",")
+               .append(safe(s.get("current_price_date"))).append(",")
                .append(fmtNum(s.get("price_change_pct"))).append(",")
                .append(fmtNum(s.get("current_volume"))).append(",")
                .append(safe(s.get("vol_above_20d_avg"))).append(",")
@@ -5880,6 +7253,814 @@ public class StockTrackerService {
                .append(generatedAt).append("\n");
         }
         return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Validated exit bracket for the ATR Base Price Crossover screen. See the export below
+     *  for why these three numbers are not free parameters. */
+    private static final double CROSSOVER_STOP_PCT   = 7.0;
+    private static final double CROSSOVER_TARGET_PCT = 15.0;
+    private static final int    CROSSOVER_MAX_HOLD   = 15;
+    /** Daily bars loaded per symbol: ATR14 needs 15, the volume average 20, and the
+     *  "no earlier touch since the base price date" scan needs to reach back to that date. */
+    private static final int    CROSSOVER_BARS       = 120;
+
+    /**
+     * Bars loaded when the export runs as a trade log rather than a snapshot.
+     *
+     * <p>Every trade has to start at a real historical session, so the window must reach the
+     * oldest base-price date in the tracker - uploads currently run back to 2026-01-02, about
+     * 160 sessions. 260 covers a full year with room to spare; the store itself only holds
+     * from 2025-08-01, so asking for more simply returns what exists.
+     */
+    private static final int    CROSSOVER_LOG_BARS   = 260;
+
+    /**
+     * ATR Base Price Crossover export.
+     *
+     * <p>The entry screen validated against the 5-minute candle history in August 2026. Two
+     * tests decide the list; a third de-duplicates it:
+     *
+     * <ol>
+     *   <li><b>Volatility</b> - ATR14(D-1) / Close(D-1) x 100 &gt;= 3.0%. The only filter in
+     *       the original four-test screen that survived out-of-sample testing: stocks clearing
+     *       it returned +3.04 percentage points more per trade than those that did not
+     *       (t = +4.47), and the gap held in the untouched out-of-sample window.</li>
+     *   <li><b>Trigger</b> - Close(D-1) &lt; Base AND High(D) &gt;= Base. Price closed the
+     *       previous session under the base price and has traded up through it today, so a
+     *       buy-stop resting at the base price would have filled.</li>
+     *   <li><b>First trigger only</b> - the base price must not have been reached in any
+     *       completed session between the upload date and D-1. One entry per base-price setup;
+     *       a stock that keeps dipping under base and popping back is not a fresh signal.</li>
+     * </ol>
+     *
+     * <p><b>Two tests were removed from the earlier version of this screen.</b> The volume
+     * filter (current volume &gt; 20-day average) is gone: at 1.5x the average it was the worst
+     * of every filter tested, raising the stop-loss rate from 19.0% to 24.5%, and its verdict
+     * reversed between the 1.0x and 1.5x thresholds - a result that flips on a small parameter
+     * change has not been established. Volume is still reported in the output, just not used to
+     * exclude rows. The separate "Current Price &gt;= Base Price" test is also gone: it duplicated
+     * the trigger test in a weaker form, and 45.8% of intraday touches of the base price close
+     * back below it, so gating on the live price silently drops trades a buy-stop would already
+     * have taken. "Still Above Base" reports that state instead of filtering on it.
+     *
+     * <p>ADX was tested and deliberately excluded. ADX &lt; 20 cost 0.52 percentage points per
+     * trade (t = -0.87) and inverted out-of-sample, where ADX &gt;= 20 scored a profit factor of
+     * 2.44 against 1.73. Adding it back would cut the list roughly in half for no gain.
+     *
+     * <p>ATR is computed with the same engine the rest of the application uses, on bars up to
+     * and including D-1, so the number here matches what the indicator screens report.
+     *
+     * <p><b>The exit levels in the output are part of the rule, not a suggestion.</b> The
+     * screen is only meaningful paired with them: stop -7%, target +15%, and a hard exit at the
+     * close of the 15th session. A -5% stop sits roughly 1.2 ATR from entry for these names -
+     * inside one day's normal range - and pushed the out-of-sample stop-loss rate to 46.9%.
+     *
+     * <p>One caveat worth passing on to whoever trades this: in testing, waiting for the
+     * crossover did not beat simply buying each stock the day after it was added to the
+     * tracker (+0.01% per trade, t = +0.04). The screen is a disciplined, backtested way to
+     * stagger entries. It has not been shown to select better ones.
+     */
+    @SuppressWarnings("unchecked")
+    public byte[] exportAtrBaseCrossoverCsv(Long userId, Long institutionId, double minAtrPct) {
+        return exportAtrBaseCrossoverCsv(userId, institutionId, minAtrPct, true, false);
+    }
+
+    /**
+     * @param requireVolume    apply "Current Volume &gt; 20-Day Average Volume" as a filter rather
+     *                         than only reporting it. On by default: it is one of the four stated
+     *                         rules for this screen.
+     * @param firstTriggerOnly drop a setup whose base price was already reached in an earlier
+     *                         session. Off by default. It is a useful refinement - a level that
+     *                         has been tested repeatedly is not the same setup as one crossing
+     *                         for the first time - but it is a much stricter rule than the four
+     *                         asked for, and on its own it emptied the export completely: all
+     *                         eight stocks crossing on 27 Aug 2026 had touched their base before,
+     *                         between 2 and 61 times.
+     */
+    @SuppressWarnings("unchecked")
+    public byte[] exportAtrBaseCrossoverCsv(Long userId, Long institutionId, double minAtrPct,
+                                            boolean requireVolume, boolean firstTriggerOnly) {
+        List<Map<String, Object>> all = getAllTrackedStocksScoped(userId, institutionId, null, null,
+            null, null, "symbol", "asc", 0, 50000, false);
+
+        List<Map<String, Object>> priced = new ArrayList<>();
+        for (Map<String, Object> st : all) {
+            if (getD(st, "base_price") > 0) priced.add(st);
+        }
+        if (priced.isEmpty()) return atrCrossoverCsv(List.of(), minAtrPct);
+
+        // 15 bars cover ATR14 and 20 the volume average, but the "no earlier touch since
+        // upload" scan needs to walk back to the upload date, so load a wider window. Median
+        // time from upload to first crossover is 2 sessions; 120 bars covers all but a handful.
+        Map<String, List<CandleBar>> barsBySymbol = loadDailyBarsBatch(
+            priced.stream().map(x -> String.valueOf(x.getOrDefault("symbol", ""))).toList(),
+            CROSSOVER_LOG_BARS);
+
+        // The date the backtest is being evaluated AS OF. Everything after it is unknowable, so
+        // it is what separates a trade that ran out of time from one that is still open.
+        String evaluationDate;
+        try {
+            evaluationDate = marketCalendar.lastCompletedTradingDay().toString();
+        } catch (Exception e) {
+            evaluationDate = DateUtil.today();
+        }
+
+        // Which price counts as "now".
+        //
+        // In a live session the broker quote is the truth. Outside one - after the close, at the
+        // weekend, or on a holiday - it is at best the last session's close carrying today's
+        // timestamp, and at worst days stale. Pricing off it then would report a crossover
+        // against a number that was never traded on the session being judged.
+        //
+        // So when the market is shut the last COMPLETED session is used throughout: its close is
+        // "current", its high is the day high, and the crossover is measured on that session.
+        // A run on a holiday therefore reproduces the previous trading day's answer instead of
+        // inventing a new one, and the same run repeated tomorrow gives the same result.
+        boolean marketOpen = isMarketOpen();
+
+        List<Map<String, Object>> hits = new ArrayList<>();
+        for (Map<String, Object> st : priced) {
+            String symbol = String.valueOf(st.getOrDefault("symbol", ""));
+            double base = getD(st, "base_price");
+            double quotePrice = getD(st, "current_price");
+
+            List<CandleBar> bars = barsBySymbol.getOrDefault(normalizeSymbol(symbol), List.of());
+            if (bars.size() < 16) continue;                    // not enough history for ATR14
+
+            // The base price has to have existed before session D, otherwise a buy-stop could
+            // not have been resting at it. Requiring D-1 to be on or after the base price date
+            // is the same "search starts the session after the base is set" rule the backtest
+            // used. Without it a stock uploaded today lists immediately on today's own bar,
+            // which is a level nobody could have placed an order at.
+            String uploadDate = normalizeStoredDate(String.valueOf(st.getOrDefault("upload_date", "")));
+            boolean hasUploadDate = uploadDate != null && !uploadDate.isBlank();
+
+            // Whether the loaded window actually reaches back to the base price date. If it does
+            // not, the earliest crossing found here might not be the earliest that happened, and
+            // the First Trigger column says UNVERIFIED rather than claiming otherwise.
+            String oldestLoaded = normalizeStoredDate(bars.get(bars.size() - 1).tradeDate);
+            boolean historyReachesUpload = !hasUploadDate
+                || (oldestLoaded != null && oldestLoaded.compareTo(uploadDate) <= 0);
+
+            // Every session that could be a session D, oldest first.
+            //
+            // This used to look at exactly one session - the newest - which is why every row
+            // carried the same entry date and no trade could ever have an outcome. A trade log
+            // needs the crossing wherever it happened, so each stored session with a session
+            // behind it is a candidate, and the live tick is appended as one more when the
+            // market is open and today has no bar yet.
+            List<Integer> sessionIdx = new ArrayList<>();
+            for (int i = bars.size() - 2; i >= 0; i--) sessionIdx.add(i);
+            if (marketOpen && !hasTodayBar(bars)) sessionIdx.add(-1);
+
+            int tradesForSymbol = 0;
+            for (int dIdx : sessionIdx) {
+                int todayIdx = dIdx;
+                int prevIdx  = dIdx + 1;
+                if (bars.size() <= prevIdx + 15) continue;   // no room for ATR14 behind D-1
+
+                String prevBarDate = normalizeStoredDate(bars.get(prevIdx).tradeDate);
+                if (hasUploadDate && prevBarDate != null
+                    && prevBarDate.compareTo(uploadDate) < 0) continue;
+
+                double prevClose = bars.get(prevIdx).close;
+                if (prevClose <= 0 || prevClose >= base) continue; // (1) Close(D-1) < Base Price
+
+                // (2) the base price was actually traded through during session D.
+                CandleBar todayBar = todayIdx >= 0 ? bars.get(todayIdx) : null;
+
+                // A historical session is priced off its OWN bar. The live quote may only stand
+                // in for a session still in progress - using it on a past session would date the
+                // row to 2026-01 and price it at today, which is the corruption this whole change
+                // exists to remove.
+                boolean liveSession = marketOpen && todayIdx <= 0;
+                double current = liveSession
+                    ? (quotePrice > 0 ? quotePrice : (todayBar != null ? todayBar.close : 0))
+                    : (todayBar != null ? todayBar.close : 0);
+                if (current <= 0) continue;
+
+                // A live session's high has to account for the tick that has just printed; a
+                // closed one is already final, so the stored bar is taken as it stands.
+                double todayHigh = todayBar != null
+                    ? (liveSession ? Math.max(todayBar.high, current) : todayBar.high)
+                    : current;
+                double todayLow  = todayBar != null ? todayBar.low : current;
+                if (todayHigh <= 0 || todayHigh < base) continue;
+
+            // (3) ATR14 as a percentage of the D-1 close. The engine wants oldest-first series,
+            // so the window from D-1 backwards is reversed before handing it over.
+            List<Double> highs = new ArrayList<>(), lows = new ArrayList<>(), closes = new ArrayList<>();
+            for (int i = prevIdx + 15; i >= prevIdx; i--) {
+                CandleBar bar = bars.get(i);
+                highs.add(bar.high); lows.add(bar.low); closes.add(bar.close);
+            }
+            double atr14 = indicator.atr(highs, lows, closes, 14);
+            if (atr14 <= 0) continue;
+            double atrPct = Math.round((atr14 / prevClose) * 10000.0) / 100.0;
+            if (atrPct < minAtrPct) continue;
+
+            // (4) first trigger only. The session loop already runs oldest-first, so the
+            // first crossing it reaches IS the first trigger - no backward scan needed. All that
+            // is left is to say so honestly: only the first row emitted for a symbol is the
+            // first trigger, and only if the loaded window reached the base price date.
+
+            // A buy-stop at the base price fills at the first trade at or above it, which can
+            // never be below the day's low. When the stock gapped clean over base the fill is
+            // worse than the level - 39% of backtested entries did exactly this - so the exit
+            // levels are derived from the realistic fill, not from the base price.
+            boolean gappedAboveBase = todayLow > base;
+            double entryRef = Math.max(base, todayLow);
+
+            // The 20-day average starts at D-1 so session D never counts towards the average it
+            // is being measured against.
+            double quoteVol = getD(st, "volume");
+            double avg20Vol = bars.size() > prevIdx + 1
+                ? sameSourceAverageVolume(bars, prevIdx, Math.min(20, bars.size() - prevIdx),
+                                          todayBar != null ? todayBar : bars.get(0),
+                                          MIN_SAME_SOURCE_VOL_BARS) : 0;
+            double todayVol = todayBar != null ? todayBar.volume : quoteVol;
+            // "Cannot be measured" is not "failed".
+            //
+            // sameSourceAverageVolume returns 0 when there are too few bars from the same feed to
+            // average - and right now that is the normal case, because Dhan daily bars only cover
+            // 24-27 Aug, three usable bars against a minimum of five. Treating that 0 as a failed
+            // test silently emptied this export: PENIND and FIVESTAR had been listed and vanished
+            // the moment the same-source rule went in, not because their volume fell but because
+            // it stopped being comparable.
+            //
+            // So the filter only bites when the comparison is real. An unmeasurable stock stays in
+            // and is labelled, which is the honest outcome: the reader can see the test did not run
+            // rather than being shown a shorter list with no explanation.
+            boolean volMeasurable = todayVol > 0 && avg20Vol > 0;
+            if (requireVolume && volMeasurable && todayVol <= avg20Vol) continue;
+
+            Map<String, Object> row = new LinkedHashMap<>(st);
+            row.put("previous_close", round2(prevClose));
+            row.put("today_high", round2(todayHigh));
+            row.put("today_low", round2(todayLow));
+            // The row is a copy of the tracked_stocks record, so current_price is the stored
+            // quote. Overwrite it with the price this row was actually judged on - otherwise the
+            // export prints one number while the decision used another.
+            row.put("current_price", round2(current));
+            row.put("still_above_base", current >= base ? "YES" : "NO");
+            row.put("price_basis", marketOpen ? "Live (market open)"
+                : "Close of " + (todayBar != null ? todayBar.tradeDate : "last session"));
+            row.put("gapped_above_base", gappedAboveBase ? "YES" : "NO");
+            row.put("entry_ref", round2(entryRef));
+            row.put("stop_loss", round2(entryRef * (1 - CROSSOVER_STOP_PCT / 100.0)));
+            row.put("target", round2(entryRef * (1 + CROSSOVER_TARGET_PCT / 100.0)));
+            row.put("max_hold_sessions", CROSSOVER_MAX_HOLD);
+
+            // Entry Date is session D: the session in which the base price was traded
+            // through. It is the stored bar's own date - never today's - so a trade that fired
+            // in January stays dated to January however long afterwards the file is generated.
+            String entryDate = todayBar != null ? normalizeStoredDate(todayBar.tradeDate)
+                                                : DateUtil.today();
+            row.put("entry_date", entryDate);
+
+            resolveCrossoverTrade(row, bars, dIdx, entryRef,
+                                  round2(entryRef * (1 - CROSSOVER_STOP_PCT / 100.0)),
+                                  round2(entryRef * (1 + CROSSOVER_TARGET_PCT / 100.0)),
+                                  entryDate, evaluationDate);
+            row.put("first_trigger", tradesForSymbol > 0 ? "NO"
+                                   : (historyReachesUpload ? "YES" : "UNVERIFIED"));
+            row.put("atr14", round2(atr14));
+            row.put("atr_pct", atrPct);
+            row.put("current_volume", round2(todayVol));
+            row.put("avg_20d_volume", round2(avg20Vol));
+            row.put("vol_ratio", volMeasurable ? Math.round((todayVol / avg20Vol) * 100.0) / 100.0 : null);
+            row.put("vol_tested", volMeasurable ? (todayVol > avg20Vol ? "Yes" : "No") : "n/a");
+            row.put("gain_from_base_pct", Math.round(((current - base) / base) * 10000.0) / 100.0);
+
+            hits.add(row);
+            tradesForSymbol++;
+            if (firstTriggerOnly) break;   // oldest-first, so the first hit IS the first trigger
+            }
+        }
+
+        // Daily bars gave the session each trade entered and left on. This adds the clock
+        // time, and settles any session that touched both levels.
+        fillCrossoverTradeTimes(hits);
+        for (Map<String, Object> r : hits) r.put("validation", validateCrossoverRow(r));
+
+        // A log reads newest trade first; ties break on volatility, which is the filter the
+        // screen is built around.
+        hits.sort((a, b) -> {
+            int byDate = String.valueOf(b.getOrDefault("entry_date", ""))
+                   .compareTo(String.valueOf(a.getOrDefault("entry_date", "")));
+            if (byDate != 0) return byDate;
+            return Double.compare(getD(b, "atr_pct"), getD(a, "atr_pct"));
+        });
+        return atrCrossoverCsv(hits, minAtrPct);
+    }
+
+    /**
+     * Work out what actually happened to one crossover trade, and when.
+     *
+     * <p>The outcome is never inferred from the exit date - it is found by replaying the
+     * sessions after entry and taking the FIRST thing that occurred:
+     *
+     * <pre>
+     *   stop hit first        -&gt; STOP LOSS         exit on that session, at the stop
+     *   target hit first      -&gt; PROFIT BOOK       exit on that session, at the target
+     *   neither, hold expires -&gt; DEFINED DATE EXIT exit on the deadline, at its close
+     *   deadline still ahead  -&gt; OPEN              no exit date at all
+     * </pre>
+     *
+     * <p>A session whose range covers both levels cannot be ordered from a daily bar - the low
+     * and the high carry no time. It is provisionally called a stop, which is the conservative
+     * reading, and flagged so the intraday pass can settle it from 5-minute candles.
+     *
+     * <p>OPEN is decided against the evaluation date, not against today's clock: a trade whose
+     * deadline has not yet arrived has no outcome to report, and inventing one by closing it at
+     * the last available bar would turn "not finished" into a fabricated result.
+     */
+    private void resolveCrossoverTrade(Map<String, Object> row, List<CandleBar> bars, int dIdx,
+                                       double entryRef, double stopPx, double targetPx,
+                                       String entryDate, String evaluationDate) {
+        String definedExit = plusTradingDays(entryDate, CROSSOVER_MAX_HOLD);
+        row.put("defined_exit_date", definedExit);
+
+        String status = null, exitDate = null;
+        Double exitPrice = null;
+        boolean sameBarBoth = false;
+        CandleBar deadlineBar = null;
+
+        // bars are newest-first, so counting the index DOWN walks forward in time from entry.
+        for (int i = dIdx - 1; i >= 0; i--) {
+            CandleBar bar = bars.get(i);
+            String bd = normalizeStoredDate(bar.tradeDate);
+            if (bd == null) continue;
+            if (definedExit != null && bd.compareTo(definedExit) > 0) break;
+
+            deadlineBar = bar;                       // newest session still inside the hold
+            boolean hitStop   = bar.low > 0 && bar.low <= stopPx;
+            boolean hitTarget = bar.high >= targetPx;
+            if (!hitStop && !hitTarget) continue;
+
+            sameBarBoth = hitStop && hitTarget;
+            status    = hitStop ? "STOP LOSS" : "PROFIT BOOK";
+            exitDate  = bd;
+            exitPrice = hitStop ? stopPx : targetPx;
+            break;
+        }
+
+        // Ran the full hold without touching either level. Only call that an exit once the
+        // deadline is actually in the past - otherwise the trade is simply still running.
+        if (status == null && definedExit != null && deadlineBar != null
+            && definedExit.compareTo(evaluationDate) <= 0) {
+            status    = "DEFINED DATE EXIT";
+            exitDate  = normalizeStoredDate(deadlineBar.tradeDate);
+            exitPrice = round2(deadlineBar.close);
+        }
+        if (status == null) status = "OPEN";
+
+        row.put("trade_status", status);
+        row.put("exit_date", exitDate);
+        row.put("exit_price", exitPrice);
+        row.put("same_bar_both", sameBarBoth);
+
+        // These two columns now carry the date the level was actually reached, and stay blank
+        // when it never was. They previously held the hold deadline, which is what
+        // defined_exit_date is for.
+        row.put("stop_loss_date",  "STOP LOSS".equals(status)   ? exitDate : null);
+        row.put("target_date",     "PROFIT BOOK".equals(status) ? exitDate : null);
+
+        if (exitPrice != null && entryRef > 0) {
+            row.put("return_pct", round2((exitPrice - entryRef) / entryRef * 100.0));
+        }
+    }
+
+    /**
+     * Put a clock time on each trade's entry and exit, from 5-minute candles.
+     *
+     * <p>Daily bars answer WHICH session a level was reached on but never WHEN, and they cannot
+     * order two levels reached on the same session at all - a daily low and high carry no time
+     * between them. This resolves both from the intraday feed, which holds 5-minute candles for
+     * every session back to 2025-08-01.
+     *
+     * <p>Where a session touched the stop and the target, whichever candle came first decides
+     * the trade, and the status, exit price and hit-date columns are rewritten to match. A
+     * single candle spanning both stays a stop - inside 5 minutes there is nothing left to
+     * order it by, and assuming the good outcome would flatter every such trade.
+     *
+     * <p>Missing intraday data costs the time only. The date and status already stand on their
+     * own from the daily bars, so a blank Entry Time means "not recorded", never "no entry".
+     */
+    private void fillCrossoverTradeTimes(List<Map<String, Object>> rows) {
+        LinkedHashSet<String> keys = new LinkedHashSet<>();
+        for (Map<String, Object> r : rows) {
+            String sym = normalizeSymbol(String.valueOf(r.getOrDefault("symbol", "")));
+            if (sym.isBlank()) continue;
+            String entry = textOrNull(r.get("entry_date"));
+            String exit  = textOrNull(r.get("exit_date"));
+            if (entry != null) keys.add(sym + "|" + entry);
+            if (exit  != null) keys.add(sym + "|" + exit);
+        }
+        if (keys.isEmpty()) return;
+
+        Map<String, List<Object[]>> ticks = loadIntradaySessions(keys);
+        if (ticks.isEmpty()) return;
+
+        for (Map<String, Object> r : rows) {
+            String sym = normalizeSymbol(String.valueOf(r.getOrDefault("symbol", "")));
+            if (sym.isBlank()) continue;
+            String entryDate = textOrNull(r.get("entry_date"));
+            String exitDate  = textOrNull(r.get("exit_date"));
+            double base      = getD(r, "base_price");
+            double entryRef  = getD(r, "entry_ref");
+            double stopPx    = getD(r, "stop_loss");
+            double targetPx  = getD(r, "target");
+
+            // Entry fills at the first candle that trades through the base price - that is when
+            // a resting buy-stop would have been taken.
+            if (entryDate != null) {
+                for (Object[] c : ticks.getOrDefault(sym + "|" + entryDate, List.of())) {
+                    if (getNumber(c[1]) >= base) { r.put("entry_time", clockOf(c[0])); break; }
+                }
+            }
+            if (exitDate == null) continue;
+            List<Object[]> day = ticks.getOrDefault(sym + "|" + exitDate, List.of());
+            if (day.isEmpty()) continue;
+
+            if ("DEFINED DATE EXIT".equals(String.valueOf(r.get("trade_status")))) {
+                // Out at the close of the deadline session, so the last candle is the exit -
+                // and its close is a truer exit price than the daily bar's.
+                Object[] last = day.get(day.size() - 1);
+                r.put("exit_time", clockOf(last[0]));
+                r.put("exit_price", round2(getNumber(last[3])));
+            } else {
+                int stopAt = -1, targetAt = -1;
+                for (int i = 0; i < day.size(); i++) {
+                    double hi = getNumber(day.get(i)[1]), lo = getNumber(day.get(i)[2]);
+                    if (stopAt   < 0 && lo > 0 && lo <= stopPx)  stopAt = i;
+                    if (targetAt < 0 && hi >= targetPx)          targetAt = i;
+                    if (stopAt >= 0 && targetAt >= 0) break;
+                }
+                int at = -1;
+                if (stopAt >= 0 && (targetAt < 0 || stopAt <= targetAt)) {
+                    at = stopAt;
+                    r.put("trade_status", "STOP LOSS");
+                    r.put("exit_price", round2(stopPx));
+                    r.put("stop_loss_date", exitDate);
+                    r.put("target_date", null);
+                } else if (targetAt >= 0) {
+                    at = targetAt;
+                    r.put("trade_status", "PROFIT BOOK");
+                    r.put("exit_price", round2(targetPx));
+                    r.put("target_date", exitDate);
+                    r.put("stop_loss_date", null);
+                }
+                if (at >= 0) r.put("exit_time", clockOf(day.get(at)[0]));
+            }
+
+            double exitPx = getD(r, "exit_price");
+            if (exitPx > 0 && entryRef > 0) {
+                r.put("return_pct", round2((exitPx - entryRef) / entryRef * 100.0));
+            }
+        }
+    }
+
+    /**
+     * 5-minute candles for a set of (symbol, trade_date) pairs, keyed {@code SYMBOL|yyyy-MM-dd}
+     * and ordered by time within each session.
+     *
+     * <p>Matched on the raw {@code symbol} column rather than {@code UPPER(symbol)} so that
+     * idx_bmc_symbol_date can be used. That is not a cosmetic choice: over 2,000 pairs the
+     * UPPER() form takes 107 seconds because it cannot use the index, against 0.6 seconds this
+     * way. The 29 symbols stored in mixed case are all NSE indices and have no intraday rows at
+     * all, so nothing is missed by matching exactly.
+     */
+    @SuppressWarnings("unchecked")
+    private Map<String, List<Object[]>> loadIntradaySessions(Collection<String> keys) {
+        Map<String, List<Object[]>> out = new HashMap<>();
+        List<String> list = new ArrayList<>(keys);
+        int batch = 1000;
+        for (int start = 0; start < list.size(); start += batch) {
+            List<String> chunk = list.subList(start, Math.min(start + batch, list.size()));
+            StringBuilder vals = new StringBuilder();
+            for (int i = 0; i < chunk.size(); i++) {
+                if (i > 0) vals.append(",");
+                // The first row carries the casts; without them Postgres cannot infer a type
+                // for the VALUES columns and refuses the join.
+                vals.append(i == 0 ? "(CAST(? AS text),CAST(? AS text))" : "(?,?)");
+            }
+            try {
+                var query = em.createNativeQuery(
+                    "SELECT c.symbol,c.trade_date,c.candle_time,c.high,c.low,c.close " +
+                    "FROM broker_market_candles c " +
+                    "JOIN (VALUES " + vals + ") AS w(sym,td) " +
+                    "  ON c.symbol=w.sym AND c.trade_date=w.td " +
+                    "WHERE UPPER(COALESCE(c.candle_mode,''))='INTRADAY' " +
+                    "ORDER BY c.symbol,c.trade_date,c.candle_time");
+                int p = 1;
+                for (String k : chunk) {
+                    int bar = k.indexOf('|');
+                    query.setParameter(p++, k.substring(0, bar));
+                    query.setParameter(p++, k.substring(bar + 1));
+                }
+                for (Object[] r : (List<Object[]>) query.getResultList()) {
+                    out.computeIfAbsent(asText(r[0]) + "|" + asText(r[1]), k -> new ArrayList<>())
+                       .add(new Object[]{ asText(r[2]), getNumber(r[3]),
+                                          getNumber(r[4]), getNumber(r[5]) });
+                }
+            } catch (Exception e) {
+                log.debug("Intraday session ticks unavailable for {} pair(s): {}",
+                          chunk.size(), e.getMessage());
+            }
+        }
+        return out;
+    }
+
+    /** HH:mm:ss out of a stored {@code yyyy-MM-ddTHH:mm:ss} candle timestamp. */
+    private String clockOf(Object candleTime) {
+        String s = candleTime == null ? "" : String.valueOf(candleTime);
+        int at = s.indexOf('T');
+        return at >= 0 && s.length() > at + 1 ? s.substring(at + 1) : null;
+    }
+
+    private String textOrNull(Object v) {
+        if (v == null) return null;
+        String s = String.valueOf(v).trim();
+        return s.isEmpty() ? null : s;
+    }
+
+    /**
+     * Check a finished row against the rules it claims to follow, so a bad one is visible in the
+     * file instead of being read as fact. Returns OK, or every problem found.
+     */
+    private String validateCrossoverRow(Map<String, Object> r) {
+        String status = String.valueOf(r.getOrDefault("trade_status", ""));
+        String entry  = textOrNull(r.get("entry_date"));
+        String exit   = textOrNull(r.get("exit_date"));
+        String defined = textOrNull(r.get("defined_exit_date"));
+        List<String> problems = new ArrayList<>();
+
+        if (entry == null) problems.add("no entry date");
+        if ("OPEN".equals(status)) {
+            if (exit != null) problems.add("OPEN but has an exit date");
+        } else {
+            if (exit == null) problems.add("closed but has no exit date");
+            else if (entry != null && exit.compareTo(entry) <= 0) problems.add("exit not after entry");
+        }
+        if ("STOP LOSS".equals(status)   && textOrNull(r.get("stop_loss_date")) == null)
+            problems.add("STOP LOSS without a stop date");
+        if ("PROFIT BOOK".equals(status) && textOrNull(r.get("target_date")) == null)
+            problems.add("PROFIT BOOK without a target date");
+        // Holidays can leave the deadline itself untraded, so the exit lands on the last session
+        // inside the hold. Earlier is fine; later means the hold was overrun.
+        if (exit != null && defined != null && exit.compareTo(defined) > 0)
+            problems.add("exit past the defined exit date");
+
+        return problems.isEmpty() ? "OK" : String.join("; ", problems);
+    }
+
+    /**
+     * The RSI 45 section's stocks, as CSV laid out like the ATR Base Price Crossover file.
+     *
+     * <p>Runs the SAME call the panel runs - identical parameters, no separate filter - so the
+     * file can never list a stock the screen does not, which is the failure mode of an export
+     * that reimplements its own selection. The button previously pointed at the chart-trades
+     * export, a different dataset built from ranked bar-chart days, which is why it appeared to
+     * do nothing useful here.
+     */
+    public byte[] exportRsi45SectionCsv(Long userId, Long institutionId, Double maxPrice,
+                                        boolean requireCrossing, boolean requireVolume,
+                                        boolean applyRanking) {
+        Map<String, Object> panel = getBelowPriceTop10(userId, institutionId, maxPrice,
+                                                       requireCrossing, requireVolume, applyRanking);
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> rows =
+            (List<Map<String, Object>>) panel.getOrDefault("top10", List.of());
+
+        String generatedAt = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        StringBuilder csv = new StringBuilder();
+        csv.append("\ufeff");
+        csv.append("TradeRakshak(TM) - RSI 45 Previous Close Less the Base Price\n");
+        csv.append("ENTRY\n");
+        csv.append("1. Previous Close < Base Price AND Current Price >= Base Price (the crossing)\n");
+        csv.append("2. Volume > 20-Day Average Volume: ")
+           .append(requireVolume ? "applied as a filter" : "reported only, does not exclude")
+           .append("\n");
+        csv.append("3. Selection: ")
+           .append(applyRanking ? "ranked, best ten kept"
+                                : "every qualifying stock, strongest move first - no ranking")
+           .append("\n");
+        csv.append("NOTES\n");
+        csv.append("Identification is settled on the last completed session's close, because the "
+                 + "entry test needs a full day's volume. Prices then track the market while it "
+                 + "is open, so Current Price can move after the list is fixed.\n");
+        csv.append("ATR14 and ATR % are measured on the sessions behind D-1, the same way the ATR "
+                 + "Base Price Crossover screen measures them.\n");
+        csv.append("As of: ").append(safe(panel.get("as_of")))
+           .append(",Scope: ").append(csvQuote(panel.get("scope")))
+           .append(",Total: ").append(rows.size()).append("\n");
+        csv.append("Pipeline: ").append(csvQuote(panel.get("pipeline"))).append("\n");
+        csv.append("DISCLAIMER: For educational purposes only. Not SEBI investment advice.\n\n");
+
+        csv.append("Rank,Symbol,Sector,Base Price,Base Price Date,Previous Close,Current Price,"
+                 + "Price Change %,Return %,ATR14 (D-1),ATR %,Current Volume,20D Avg Volume,"
+                 + "Volume Above 20D Avg,Generated Date & Time\n");
+
+        if (rows.isEmpty()) {
+            csv.append("No stock met the entry test on the last completed session. That is a "
+                     + "normal outcome, not a fault - the crossing has to happen on the day.\n");
+        }
+        int rank = 0;
+        for (Map<String, Object> r : rows) {
+            double vol = getD(r, "volume"), avg = getD(r, "avg_20d_volume");
+            csv.append(++rank).append(",")
+               .append(safe(r.get("symbol"))).append(",")
+               .append(csvQuote(r.get("sector"))).append(",")
+               .append(fmtNum(r.get("base_price"))).append(",")
+               .append(safe(r.get("upload_date"))).append(",")
+               .append(fmtNum(r.get("previous_close"))).append(",")
+               .append(fmtNum(r.get("current_price"))).append(",")
+               .append(fmtNum(r.get("price_change_pct"))).append(",")
+               .append(fmtNum(r.get("return_pct"))).append(",")
+               .append(fmtNum(r.get("atr14"))).append(",")
+               .append(fmtNum(r.get("atr_pct"))).append(",")
+               .append(fmtNum(r.get("volume"))).append(",")
+               .append(fmtNum(r.get("avg_20d_volume"))).append(",")
+               // n/a, not No: with no comparable history the test did not run.
+               .append(vol > 0 && avg > 0 ? (vol > avg ? "Yes" : "No") : "n/a").append(",")
+               .append(generatedAt).append("\n");
+        }
+        return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The Previous Top 10 section as CSV - the columns on screen, for any past date.
+     *
+     * <p>Built from the SAME preview call the table renders from, so a figure in the file can
+     * never disagree with the figure above it. Passing a date replays that session instead of
+     * the latest, which is what makes back-dated rows possible: the trade is rebuilt from stored
+     * candles at this section's own times rather than read from a saved batch, so a day that was
+     * never traded live still produces a row.
+     */
+    @SuppressWarnings("unchecked")
+    public byte[] exportPrevTop10Csv(Long userId, Long institutionId, String runDate) {
+        // The very call the table renders from. A date replays that session; no date is the
+        // section's default view. Reading the same payload is what guarantees the file and the
+        // screen cannot disagree.
+        boolean backDated = runDate != null && !runDate.isBlank();
+        Map<String, Object> preview = getTop10Preview(userId, institutionId,
+            backDated ? "CUSTOM" : "1D", backDated ? runDate : null, getPrevTop10BuyTime(),
+            "1D", null, getPrevTop10SellTime());
+        // "stocks" is the key getTop10Preview actually returns. Reading "details" meant this
+        // export always wrote a header, a summary line taken from the same payload - Winners: 1,
+        // Losers: 9 - and then "No stocks for this date", which is self-contradictory on its face.
+        List<Map<String, Object>> rows =
+            (List<Map<String, Object>>) preview.getOrDefault("stocks", List.of());
+
+        String generatedAt = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        StringBuilder csv = new StringBuilder();
+        csv.append("\ufeff");
+        csv.append("TradeRakshak(TM) - Previous Top 10 Ranking Stocks\n");
+        csv.append("RULE\n");
+        csv.append(csvQuote(preview.getOrDefault("selection_basis", preview.get("rule"))))
+           .append("\n");
+        csv.append("Weekends and market holidays are skipped - the sell leg is the next session "
+                 + "that actually traded, so a Friday buy sells on Monday.\n");
+        csv.append("A row still OPEN is valued at the live price, because its sell has not "
+                 + "happened yet - Return % then measures buy against the current price.\n");
+        csv.append("Run date: ").append(safe(preview.get("run_date")))
+           .append(",Average Return: ").append(fmtNum(preview.get("avg_return")))
+           .append("%,Winners: ").append(safe(preview.get("winners")))
+           .append(",Losers: ").append(safe(preview.get("losers")))
+           .append(",Stocks: ").append(rows.size()).append("\n");
+        csv.append("DISCLAIMER: For educational purposes only. Not SEBI investment advice.\n\n");
+
+        csv.append("Rank,Symbol,Buy Date,Buy Time,Buy Price,Sell Date,Sell Time,Sell Price,"
+                 + "Return %,Status,Price Source,Generated Date & Time\n");
+
+        if (rows.isEmpty()) {
+            csv.append("No stocks for this date. Either nothing was ranked that session, or no "
+                     + "stored candles cover it.\n");
+        }
+        int rank = 0;
+        String buyDay  = String.valueOf(preview.getOrDefault("run_date", ""));
+        String sellDay = String.valueOf(preview.getOrDefault("sell_date", ""));
+        for (Map<String, Object> r : rows) {
+            // Prefer the row's own dates - after the sell leg moved to the next trading day the
+            // two legs sit on different sessions, and a single top-level pair cannot say that.
+            Object rBuyDay  = r.getOrDefault("buy_date", buyDay);
+            Object rSellDay = r.getOrDefault("sell_date", sellDay);
+            csv.append(++rank).append(",")
+               .append(safe(r.get("symbol"))).append(",")
+               .append(safe(rBuyDay)).append(",")
+               .append(safe(r.get("buy_time"))).append(",")
+               .append(fmtNum(r.get("buy_price"))).append(",")
+               .append(safe(rSellDay)).append(",")
+               .append(safe(r.get("sell_time"))).append(",")
+               .append(fmtNum(r.get("sell_price"))).append(",")
+               .append(fmtNum(r.get("return_pct"))).append(",")
+               .append(safe(r.getOrDefault("status",
+                    Boolean.FALSE.equals(r.get("price_available")) ? "NO PRICE" : "-"))).append(",")
+               .append(safe(r.getOrDefault("sell_note", r.get("source")))).append(",")
+               .append(generatedAt).append("\n");
+        }
+        return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    private byte[] atrCrossoverCsv(List<Map<String, Object>> rows, double minAtrPct) {
+        String generatedAt = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        StringBuilder csv = new StringBuilder();
+        csv.append("﻿");
+        csv.append("TradeRakshak™ — ATR Base Price Crossover\n");
+        csv.append("ENTRY\n");
+        csv.append("1. Volatility: ATR14(D-1) / Close(D-1) x 100 >= ").append(minAtrPct).append("%\n");
+        csv.append("2. Trigger: Close(D-1) < Base Price AND High(D) >= Base Price\n");
+        csv.append("3. First trigger only: base price not reached in any session since the base price date\n");
+        csv.append("4. Fill: buy-stop at Base Price - shown as Entry, which allows for a gap through the level\n");
+        csv.append("EXIT\n");
+        csv.append("5. Stop Loss: Entry -").append(fmtPct(CROSSOVER_STOP_PCT))
+           .append("%,Target: Entry +").append(fmtPct(CROSSOVER_TARGET_PCT))
+           .append("%,Max Hold: ").append(CROSSOVER_MAX_HOLD).append(" sessions then exit at close\n");
+        csv.append("6. First level touched wins. If both are reached in the same candle, treat it as the stop.\n");
+        csv.append("7. This file is a TRADE LOG, not a list of today's signals: one row per "
+                 + "crossing found anywhere in the stored history, each carrying its own entry "
+                 + "session and its own outcome. Every price on a row is that session's price.\n");
+        csv.append("8. Stop Loss Date and Target Date are the dates those levels were actually "
+                 + "REACHED, and stay blank when they never were. The end of the hold is Defined "
+                 + "Exit Date.\n");
+        csv.append("9. Trade Status is decided by what happened FIRST after entry, never by the "
+                 + "exit date: STOP LOSS, PROFIT BOOK, DEFINED DATE EXIT, or OPEN while the "
+                 + "defined exit date is still ahead of the evaluation date.\n");
+        csv.append("10. Times come from 5-minute candles. A session that touched both levels is "
+                 + "settled by whichever candle came first; one candle holding both counts as the "
+                 + "stop. A blank time means no intraday data, not no entry.\n");
+        csv.append("11. Validation reports any row that contradicts these rules. Anything other "
+                 + "than OK should not be traded on.\n");
+        csv.append("NOTES\n");
+        csv.append("Price basis: during market hours the live quote is used. Outside a session - "
+                 + "evening, weekend or holiday - the last completed session's close and high "
+                 + "are used instead, so a run on a holiday reproduces the previous trading day.\n");
+        csv.append("Volume is reported but NOT filtered on - the volume filter failed out-of-sample testing.\n");
+        csv.append("ADX is deliberately not used - ADX < 20 inverted out-of-sample.\n");
+        csv.append("Still Above Base = NO means price has fallen back under base since the trigger; "
+                 + "a resting buy-stop would already have filled.\n");
+        csv.append("Generated: ").append(generatedAt).append(",Total: ").append(rows.size()).append("\n");
+        csv.append("DISCLAIMER: For educational purposes only. Not SEBI investment advice.\n\n");
+        csv.append("Symbol,Base Price,Base Price Date,Entry Date,Previous Close,Day High,Day Low,"
+                 + "Current Price,Still Above Base,Gapped Above Base,Entry,"
+                 + "Stop Loss,Stop Loss Date,Target,Target Date,"
+                 + "Max Hold (Sessions),First Trigger,Gain From Base %,ATR14 (D-1),ATR %,"
+                 + "Current Volume,20D Avg Volume,Volume Ratio,Price Basis,Last Updated,Generated Date & Time,"
+                 + "Entry Time,Defined Exit Date,Exit Date,Exit Time,Exit Price,Trade Status,Return %,Validation\n");
+        if (rows.isEmpty()) {
+            // An empty list is the normal case, not a fault. Each base price fires once, so the
+            // screen only lists setups crossing for the first time today - which over the tested
+            // history happened on about one session in five, in bursts a day or two after each
+            // batch of uploads. Saying so here saves the reader assuming the export is broken.
+            csv.append("No crossings found in the stored history for the uploaded stocks. "
+                     + "Check that daily bars exist for them and that base prices are set.\n");
+        }
+        for (Map<String, Object> r : rows) {
+            csv.append(safe(r.get("symbol"))).append(",")
+               .append(fmtNum(r.get("base_price"))).append(",")
+               .append(safe(r.get("upload_date"))).append(",")
+               .append(safe(r.get("entry_date"))).append(",")
+               .append(fmtNum(r.get("previous_close"))).append(",")
+               .append(fmtNum(r.get("today_high"))).append(",")
+               .append(fmtNum(r.get("today_low"))).append(",")
+               .append(fmtNum(r.get("current_price"))).append(",")
+               .append(safe(r.get("still_above_base"))).append(",")
+               .append(safe(r.get("gapped_above_base"))).append(",")
+               .append(fmtNum(r.get("entry_ref"))).append(",")
+               .append(fmtNum(r.get("stop_loss"))).append(",")
+               .append(safe(r.get("stop_loss_date"))).append(",")
+               .append(fmtNum(r.get("target"))).append(",")
+               .append(safe(r.get("target_date"))).append(",")
+               .append(safe(r.get("max_hold_sessions"))).append(",")
+               .append(safe(r.get("first_trigger"))).append(",")
+               .append(fmtNum(r.get("gain_from_base_pct"))).append(",")
+               .append(fmtNum(r.get("atr14"))).append(",")
+               .append(fmtNum(r.get("atr_pct"))).append(",")
+               .append(fmtNum(r.get("current_volume"))).append(",")
+               .append(fmtNum(r.get("avg_20d_volume"))).append(",")
+               .append(fmtNum(r.get("vol_ratio"))).append(",")
+               .append(csvQuote(r.get("price_basis"))).append(",")
+               .append(safe(r.get("last_refreshed"))).append(",")
+               .append(generatedAt).append(",")
+               .append(safe(r.get("entry_time"))).append(",")
+               .append(safe(r.get("defined_exit_date"))).append(",")
+               .append(safe(r.get("exit_date"))).append(",")
+               .append(safe(r.get("exit_time"))).append(",")
+               .append(fmtNum(r.get("exit_price"))).append(",")
+               .append(safe(r.get("trade_status"))).append(",")
+               .append(fmtNum(r.get("return_pct"))).append(",")
+               .append(csvQuote(r.get("validation"))).append("\n");
+        }
+        return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Percentages in the header lines read better without a trailing ".0". */
+    private String fmtPct(double value) {
+        return value == Math.rint(value) ? String.valueOf((long) value) : String.valueOf(value);
     }
 
     /**
@@ -6252,7 +8433,40 @@ public class StockTrackerService {
     }
 
     @SuppressWarnings("unchecked")
-    private Map<String, Double> resolveCurrentPricesBatch(List<String> symbols, Long institutionId) {
+    /**
+     * The date each tracked price was last stamped with, keyed by normalised symbol.
+     *
+     * <p>A price is only usable for valuing a position if it is not older than the purchase.
+     * Four of the 1,232 tracked stocks currently carry prices several sessions behind, and
+     * without this the gap between the stale figure and the buy is reported as a loss.
+     */
+    private Map<String, String> trackedPriceDates(List<String> symbols, Long institutionId) {
+        Map<String, String> out = new HashMap<>();
+        if (symbols == null || symbols.isEmpty()) return out;
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT UPPER(TRIM(symbol)), current_price_date FROM tracked_stocks " +
+                "WHERE institution_id = ?1 AND current_price_date IS NOT NULL")
+                .setParameter(1, institutionId).getResultList();
+            for (Object[] r : rows) {
+                if (r[0] == null || r[1] == null) continue;
+                out.put(normalizeSymbol(String.valueOf(r[0])), String.valueOf(r[1]));
+            }
+        } catch (Exception e) {
+            log.debug("Tracked price dates lookup failed: {}", e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Latest price per symbol: the tracked universe first, then the live Dhan quote feed.
+     *
+     * <p>Public because the Trading Journal marks open rows to market through this same path.
+     * A second price lookup written next to the journal would drift from this one the first
+     * time either source changed.
+     */
+    public Map<String, Double> resolveCurrentPricesBatch(List<String> symbols, Long institutionId) {
         Map<String, Double> prices = new LinkedHashMap<>();
         List<String> normalized = symbols.stream()
             .map(this::normalizeSymbol).filter(s -> !s.isBlank()).distinct().toList();
@@ -6302,7 +8516,8 @@ public class StockTrackerService {
             try {
                 var q = em.createNativeQuery(
                     "SELECT DISTINCT ON (" + symCol + ") " + symCol + " AS sym, close " +
-                    "FROM market_data WHERE " + symCol + " IN (" + in3 + ") AND close IS NOT NULL AND close>0 " +
+                    "FROM broker_market_candles WHERE " + symCol + " IN (" + in3 + ") AND close IS NOT NULL AND close>0 " +
+                    "AND (candle_mode IS NULL OR UPPER(candle_mode)='DAILY') " +
                     "ORDER BY " + symCol + ", trade_date DESC");
                 for (int i = 0; i < still.size(); i++) q.setParameter(i + 1, still.get(i));
                 for (Object[] r : (List<Object[]>) q.getResultList()) {
@@ -6415,16 +8630,6 @@ public class StockTrackerService {
         return DateUtil.today();
     }
 
-    private int compareDates(String d1, String d2) {
-        if (d1 == null) return -1;
-        if (d2 == null) return 1;
-        try {
-            return LocalDate.parse(parseDate(d1)).compareTo(LocalDate.parse(parseDate(d2)));
-        } catch (Exception e) {
-            return parseDate(d1).compareTo(parseDate(d2));
-        }
-    }
-
     // ==========================================================================
     //  DB HELPERS
     // ==========================================================================
@@ -6466,13 +8671,84 @@ public class StockTrackerService {
     }
 
     @SuppressWarnings("unchecked")
+    /**
+     * Resolves every missing base price in ONE statement.
+     *
+     * <p>The per-symbol path below issues two round trips per stock - a lookup and an update - so
+     * 1,232 stocks cost about 2,400 queries and took 27.7 seconds measured. For that whole time
+     * the screen shows "Waiting for broker price" against every row, which reads as though the
+     * application is stuck on the broker when in fact the answer was already in the candle table
+     * the entire time.
+     *
+     * <p>One LATERAL join does the same work set-based, using the same normalized daily index the
+     * rest of the application relies on. What it cannot resolve - symbols that only match through
+     * an alias - is left for the per-symbol pass, which then has almost nothing to do.
+     *
+     * @return how many rows were filled
+     */
+    private int bulkFillBasePricesFromCandles(Long institutionId) {
+        String now = DateUtil.now();
+        try {
+            return new TransactionTemplate(transactionManager).execute(tx -> em.createNativeQuery(
+                "UPDATE tracked_stocks t SET "
+              + "  base_price = c.close_px, "
+              + "  return_pct = CASE WHEN t.current_price IS NOT NULL AND t.current_price > 0 "
+              + "                    THEN ((t.current_price - c.close_px) / c.close_px) * 100 ELSE 0 END, "
+              + "  base_price_source = c.src, last_refreshed = ?, updated_at = ? "
+              + "FROM ( "
+              + "  SELECT t2.id AS tid, x.close AS close_px, "
+              + "         COALESCE(x.source,'BROKER_DAILY') || ':' || x.trade_date AS src "
+              + "  FROM tracked_stocks t2 "
+              + "  CROSS JOIN LATERAL ( "
+              + "    SELECT b.close, b.trade_date, b.source FROM broker_market_candles b "
+              + "     WHERE " + normalizedSql("b.symbol") + " = " + normalizedSql("t2.symbol") + " "
+              + "       AND b.close IS NOT NULL AND b.close > 0 "
+              + "       AND b.trade_date <= t2.upload_date "
+              // Bound the lookback. Without a lower bound this took the most recent daily
+              // candle at ANY distance before the upload date - so while the candle table held
+              // only July 2025 bhavcopy, every stock uploaded in 2026 matched 2025-07-31 and was
+              // stamped with a price up to 456 days stale. 623 of 1,271 rows were filled that
+              // way; 360ONE (uploaded 2026-10-16) was priced at 1052.7 from 2025-07-31, which
+              // made its return read -6.43% against a base it never traded at. A missing base
+              // price is recoverable - the next fetch fills it - but a plausible wrong one is
+              // not, because nothing flags it. Seven days covers a weekend plus a holiday; past
+              // that, leave it NULL and let the backfill supply the real bar.
+              + "       AND b.trade_date >= to_char(t2.upload_date::date - 7, 'YYYY-MM-DD') "
+              + "       AND UPPER(COALESCE(b.candle_mode,'')) = 'DAILY' "
+              + "     ORDER BY b.trade_date DESC LIMIT 1 "
+              + "  ) x "
+              + "  WHERE t2.institution_id = ? AND t2.is_active = 1 "
+              + "    AND (t2.base_price IS NULL OR t2.base_price <= 0) "
+              + "    AND COALESCE(t2.upload_date,'') <> '' "
+              + ") c WHERE t.id = c.tid")
+                .setParameter(1, now).setParameter(2, now)
+                .setParameter(3, institutionId)
+                .executeUpdate());
+        } catch (Exception e) {
+            // Never fatal - the per-symbol path below still works, just slowly.
+            log.warn("[BasePrice] Bulk fill from candles failed, falling back to per-symbol: {}",
+                e.getMessage());
+            return 0;
+        }
+    }
+
     private int backfillBasePricesFromSavedMarketData(List<String> symbols, Long institutionId) {
+        // Fast path first: one statement resolves nearly everything.
+        int bulk = bulkFillBasePricesFromCandles(institutionId);
+        if (bulk > 0) log.info("[BasePrice] Bulk-filled {} base price(s) from stored candles.", bulk);
+
+        // The same pass over the upload log. Its base prices are pinned to each row's own
+        // entry_date, not to the symbol's current one, which is what lets a backtest of a past
+        // date price the signal as it stood that day.
+        int history = uploadHistory.backfillBasePrices(institutionId);
+        if (history > 0) log.info("[BasePrice] Filled {} upload-history base price(s) from stored candles.", history);
+
         List<String> normalizedInput = symbols == null ? List.of() : symbols.stream()
             .map(this::normalizeSymbol)
             .filter(s -> !s.isBlank())
             .distinct()
             .toList();
-        if (normalizedInput.isEmpty()) return 0;
+        if (normalizedInput.isEmpty()) return bulk;
         Set<String> requested = new HashSet<>(normalizedInput);
         List<Object[]> rows;
         try {
@@ -6512,7 +8788,7 @@ public class StockTrackerService {
             batchReturns.add(returnPct);
             batchSources.add(saved.source + ":" + saved.tradeDate);
         }
-        if (batchSymbols.isEmpty()) return 0;
+        if (batchSymbols.isEmpty()) return bulk;
         String now = DateUtil.now();
         try {
             runInTransaction(() -> {
@@ -6536,7 +8812,7 @@ public class StockTrackerService {
             log.warn("Batch base price backfill failed for {} symbols: {}", batchSymbols.size(), e.getMessage());
             return 0;
         }
-        return batchSymbols.size();
+        return bulk + batchSymbols.size();
     }
 
     @SuppressWarnings("unchecked")
@@ -6547,25 +8823,44 @@ public class StockTrackerService {
             .distinct()
             .toList();
         if (aliasList.isEmpty()) return null;
+
+        // Same seven-day floor as bulkFillBasePricesFromCandles, for the same reason.
+        //
+        // This is the per-symbol fallback that runs on whatever the bulk statement could not
+        // resolve, and it was left unbounded when the bulk path was fixed - so the bug simply
+        // moved here. Measured on 2026-11-10: clearing the 639 wrongly-stamped rows and letting
+        // the recovery refill them produced "Bulk-filled 627" and 639 refilled in total, and the
+        // 12 rows that differ are exactly the ones this method wrote - DPABHUSHAN uploaded
+        // 2026-07-10 priced from 2025-07-31, 344 days earlier, because that was the newest daily
+        // bar stored for it at the time.
+        //
+        // A missing base price is recoverable and shows as "Waiting for broker price". A
+        // plausible wrong one is not, because nothing flags it and every return is measured
+        // against it.
+        String lowerBound = null;
+        try {
+            lowerBound = java.time.LocalDate.parse(uploadDate).minusDays(7).toString();
+        } catch (Exception e) {
+            // An upload date we cannot parse cannot be bounded safely, so do not guess a base
+            // price for it at all - leave it to the broker fetch.
+            log.debug("Base price lookup skipped: unparseable upload date {}", uploadDate);
+            return null;
+        }
+
         String in = placeholders(aliasList.size());
-        String marketSymbol = normalizedSql("symbol");
         String candleSymbol = normalizedSql("symbol");
         String sql =
-            "SELECT close_price,trade_date,source FROM (" +
-            "SELECT close AS close_price,trade_date,COALESCE(source,'MARKET_DATA') AS source FROM market_data " +
-            "WHERE " + marketSymbol + " IN (" + in + ") AND close IS NOT NULL AND close>0 AND trade_date<=? " +
-            "UNION ALL " +
             "SELECT close AS close_price,trade_date,COALESCE(source,'BROKER_DAILY') AS source FROM broker_market_candles " +
-            "WHERE " + candleSymbol + " IN (" + in + ") AND close IS NOT NULL AND close>0 AND trade_date<=? " +
-            "AND (candle_mode IS NULL OR UPPER(candle_mode)='DAILY')" +
-            ") q ORDER BY trade_date DESC LIMIT 1";
+            "WHERE " + candleSymbol + " IN (" + in + ") AND close IS NOT NULL AND close>0 " +
+            "AND trade_date<=? AND trade_date>=? " +
+            "AND (candle_mode IS NULL OR UPPER(candle_mode)='DAILY') " +
+            "ORDER BY trade_date DESC LIMIT 1";
         try {
             var query = em.createNativeQuery(sql);
             int p = 1;
             for (String alias : aliasList) query.setParameter(p++, alias);
             query.setParameter(p++, uploadDate);
-            for (String alias : aliasList) query.setParameter(p++, alias);
-            query.setParameter(p, uploadDate);
+            query.setParameter(p, lowerBound);
             List<Object[]> rows = query.getResultList();
             if (rows.isEmpty()) return null;
             Object[] row = rows.get(0);
@@ -6691,7 +8986,10 @@ public class StockTrackerService {
 
     /** Clamps a HH:mm string to the 5-minute grid the UI offers; defaults to the 15:20 snapshot. */
     private String normalizeHhmm(String hhmm) {
-        if (hhmm == null || !hhmm.trim().matches("\\d{1,2}:\\d{2}")) return "15:20";
+        // Falls back to a real bar start. Candles are hourly from the 09:15 open, so 15:20 -
+        // what this used to return - begins no bar, and a malformed time would have become a
+        // time matching no candle at all instead of the last bar of the day.
+        if (hhmm == null || !hhmm.trim().matches("\\d{1,2}:\\d{2}")) return "15:15";
         String[] parts = hhmm.trim().split(":");
         int h = Math.min(23, Math.max(0, Integer.parseInt(parts[0])));
         int m = Math.min(59, Math.max(0, Integer.parseInt(parts[1])));
@@ -6900,7 +9198,11 @@ public class StockTrackerService {
      * that made PostgreSQL sequentially scan broker_market_candles.
      */
     private List<CandleBar> loadDailyBars(String symbol, int bars) {
-        return loadDailyBarsBatch(List.of(symbol == null ? "" : symbol), bars)
+        // fillTrailing=false. The fold itself is now just a cached map lookup, but this
+        // wrapper runs collectBrokerBars once per symbol - 1,232 times for Uploaded Stock
+        // Details - and that query is the expensive part, not the fold. Until the batch path is
+        // fixed properly, a per-symbol caller must not add to it.
+        return loadDailyBarsBatch(List.of(symbol == null ? "" : symbol), bars, false)
             .getOrDefault(normalizeSymbol(symbol), List.of());
     }
 
@@ -6924,6 +9226,16 @@ public class StockTrackerService {
      * @return bars keyed by {@link #normalizeSymbol(String)}; symbols with no history are absent.
      */
     private Map<String, List<CandleBar>> loadDailyBarsBatch(Collection<String> symbols, int bars) {
+        return loadDailyBarsBatch(symbols, bars, true);
+    }
+
+    /**
+     * @param fillTrailing reconstruct sessions missing from the daily feed. Worth it for a batch
+     *        load; ruinous for a caller that loads one symbol at a time - see
+     *        {@link #loadDailyBars(String, int)}.
+     */
+    private Map<String, List<CandleBar>> loadDailyBarsBatch(Collection<String> symbols, int bars,
+                                                            boolean fillTrailing) {
         Map<String, List<CandleBar>> out = new HashMap<>();
         if (symbols == null || symbols.isEmpty()) return out;
 
@@ -6934,27 +9246,13 @@ public class StockTrackerService {
             .toList();
         if (normalized.isEmpty()) return out;
 
+        // broker_market_candles is the single daily store. This used to read market_data first
+        // and fall back to the candles for any symbol with fewer than 3 bars, but market_data
+        // only ever held a copy of these same rows, so the first pass could add nothing.
         int batchSize = 900;
         for (int start = 0; start < normalized.size(); start += batchSize) {
             List<String> batch = normalized.subList(start, Math.min(start + batchSize, normalized.size()));
-            collectMarketDataBars(out, batch, bars);
-        }
-
-        // Same fallback rule as the single-symbol path: fewer than 3 market_data bars
-        // means we retry that symbol against the broker candles and keep the longer series.
-        List<String> needsBroker = normalized.stream()
-            .filter(sym -> out.getOrDefault(sym, List.of()).size() < 3)
-            .toList();
-        if (!needsBroker.isEmpty()) {
-            Map<String, List<CandleBar>> broker = new HashMap<>();
-            for (int start = 0; start < needsBroker.size(); start += batchSize) {
-                List<String> batch = needsBroker.subList(start, Math.min(start + batchSize, needsBroker.size()));
-                collectBrokerBars(broker, batch, bars);
-            }
-            for (String sym : needsBroker) {
-                List<CandleBar> brokerSeries = broker.getOrDefault(sym, List.of());
-                if (brokerSeries.size() > out.getOrDefault(sym, List.of()).size()) out.put(sym, brokerSeries);
-            }
+            collectBrokerBars(out, batch, bars);
         }
 
         // Last resort: fold intraday candles into one bar per day. Without this, a database
@@ -6977,7 +9275,126 @@ public class StockTrackerService {
                 if (series.size() > out.getOrDefault(sym, List.of()).size()) out.put(sym, series);
             }
         }
+
+        // The rescue above is all-or-nothing: it only helps a symbol with almost no daily
+        // history. A symbol with months of daily bars that simply stops short of the last
+        // session is not "short", so it was left a session behind even with that session
+        // sitting in the same table as intraday rows. Fill those trailing gaps too.
+        if (fillTrailing) fillTrailingIntradaySessions(out, normalized, bars, batchSize);
         return out;
+    }
+
+    /**
+     * How many trailing sessions may be reconstructed from intraday when the daily series has
+     * fallen behind. Two weeks is generous for a stalled fetch and still bounds the work; past
+     * that the daily feed is broken badly enough that quietly papering over it does no favours.
+     */
+    private static final int MAX_TRAILING_INTRADAY_SESSIONS = 10;
+
+    /**
+     * Prepend sessions that exist as intraday candles but are missing from the daily series.
+     *
+     * <p>Daily bars and intraday candles arrive on separate schedules, so the daily rollup
+     * routinely lags. On 2026-08-28 exactly 92 symbols got a daily bar while 2,954 traded and
+     * were recorded intraday 09:15-15:26 - so every tracked stock's newest daily bar was
+     * 08-27, and every screen keyed off "the newest bar is the current session" silently
+     * reported a session-old answer. The ATR crossover export dated its own entries 08-27 on a
+     * Monday, and listed 31 setups where the real session had 20.
+     *
+     * <p>A folded bar is a stand-in, not an equal. High and low are exact - they are extremes
+     * over the same ticks - but the close is the last 5-minute close, not the official closing
+     * price, which comes from the closing auction and can differ by a few paise (BFUTILITIE on
+     * 08-27: 503.00 folded against 502.55 official). It is tagged {@code intraday-agg} so the
+     * same-source volume rule will not average it against broker bars, and so anything else
+     * that cares can tell the difference.
+     *
+     * <p>This never overwrites a real daily bar - only dates strictly newer than the symbol's
+     * newest daily bar are added. So it self-heals: once the daily backfill catches up, the
+     * real bars win and the fold stops being used with no further change.
+     */
+    private void fillTrailingIntradaySessions(Map<String, List<CandleBar>> out,
+                                              List<String> symbols, int bars, int batchSize) {
+        // Sessions the daily feed never produced, merged in from the shared fold.
+        //
+        // This used to run its own query per call. That cost about 120ms of PLANNING each time -
+        // the planner re-examining eleven indexes on a 52-million-row table - which was invisible
+        // for a batch load and ruinous for callers that load one symbol at a time: the uploaded
+        // stock signals loop turned a seconds-long download into minutes. gapSessionBars() does
+        // the fold once for the whole universe and caches it, so this is now a map lookup and
+        // every caller can afford it, single-symbol ones included.
+        Map<String, List<DayBar>> gaps = gapSessionBars();
+        if (gaps.isEmpty()) return;
+
+        int filled = 0;
+        String newestFilled = null;
+        for (String sym : symbols) {
+            List<CandleBar> series = out.get(sym);
+            if (series == null || series.isEmpty()) continue;
+
+            String newestDaily = normalizeStoredDate(series.get(0).tradeDate);
+            if (newestDaily == null || newestDaily.isBlank()) continue;
+
+            List<DayBar> folded = gaps.get(sym);
+            if (folded == null || folded.isEmpty()) continue;
+
+            // Only sessions strictly newer than what this symbol already has. A real daily bar
+            // is never displaced - the fold only ever fills the end of the series.
+            List<CandleBar> add = new ArrayList<>();
+            for (DayBar g : folded) {
+                if (g.date().compareTo(newestDaily) > 0) {
+                    add.add(new CandleBar(g.date(), g.close(), g.high(), g.low(), g.volume(),
+                                          "intraday-agg"));
+                }
+            }
+            if (add.isEmpty()) continue;
+
+            add.sort((x, y) -> y.tradeDate.compareTo(x.tradeDate));   // newest first
+            List<CandleBar> merged = new ArrayList<>(add);
+            merged.addAll(series);
+            if (merged.size() > bars) merged = new ArrayList<>(merged.subList(0, bars));
+            out.put(sym, merged);
+            filled++;
+            String top = add.get(0).tradeDate;
+            if (newestFilled == null || top.compareTo(newestFilled) > 0) newestFilled = top;
+        }
+        if (filled > 0) {
+            log.debug("[Bars] {} symbol(s) extended to {} from the shared intraday fold.",
+                      filled, newestFilled);
+        }
+    }
+
+    /**
+     * One folded bar per trading day strictly after {@code afterDate}, for the given symbols.
+     *
+     * <p>Same aggregation as {@link #collectIntradayAggregatedBars}, bounded by date instead of
+     * by row count so it can be used to patch the end of an existing series.
+     */
+    @SuppressWarnings("unchecked")
+    private void collectIntradaySessionsAfter(Map<String, List<CandleBar>> out,
+                                              List<String> batch, String afterDate) {
+        try {
+            var query = em.createNativeQuery(
+                "SELECT UPPER(COALESCE(symbol,'')) AS sym,trade_date," +
+                "(ARRAY_AGG(close ORDER BY candle_time DESC))[1] AS close," +
+                "MAX(high) AS high,MIN(low) AS low," +
+                "SUM(COALESCE(total_volume,volume)) AS vol," +
+                "'intraday-agg' AS source " +
+                "FROM broker_market_candles " +
+                "WHERE close IS NOT NULL AND close > 0 " +
+                "AND UPPER(COALESCE(candle_mode,''))='INTRADAY' " +
+                "AND trade_date > ? " +
+                "AND UPPER(COALESCE(symbol,'')) IN (" + placeholders(batch.size()) + ") " +
+                "GROUP BY UPPER(COALESCE(symbol,'')),trade_date " +
+                "ORDER BY sym,trade_date DESC");
+            query.setParameter(1, afterDate);
+            for (int i = 0; i < batch.size(); i++) query.setParameter(i + 2, batch.get(i));
+            for (Object[] r : (List<Object[]>) query.getResultList()) {
+                addBar(out, asText(r[0]), MAX_TRAILING_INTRADAY_SESSIONS, r, 1);
+            }
+        } catch (Exception e) {
+            log.debug("Trailing intraday sessions unavailable for {} symbols: {}",
+                      batch.size(), e.getMessage());
+        }
     }
 
     /**
@@ -7014,29 +9431,6 @@ public class StockTrackerService {
     }
 
     @SuppressWarnings("unchecked")
-    private void collectMarketDataBars(Map<String, List<CandleBar>> out, List<String> batch, int bars) {
-        try {
-            // ROW_NUMBER() applies the per-symbol "newest N" cut inside the database, so this
-            // returns ~bars rows per symbol instead of every stored candle for every symbol.
-            var query = em.createNativeQuery(
-                "SELECT sym,trade_date,close,high,low,vol,source FROM (" +
-                "SELECT UPPER(symbol) AS sym,trade_date,close,high,low," +
-                "COALESCE(total_volume,volume) AS vol,source," +
-                "ROW_NUMBER() OVER (PARTITION BY UPPER(symbol) ORDER BY trade_date DESC) AS rn " +
-                "FROM market_data WHERE close IS NOT NULL AND UPPER(symbol) IN (" +
-                placeholders(batch.size()) + ")) t WHERE rn <= ? ORDER BY sym, trade_date DESC");
-            int i = 0;
-            for (; i < batch.size(); i++) query.setParameter(i + 1, batch.get(i));
-            query.setParameter(i + 1, bars);
-            for (Object[] r : (List<Object[]>) query.getResultList()) {
-                addBar(out, asText(r[0]), bars, r, 1);
-            }
-        } catch (Exception e) {
-            log.debug("Batch daily bars unavailable for {} symbols: {}", batch.size(), e.getMessage());
-        }
-    }
-
-    @SuppressWarnings("unchecked")
     private void collectBrokerBars(Map<String, List<CandleBar>> out, List<String> batch, int bars) {
         try {
             // Deliberately three UNION ALL branches rather than one OR'd predicate: with the
@@ -7046,6 +9440,11 @@ public class StockTrackerService {
             // Each branch tags its rows with the priority the single-symbol path used when a
             // row matched on more than one column (symbol, then trading_symbol, then the
             // -EQ-stripped form), and rows are de-duplicated by id keeping the best priority.
+            // A trade_date floor was tried here and REVERTED. On its own the bounded query
+            // measured 633ms against 2,459ms unbounded, but inside these three UNION branches it
+            // pushed the planner off the symbol indexes and bars-batch went from 5.9 seconds to
+            // 181.6. The saving is real but it cannot be taken this way; per-symbol LIMIT or a
+            // narrower index would be the route, measured in situ rather than standalone.
             String in = placeholders(batch.size());
             String cols = ",trade_date,close,high,low,COALESCE(total_volume,volume),source " +
                           "FROM broker_market_candles " +
@@ -7146,6 +9545,77 @@ public class StockTrackerService {
         return DateUtil.today().equals(normalizeStoredDate(bars.get(0).tradeDate));
     }
 
+    /**
+     * How many same-feed bars the 20-day volume average needs before it is worth trusting.
+     *
+     * <p>Five is deliberately lenient. The stricter the bar, the more stocks abstain from the
+     * volume test altogether while Dhan history is still thin - and an abstention lasting weeks
+     * is its own kind of wrong. Five same-source days is a comparison rather than noise, and the
+     * count rises on its own as more Dhan history is fetched.
+     */
+    private static final int MIN_SAME_SOURCE_VOL_BARS = 5;
+
+    /**
+     * Average volume over {@code count} bars from {@code start}, counting ONLY bars that came
+     * from the same feed as {@code reference}.
+     *
+     * <p>The two feeds in this table do not measure the same thing. Across 2,793 stocks holding
+     * both kinds of bar for the same period, the DERIVED rollups run a median 1.33x the volume
+     * Dhan reports for the identical stock and dates - 1,189 of them more than 1.5x higher, 541
+     * more than 1.5x lower. DERIVED bars are daily candles folded up from 51 million intraday
+     * rows in a single pass on 25 Aug 2026; Dhan bars are the exchange's own daily figure, and
+     * summing intraday prints does not reproduce it.
+     *
+     * <p>Mixing them silently broke "volume above its 20-day average". Dhan bars existed only for
+     * 24-27 Aug, so the newest bar was DHAN while the 20-day window behind it was mostly DERIVED:
+     * the ratio measured the gap between two feeds, not any change in trading. On 30 Aug all nine
+     * crossing stocks "failed" on volume that way, and ELECTCAST - the one name whose DERIVED
+     * bars run lower than its Dhan bars - "passed" for the same bad reason.
+     *
+     * @return the average, or 0 when fewer than {@code minBars} same-source bars are available.
+     *         Callers already treat 0 as "no comparison possible", which is the honest answer -
+     *         better than a confident number derived from two different measurements.
+     */
+    private double sameSourceAverageVolume(List<CandleBar> bars, int start, int count,
+                                           CandleBar reference, int minBars) {
+        if (bars == null || reference == null) return 0;
+        String want = reference.source == null ? "" : reference.source.trim().toUpperCase(Locale.ROOT);
+        int end = Math.min(bars.size(), start + count);
+        double sum = 0;
+        int n = 0;
+        for (int i = start; i < end; i++) {
+            CandleBar bar = bars.get(i);
+            String src = bar.source == null ? "" : bar.source.trim().toUpperCase(Locale.ROOT);
+            if (!src.equals(want)) continue;
+            if (bar.volume > 0) { sum += bar.volume; n++; }
+        }
+        return n >= minBars ? sum / n : 0;
+    }
+
+    /**
+     * The date {@code n} trading days after {@code fromDate}, skipping weekends and NSE holidays.
+     *
+     * <p>Used for the crossover's hold deadline. Counting calendar days would land the exit on a
+     * day the market is shut, which is worse than useless in an instruction to close a position.
+     *
+     * @return null when {@code fromDate} is not a parseable ISO date, so the column blanks out
+     *         instead of printing a date that was never computed from anything.
+     */
+    private String plusTradingDays(String fromDate, int n) {
+        if (fromDate == null || fromDate.isBlank()) return null;
+        try {
+            java.time.LocalDate d = java.time.LocalDate.parse(fromDate.trim());
+            int added = 0;
+            for (int guard = 0; added < n && guard < n * 4 + 40; guard++) {
+                d = d.plusDays(1);
+                if (marketCalendar.isTradingDay(d)) added++;
+            }
+            return d.toString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     private double averageVolume(List<CandleBar> bars, int start, int count) {
         int end = Math.min(bars.size(), start + count);
         double sum = 0;
@@ -7213,8 +9683,7 @@ public class StockTrackerService {
         try {
             Optional<DhanBrokerService.Credential> credential = findVerifiedDhanCredential(null, institutionId);
             if (credential.isEmpty()) return List.of();
-            Optional<DhanInstrumentRef> ref = findBrokerInstrument(normalizeSymbol(symbol));
-            if (ref.isEmpty()) ref = findDhanInstrument(normalizeSymbol(symbol));
+            Optional<DhanInstrumentRef> ref = findDhanInstrument(normalizeSymbol(symbol));
             if (ref.isEmpty()) return List.of();
             LocalDate to = LocalDate.now(IST);
             LocalDate from = to.minusDays(370);
@@ -7323,7 +9792,8 @@ public class StockTrackerService {
         boolean pit = asOf != null && !asOf.isBlank();
         try {
             var q1 = em.createNativeQuery(
-                "SELECT close,high,low,volume,COALESCE(delivery_pct,0) FROM market_data " +
+                "SELECT close,high,low,COALESCE(total_volume,volume),COALESCE(delivery_pct,0) " +
+                "FROM broker_market_candles " +
                 "WHERE symbol=? AND exchange='NSE' " + (pit ? "AND trade_date <= ? " : "") +
                 "ORDER BY trade_date DESC LIMIT ?")
                 .setParameter(1, symbol);
@@ -7563,12 +10033,130 @@ public class StockTrackerService {
      * Exchange holidays are not modelled here - the stored candle date is preferred
      * over this whenever one exists.
      */
+    private volatile String lastTradedAtCache = null;
+    private volatile long lastTradedAtCacheTs = 0L;
+
+    /**
+     * When the newest stored price actually traded - the timestamp of the last intraday candle.
+     *
+     * <p>lastSessionCloseIST below is pure calendar arithmetic: it assumes 15:30, steps back over
+     * weekends and knows nothing about holidays or about whether that session has any data. It
+     * therefore names a time no trade happened at, and on a holiday names a day the market was
+     * shut. The last stored candle is the honest answer - on 6 Sep 2026 that is 2026-09-04
+     * 15:27, not the 15:30 the calendar would claim.
+     *
+     * <p>Cached for a minute: it only changes when new candles land, and the query touches a
+     * 52-million-row table (215ms) which is not worth repeating per request.
+     */
+    private String lastTradedAtIST() {
+        long now = System.currentTimeMillis();
+        if (lastTradedAtCache != null && now - lastTradedAtCacheTs < 60_000L) return lastTradedAtCache;
+        String value = null;
+        try {
+            Object v = em.createNativeQuery(
+                "SELECT MAX(candle_time) FROM broker_market_candles " +
+                "WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY' AND trade_date = " +
+                "(SELECT MAX(trade_date) FROM broker_market_candles " +
+                " WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY')")
+                .getSingleResult();
+            if (v != null) value = String.valueOf(v).replace('T', ' ');
+        } catch (Exception e) {
+            log.debug("Last traded time unavailable: {}", e.getMessage());
+        }
+        // Fall back to the calendar only when there is genuinely nothing stored to read.
+        lastTradedAtCache = value != null && !value.isBlank() ? value : lastSessionCloseIST();
+        lastTradedAtCacheTs = now;
+        return lastTradedAtCache;
+    }
+
     private String lastSessionCloseIST() {
         java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
         java.time.ZonedDateTime close = now.withHour(15).withMinute(30).withSecond(0).withNano(0);
         if (close.isAfter(now)) close = close.minusDays(1);
         while (close.getDayOfWeek().getValue() >= 6) close = close.minusDays(1);
         return close.format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    }
+
+    /**
+     * The trading session a price fetched right now belongs to.
+     *
+     * <p>current_price_date used to be set to {@code DateUtil.today()} - the calendar day the
+     * refresh thread happened to run on, not the session the price came from. A refresh that ran
+     * on Sunday 2026-11-01 stamped 1,264 of 1,271 tracked stocks with
+     * {@code current_price_date = 2026-11-01}, a day on which the exchange was shut and no price
+     * existed. The screen then reported a price "as of" a date that never had one.
+     *
+     * <p>Outside market hours Dhan's quote endpoint returns the last traded price, which belongs
+     * to the last session that actually ran - so that is what is recorded. Weekends step back to
+     * Friday, and a fetch before 09:15 belongs to the previous session rather than to a day that
+     * has not opened yet.
+     *
+     * <p>Exchange holidays defeated the weekday rule, which is why this now reads the data. On
+     * 2026-11-11 at 08:11 IST the quote endpoint came back after nine days down and returned
+     * Monday's closes; stepping back one weekday from Wednesday gave Tuesday 2026-11-10, the
+     * Diwali Balipratipada holiday, so 1,265 rows carried Monday's prices stamped with a date on
+     * which the exchange never opened. That also stalled the stored-close fill, whose guard
+     * compares current_price_date against a candle's session: labelled 11-10, the rows looked
+     * newer than the 11-09 close that was actually in them, and nothing would have corrected
+     * them. The last stored daily candle has neither failure mode - see
+     * {@link #latestStoredSessionDate}.
+     */
+    private String priceSessionDate() {
+        java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+        if (isMarketOpen()) return now.toLocalDate().toString();
+
+        // Out of session the last stored daily candle IS the last session that ran, so ask the
+        // data rather than reason about the calendar. Clamped to today in case a candle is ever
+        // stored ahead of the current date.
+        String stored = latestStoredSessionDate();
+        if (stored != null && stored.compareTo(now.toLocalDate().toString()) <= 0) return stored;
+
+        // Nothing stored to go on: fall back to calendar arithmetic. isTradingDay() also consults
+        // the configured holiday list, which is empty by default - hence preferring the data.
+        java.time.LocalDate d = now.toLocalDate();
+        if (now.toLocalTime().isBefore(java.time.LocalTime.of(9, 15))) d = d.minusDays(1);
+        for (int i = 0; i < 10 && !isTradingDay(d); i++) d = d.minusDays(1);
+        return d.toString();
+    }
+
+    /** Newest stored daily session, cached briefly - it changes once a day at most. */
+    private final java.util.concurrent.atomic.AtomicReference<String[]> latestSessionCache =
+        new java.util.concurrent.atomic.AtomicReference<>(null);
+    private static final long LATEST_SESSION_TTL_MS = 60_000L;
+
+    /**
+     * The most recent trade_date present in the stored daily candles, or null if there are none.
+     *
+     * <p>This is the authoritative answer to "which session was last" and needs no maintenance:
+     * it is a fact about the data rather than a rule about the calendar, so it is automatically
+     * right about holidays, half days and special sessions alike. It identified Sunday 2026-11-08
+     * as a real session - Diwali Muhurat trading - and Tuesday 2026-11-10 as not one, the Diwali
+     * Balipratipada holiday, neither of which any weekday rule would get right.
+     *
+     * <p>Costs about 19 ms against idx_bmc_trade_date, and is called once per write batch, so the
+     * result is cached for {@value #LATEST_SESSION_TTL_MS} ms.
+     */
+    private String latestStoredSessionDate() {
+        String[] cached = latestSessionCache.get();
+        long nowMs = System.currentTimeMillis();
+        if (cached != null && nowMs - Long.parseLong(cached[1]) < LATEST_SESSION_TTL_MS) {
+            return cached[0] == null || cached[0].isEmpty() ? null : cached[0];
+        }
+        String value = null;
+        try {
+            Object v = em.createNativeQuery(
+                "SELECT MAX(trade_date) FROM broker_market_candles " +
+                "WHERE (candle_mode IS NULL OR UPPER(candle_mode)='DAILY')")
+                .getSingleResult();
+            if (v != null) {
+                String s = String.valueOf(v).trim();
+                if (!s.isEmpty() && !"null".equalsIgnoreCase(s)) value = s;
+            }
+        } catch (Exception e) {
+            log.debug("Latest stored session lookup failed: {}", e.getMessage());
+        }
+        latestSessionCache.set(new String[]{value == null ? "" : value, String.valueOf(nowMs)});
+        return value;
     }
 
     private boolean isMarketOpen() {
@@ -7776,6 +10364,14 @@ public class StockTrackerService {
         }
     }
 
+    /** The yyyy-MM-dd half of a stored candle timestamp, or null if it carries no date. */
+    private static String stampDatePart(String stamp) {
+        if (stamp == null) return null;
+        int at = stamp.indexOf('T');
+        if (at >= 10) return stamp.substring(0, at);
+        return stamp.length() >= 10 && stamp.charAt(4) == '-' ? stamp.substring(0, 10) : null;
+    }
+
     private static class TradeQuote {
         final double price;
         final String time;
@@ -7820,7 +10416,9 @@ public class StockTrackerService {
         String p = period == null ? "NOW" : period.trim().toUpperCase(Locale.ROOT);
         String buyDate = resolvePeriodDate(p, customDate);
         boolean historical = !buyDate.equals(today) && !p.equals("NOW") && !p.equals("PAPER");
-        if (buyTime == null || buyTime.isBlank()) buyTime = historical ? "15:20" : now.substring(11, 16);
+        // Was a hardcoded "15:20" while top10.trade.buy_time said 15:15, so a back-dated batch
+        // priced itself five minutes away from the setting the screen displayed.
+        if (buyTime == null || buyTime.isBlank()) buyTime = historical ? getTradeBuyTime() : now.substring(11, 16);
         String batchId = "TOP10_" + buyDate.replace("-", "") + "_" + buyTime.replace(":", "");
 
         try {
@@ -8287,10 +10885,15 @@ public class StockTrackerService {
             String up = symbol.trim().toUpperCase(Locale.ROOT);
             String norm = normalizeSymbol(symbol);
             List<String> keys = norm.equals(up) ? List.of(up) : List.of(up, norm);
-            String dayStart = date + " 00:00:00";
-            String target   = date + " " + hhmm + ":59";
-            String exactLo  = date + " " + hhmm + ":00";
-            String dayEnd   = date + " 23:59:59";
+            // 'T', not a space - same rule as findIntradayBuyQuote above. candle_time is stored
+            // ISO-style ("2026-08-04T15:20:00") and compared as text; ' ' (32) sorts below 'T' (84),
+            // so a space-separated upper bound excludes every candle of the day and this returned
+            // no price at all. (tracker_rankings.created_at IS space-separated - do not change
+            // the rankingRunAsOf bounds to match this.)
+            String dayStart = date + "T00:00:00";
+            String target   = date + "T" + hhmm + ":59";
+            String exactLo  = date + "T" + hhmm + ":00";
+            String dayEnd   = date + "T23:59:59";
             String r = rule == null ? "NEXT" : rule.trim().toUpperCase(Locale.ROOT);
 
             Double px = null;
@@ -8393,14 +10996,18 @@ public class StockTrackerService {
         String bad = sessionRejection(primaryDate, primaryTime, primaryLabel);
         if (bad != null) { out.put("success", false); out.put("error", bad); return out; }
 
-        String pTime = normalizeHhmm(primaryTime, "15:20");
+        // 15:15, not 15:20. priceAt("EXACT") looks only inside [hh:mm:00, hh:mm:59] and returns
+        // null rather than a neighbouring bar - deliberately, so a missing trade reads as
+        // missing. Candles are hourly now, anchored on the 09:15 open, so the last bar starts
+        // at 15:15 and nothing begins at 15:20: every EXACT row would have read "no trade".
+        String pTime = normalizeHhmm(primaryTime, "15:15");
         boolean hasSecondary = secondaryDate != null && !secondaryDate.isBlank()
                             && secondaryTime != null && !secondaryTime.isBlank();
         String sTime = null;
         if (hasSecondary) {
             bad = sessionRejection(secondaryDate, secondaryTime, secondaryLabel);
             if (bad != null) { out.put("success", false); out.put("error", bad); return out; }
-            sTime = normalizeHhmm(secondaryTime, "15:20");
+            sTime = normalizeHhmm(secondaryTime, "15:15");
             // A position closes after it opens, whichever way round the legs are named.
             java.time.LocalDateTime p = java.time.LocalDateTime.parse(primaryDate + "T" + pTime + ":00");
             java.time.LocalDateTime s = java.time.LocalDateTime.parse(secondaryDate + "T" + sTime + ":00");
@@ -8585,8 +11192,8 @@ public class StockTrackerService {
         Map<String, Object> out = new LinkedHashMap<>();
         List<Map<String, Object>> days = new ArrayList<>();
         try {
-            String bt = normalizeHhmm(buyTime, "15:20");
-            String st = normalizeHhmm(sellTime, "10:00");
+            String bt = normalizeHhmm(buyTime, "15:15");
+            String st = normalizeHhmm(sellTime, "10:15");
             java.time.LocalDate from = java.time.LocalDate.parse(fromDate);
             java.time.LocalDate to   = java.time.LocalDate.parse(toDate);
             if (to.isBefore(from)) { java.time.LocalDate t = from; from = to; to = t; }
@@ -8693,8 +11300,8 @@ public class StockTrackerService {
     // =========================================================================
     @SuppressWarnings("unchecked")
     public List<Map<String, Object>> getBacktestTrend(Long userId, Long institutionId, String buyTime, String sellTime, int days) {
-        String bt = normalizeHhmm(buyTime, "15:20");
-        String st = normalizeHhmm(sellTime, "10:00");
+        String bt = normalizeHhmm(buyTime, "15:15");
+        String st = normalizeHhmm(sellTime, "10:15");
         int n = Math.max(1, Math.min(days, 90));
 
         // Distinct ranking days that produced a Current Top 10, most recent first.
@@ -8764,9 +11371,10 @@ public class StockTrackerService {
             String up = symbol.trim().toUpperCase(Locale.ROOT);
             String norm = normalizeSymbol(symbol);
             List<String> keys = norm.equals(up) ? List.of(up) : List.of(up, norm);
-            String dayStart = date + " 00:00:00";
-            String target   = date + " " + hhmm + ":59";
-            String dayEnd   = date + " 23:59:59";
+            // 'T', not a space - see priceAt above. A space-separated bound matched no candle.
+            String dayStart = date + "T00:00:00";
+            String target   = date + "T" + hhmm + ":59";
+            String dayEnd   = date + "T23:59:59";
 
             Double px = intradayPick("symbol", keys, dayStart, target, true);
             if (px == null) px = intradayPick("trading_symbol", keys, dayStart, target, true);
@@ -8855,10 +11463,13 @@ public class StockTrackerService {
         return d.toString();
     }
 
-    /** DB-only close for a symbol on a date: intraday near 15:20, else DAILY close, else null. */
+    /** DB-only close for a symbol on a date: intraday near the last bar, else DAILY, else null. */
     Double dbCloseAt(String symbol, String date) {
         if (symbol == null || date == null) return null;
-        Double intr = intradayCloseAt(symbol, date, "15:20");
+        // 15:20 was not a bar start once bars became hourly (09:15, 10:15 ... 15:15).
+        // intradayCloseAt looks backwards before it looks forwards, so this kept working by
+        // luck; naming the real last bucket makes it the first seek instead of the fallback.
+        Double intr = intradayCloseAt(symbol, date, "15:15");
         if (intr != null && intr > 0) return intr;
         try {
             String up = symbol.trim().toUpperCase(Locale.ROOT);
@@ -8893,7 +11504,7 @@ public class StockTrackerService {
     }
 
     /**
-     * @param buyTimeHHmm time-of-day the portfolio is priced at, e.g. "15:00". The Top 10 shown
+     * @param buyTimeHHmm time-of-day the portfolio is priced at, e.g. "15:15". The Top 10 shown
      *        is the ranking run that was current at {@code date + buyTimeHHmm} — picking 1 Day
      *        at 15:00 shows an earlier day's list when that day's run only happened later in
      *        the evening. Defaults to the 15:20 daily snapshot convention.
@@ -8914,7 +11525,7 @@ public class StockTrackerService {
      *
      * @param sellPeriod     same vocabulary as the buy period (NOW, 1D, CUSTOM, ...)
      * @param sellCustomDate yyyy-MM-dd when sellPeriod is CUSTOM
-     * @param sellTimeHHmm   time of day to price the sell leg at, e.g. "15:20"
+     * @param sellTimeHHmm   time of day to price the sell leg at, e.g. "10:15"
      */
     @SuppressWarnings("unchecked")
     public Map<String, Object> getTop10Preview(Long userId, Long institutionId, String period,
@@ -8987,17 +11598,37 @@ public class StockTrackerService {
             String sp = sellPeriod == null || sellPeriod.isBlank()
                 ? "NOW" : sellPeriod.trim().toUpperCase(Locale.ROOT);
             boolean sellHistorical = !sp.equals("NOW") && !sp.equals("PAPER");
-            String sellDate = sellHistorical ? resolvePeriodDate(sp, sellCustomDate) : null;
+            // The sell is the session AFTER the buy, not a second period resolved on its own.
+            //
+            // Both legs defaulted to "1D" and resolvePeriodDate counts back from today, so both
+            // landed on the same session - 4 Sep bought at 15:20 and sold at 11:00 the SAME
+            // morning, four hours before the purchase it was closing. The rule this section
+            // states is one trade held overnight: bought at the cut-off, sold at 11:00 on the
+            // next market day. plusTradingDays walks the market calendar, so a Friday buy sells
+            // on Monday and a holiday is stepped over.
+            //
+            // An explicitly chosen CUSTOM sell date is still honoured - that control exists so a
+            // particular pair of dates can be examined - but it is validated below.
+            String sellDate = !sellHistorical ? null
+                : (sp.equals("CUSTOM") ? resolvePeriodDate(sp, sellCustomDate)
+                                       : plusTradingDays(buyDate, 1));
             String sellTime = normalizeHhmm(sellTimeHHmm);
             // Unselected sell leg outside market hours falls back the same way as the buy leg.
             boolean sellFromLastSession = !sellHistorical && !isMarketOpen();
             String sellShownDate = sellHistorical ? sellDate : (sellFromLastSession ? lastSessionDay : DateUtil.today());
             String sellShownTime = sellHistorical ? sellTime : (sellFromLastSession ? "15:30" : "LIVE");
-            if (sellHistorical && sellDate != null && sellDate.compareTo(buyDate) < 0) {
-                out.put("success", false);
-                out.put("error", "Sell date " + sellDate + " is before the buy date " + buyDate + ".");
-                out.put("stocks", new ArrayList<>());
-                return out;
+            // Compared as instants, not as dates. The old test only caught a sell on an EARLIER
+            // day, so a sell at 11:00 on the buy's own day passed straight through it.
+            if (sellHistorical && sellDate != null) {
+                String buyStamp  = buyDate + "T" + (buyTime == null ? "00:00" : buyTime);
+                String sellStamp = sellDate + "T" + (sellTime == null ? "00:00" : sellTime);
+                if (sellStamp.compareTo(buyStamp) <= 0) {
+                    out.put("success", false);
+                    out.put("error", "The sell (" + sellDate + " " + sellTime + ") is not after the buy ("
+                                   + buyDate + " " + buyTime + ").");
+                    out.put("stocks", new ArrayList<>());
+                    return out;
+                }
             }
             out.put("sell_period", sp);
             out.put("sell_date", sellDate);
@@ -9021,13 +11652,29 @@ public class StockTrackerService {
             List<String> symbols = currentTop10.stream()
                 .map(s -> String.valueOf(s.getOrDefault("symbol", ""))).toList();
             Map<String, Double> livePrices = resolveCurrentPricesBatch(symbols, institutionId);
+            // When each tracked price was last stamped. A stock whose stored price predates the
+            // buy is being valued at a price from BEFORE it was bought: RUBYMILLS carried a
+            // 31 Aug price of 384.35 against a 4 Sep purchase at 428.30 and reported -10.26%, a
+            // loss made entirely of the three sessions between the two figures.
+            Map<String, String> priceDates = trackedPriceDates(symbols, institutionId);
 
             List<Map<String, Object>> stocks = new ArrayList<>();
-            double totalReturn = 0; int win = 0, lose = 0, missing = 0, counted = 0;
+            double totalReturn = 0; int win = 0, lose = 0, missing = 0, counted = 0, openRows = 0;
             for (Map<String, Object> s : currentTop10) {
                 String sym = String.valueOf(s.getOrDefault("symbol", ""));
                 double current = livePrices.getOrDefault(normalizeSymbol(sym), 0.0);
                 if (current <= 0) current = getD(s, "current_price");
+                String curDate = priceDates.get(normalizeSymbol(sym));
+                boolean currentPredatesBuy = curDate != null && !curDate.isBlank()
+                    && historical && buyDate != null && curDate.compareTo(buyDate) < 0;
+                String staleNote = null;
+                if (currentPredatesBuy) {
+                    // Fall back to the newest close actually held for the buy day, so the row
+                    // reads flat - unknown - instead of inventing a move out of stale data.
+                    Double onBuyDay = dbCloseAt(sym, buyDate);
+                    staleNote = "No price newer than the buy - last stored price is " + curDate + ".";
+                    current = onBuyDay != null && onBuyDay > 0 ? onBuyDay : 0;
+                }
                 // Kept as separate branches: mixing Double and double in one conditional
                 // expression makes Java unbox the null returned when no candle exists.
                 Double buy;
@@ -9048,9 +11695,38 @@ public class StockTrackerService {
 
                 // Sell price: historical when a sell day was chosen, otherwise the live tick.
                 Double sell;
+                String sellNote = null;
                 if (sellHistorical) {
                     sell = intradayCloseAt(sym, sellDate, sellTime);
-                    if (sell == null || sell <= 0) sell = dbCloseAt(sym, sellDate);
+                    if (sell == null || sell <= 0) {
+                        // dbCloseAt falls back to that day's 15:20 print, then its daily close. On
+                        // a DIFFERENT day from the buy that is a coarser but real exit. On the SAME
+                        // day it returns the very bar the buy came from, so the row showed an
+                        // identical buy and sell and a 0.00% return that looked like a real flat
+                        // trade - and counted as a winner in the average. RUBYMILLS did exactly
+                        // this: no intraday at all on 4 Sep, both legs falling back to the 428.30
+                        // daily close. Say the price is missing instead of inventing a trade.
+                        if (sellDate != null && sellDate.compareTo(DateUtil.today()) >= 0) {
+                            // The exit is today or later: this position is simply still running.
+                            // Bought at Friday's cut-off, sells at 11:00 on the next market day -
+                            // until that print exists the trade is OPEN, so value it at the
+                            // current price and say so, rather than showing ten blank rows.
+                            sell = current > 0 ? current : null;
+                            sellNote = sell == null ? "Open - no current price yet"
+                                : staleNote != null
+                                    ? "OPEN - " + staleNote
+                                    : "OPEN - valued at the current price; settles at " + sellTime
+                                      + " on " + sellDate + ".";
+                            openRows++;
+                        } else if (sellDate != null && sellDate.equals(rowBuyDate)) {
+                            sell = null;
+                            sellNote = "No traded price at " + sellTime + " on " + sellDate;
+                        } else {
+                            sell = dbCloseAt(sym, sellDate);
+                            if (sell != null && sell > 0) sellNote = "Exit taken from the " + sellDate
+                                + " close - no intraday print at " + sellTime + ".";
+                        }
+                    }
                 } else if (sellFromLastSession) {
                     sell = dbCloseAt(sym, lastSessionDay);
                 } else {
@@ -9061,22 +11737,26 @@ public class StockTrackerService {
                 m.put("symbol", sym);
                 m.put("rank", (int) getD(s, "rank"));
                 m.put("sector", s.getOrDefault("sector", ""));
-                m.put("current_price", current);
-                m.put("sell_price", sell);
+                // Rounded: these are float quotes and reached the screen as 428.29998779296875.
+                m.put("current_price", round2(current));
+                m.put("sell_price", sell == null ? null : round2(sell));
+                if (sellNote != null) m.put("sell_note", sellNote);
                 m.put("buy_date", rowBuyDate);
                 m.put("buy_time", rowBuyTime);
                 m.put("sell_date", sellShownDate);
                 m.put("sell_time", sellShownTime);
                 if (buy == null || buy <= 0 || sell == null || sell <= 0) {
-                    m.put("buy_price", buy != null && buy > 0 ? buy : null);
+                    m.put("buy_price", buy != null && buy > 0 ? round2(buy) : null);
                     m.put("return_pct", null);
                     m.put("price_available", false);
                     missing++;
                 } else {
                     double ret = Math.round(((sell - buy) / buy) * 10000.0) / 100.0;
-                    m.put("buy_price", buy);
+                    m.put("buy_price", round2(buy));
                     m.put("return_pct", ret);
                     m.put("price_available", true);
+                    // OPEN vs closed is the difference between a result and a running position.
+                    m.put("status", sellNote != null && sellNote.startsWith("OPEN") ? "OPEN" : "CLOSED");
                     totalReturn += ret; counted++;
                     if (ret >= 0) win++; else lose++;
                 }
@@ -9092,6 +11772,7 @@ public class StockTrackerService {
             out.put("winners", win);
             out.put("losers", lose);
             out.put("missing_prices", missing);
+            out.put("open_positions", openRows);
             out.put("counted", counted);
         } catch (Exception e) {
             log.error("Top 10 preview failed: {}", e.getMessage(), e);
@@ -9120,14 +11801,11 @@ public class StockTrackerService {
             String threshold = d.toString();
 
             StringBuilder sql = new StringBuilder(
-                "WITH latest AS (" +
-                "  SELECT UPPER(TRIM(symbol)) AS sym, MAX(LEFT(CAST(trade_date AS TEXT),10)) AS dd " +
-                "  FROM market_data WHERE close IS NOT NULL GROUP BY UPPER(TRIM(symbol)) " +
-                "  UNION ALL " +
-                "  SELECT UPPER(TRIM(COALESCE(symbol,trading_symbol))) AS sym, MAX(LEFT(CAST(trade_date AS TEXT),10)) AS dd " +
+                "WITH freshest AS (" +
+                "  SELECT UPPER(TRIM(COALESCE(symbol,trading_symbol))) AS sym, MAX(LEFT(CAST(trade_date AS TEXT),10)) AS latest_daily " +
                 "  FROM broker_market_candles WHERE close IS NOT NULL AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "  GROUP BY UPPER(TRIM(COALESCE(symbol,trading_symbol))) " +
-                "), freshest AS (SELECT sym, MAX(dd) AS latest_daily FROM latest GROUP BY sym) " +
+                ") " +
                 "SELECT ts.symbol, f.latest_daily, ts.base_price, ts.current_price, ts.last_refreshed, ts.base_price_source " +
                 "FROM tracked_stocks ts LEFT JOIN freshest f ON f.sym = UPPER(TRIM(ts.symbol)) " +
                 "WHERE ts.institution_id=? AND ts.is_active=1 ");

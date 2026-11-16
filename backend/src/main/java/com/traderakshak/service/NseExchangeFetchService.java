@@ -233,6 +233,17 @@ public class NseExchangeFetchService {
         return 1;
     }
 
+    /**
+     * Fetches one NSE index constituent CSV.
+     *
+     * <p>Public so IndexMembershipService can reuse the cookie jar, browser headers and warm-up
+     * request that NSE requires - a plain GET to these files is refused. Building a second HTTP
+     * client for the same host would mean maintaining that handshake twice.
+     */
+    public String fetchIndexConstituentCsv(String url) throws Exception {
+        return requestText(url);
+    }
+
     private byte[] requestBytes(String url) throws Exception {
         HttpClient client = client();
         warmup(client, url);
@@ -297,6 +308,7 @@ public class NseExchangeFetchService {
         if (url.contains("/content/fo/") || url.contains("/DERIVATIVES/")) return "https://www.nseindia.com/all-reports-derivatives";
         if (url.contains("fiidii")) return "https://www.nseindia.com/reports/fii-dii";
         if (url.contains("option-chain")) return "https://www.nseindia.com/option-chain";
+        if (url.contains("/content/indices/")) return "https://www.nseindia.com/market-data/live-market-indices";
         return "https://www.nseindia.com/all-reports";
     }
 

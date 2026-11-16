@@ -222,5 +222,16 @@ spring:
     locations: classpath:db/migration/postgresql
 
 server:
+  # Let Spring run shutdown hooks instead of dying on the spot. LiveCandleAggregator holds up to
+  # one full bar of ticks in memory, so an abrupt exit loses them - see flushOnShutdown().
+  shutdown: graceful
   ssl:
     enabled: true
+
+# Live candle aggregation. The width is NOT a free number: the Stock Upload price lookups seek
+# forward to the first bar at or after a configured time, so every buy/sell time in use must fall
+# on a bar start. Buckets are anchored at the 09:15 session open, giving 09:15, 10:15 ... 15:15 -
+# which is also how Dhan stamps its own 60-minute candles, so live and backfilled bars share a key.
+livecandle:
+  interval:
+    minutes: 60

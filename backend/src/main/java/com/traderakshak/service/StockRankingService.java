@@ -851,9 +851,14 @@ public class StockRankingService {
 
     private double getMarketTrendScore() {
         try {
-            // Use Nifty 50 last 20-day close data to compute market trend
+            // Use Nifty 50 last 20-day close data to compute market trend. The index is stored
+            // under Dhan's index segment as "NIFTY"; the old query looked for "NIFTY 50" in the
+            // equity tables, a name that appears in neither, so this always fell through to the
+            // neutral 55.0 below. It stays neutral until an index backfill has been run.
             List<Object[]> rows = em.createNativeQuery(
-                "SELECT close FROM market_data WHERE exchange='NSE' AND symbol='NIFTY 50' " +
+                "SELECT close FROM broker_market_candles " +
+                "WHERE exchange_segment='IDX_I' AND UPPER(TRIM(symbol))='NIFTY' " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' AND close IS NOT NULL " +
                 "ORDER BY trade_date DESC LIMIT 20").getResultList();
             if (rows.size() < 10) return 55.0; // neutral
 

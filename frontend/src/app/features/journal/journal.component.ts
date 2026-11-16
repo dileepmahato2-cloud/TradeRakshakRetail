@@ -49,6 +49,12 @@ type JournalMode = 'system' | 'paper' | 'manual';
       </div>
     </div>
 
+    <div style="background:#141d2e;border:1px solid #2b3f5e;border-left:3px solid #f59e0b;border-radius:7px;padding:10px 12px;margin-bottom:16px;color:#c8d8ef;font-size:12px;">
+      This page holds <strong>trade notes you write yourself</strong>. Trades the app placed for you &mdash;
+      Buy All 10 from Today top 10 Ranking Stocks, and every other automated or bulk order &mdash; are recorded
+      separately under <strong>Executed Trades</strong> in the sidebar (Trading &rarr; Trading Journal tab).
+    </div>
+
     @if (loading()) {
       <div style="text-align:center;color:#94a3b8;padding:28px;">Loading...</div>
     } @else {
@@ -71,7 +77,8 @@ type JournalMode = 'system' | 'paper' | 'manual';
           </div>
         } @else {
           <div style="background:#0b1524;border:1px solid #243853;border-radius:7px;padding:12px;margin-bottom:16px;color:#9eb8dd;font-size:13px;">
-            Showing fetched {{ sourceLabel() }} records. Use Refresh to fetch the latest journal data.
+            Showing {{ sourceLabel() }} records held in this notebook. This filters the notes on this page by
+            their source tag &mdash; it does not pull in orders the app placed. Those live under Executed Trades.
           </div>
         }
         @if (message()) { <div style="color:#5ff5cd;font-size:12px;margin-bottom:10px;">{{ message() }}</div> }

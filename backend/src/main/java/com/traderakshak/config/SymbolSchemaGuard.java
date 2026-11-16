@@ -10,6 +10,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import java.util.List;
+
 /**
  * Keeps stock-linked tables aligned on the common application key: symbol.
  * This runs at startup because local/dev deployments may run with Flyway disabled.
@@ -36,12 +38,12 @@ public class SymbolSchemaGuard implements ApplicationRunner {
         addApplicationSettingsTables();
         addDataFetchPerformanceIndexes();
         addSymbol("event_calendar");
-        addSymbol("broker_instruments");
         addSymbol("broker_market_candles");
         addSymbol("broker_api_fetch_jobs");
         addSymbol("broker_option_chain_snapshots");
         addSymbol("option_chain");
         addTradeBatchTables();
+        addStockUploadHistoryTable();
         backfillSymbols();
         appConfigService.deferredInit();
     }
@@ -341,10 +343,6 @@ public class SymbolSchemaGuard implements ApplicationRunner {
         addIndex("data_fetch_logs", "idx_dfl_data_type", "data_type");
         addIndex("data_fetch_logs", "idx_dfl_created_date", "created_at");
 
-        addIndex("market_data", "idx_market_data_trade_date", "trade_date");
-        addIndex("market_data", "idx_market_data_symbol_date", "symbol, trade_date DESC");
-        addIndex("market_data", "idx_market_data_exchange_date", "exchange, trade_date");
-
         addIndex("broker_market_candles", "idx_bmc_trade_date", "trade_date");
         addIndex("broker_market_candles", "idx_bmc_symbol_date", "symbol, trade_date DESC");
 
@@ -397,6 +395,31 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             "created_at TEXT)");
         addIndex("tracker_deletion_logs", "idx_tdl_inst", "institution_id");
         addIndex("tracker_deletion_logs", "idx_tdl_user", "user_id, created_at DESC");
+    }
+
+    /**
+     * Append-only log of every uploaded stock signal — see V49 for the reasoning.
+     * Mirrored here because local/dev deployments may run with Flyway disabled, and without the
+     * table the upload handler has nowhere to write and every Top-10 screen comes up empty.
+     */
+    private void addStockUploadHistoryTable() {
+        execute("CREATE TABLE IF NOT EXISTS stock_upload_history (" +
+            "id BIGSERIAL PRIMARY KEY, upload_batch_id UUID NOT NULL, file_name TEXT, " +
+            "institution_id BIGINT NOT NULL DEFAULT 1, user_id BIGINT NOT NULL DEFAULT 0, " +
+            "entry_date DATE NOT NULL, symbol TEXT NOT NULL, " +
+            "marketcap_name TEXT NOT NULL DEFAULT '', sector TEXT NOT NULL DEFAULT '', " +
+            "base_price DOUBLE PRECISION, base_price_date DATE, base_price_source TEXT, " +
+            "uploaded_at TIMESTAMPTZ NOT NULL DEFAULT now())");
+        // Exact-repeat suppression only. The same symbol on a DIFFERENT date is a separate signal
+        // and must stay, so entry_date is part of the key rather than excluded from it.
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_suh_row_identity ON stock_upload_history " +
+            "(institution_id, user_id, symbol, entry_date, marketcap_name, sector)");
+        addIndex("stock_upload_history", "idx_suh_symbol_date", "symbol, entry_date DESC");
+        addIndex("stock_upload_history", "idx_suh_entry_date", "entry_date");
+        addIndex("stock_upload_history", "idx_suh_scope_symbol_date",
+            "institution_id, user_id, symbol, entry_date DESC");
+        execute("CREATE INDEX IF NOT EXISTS idx_suh_missing_base ON stock_upload_history " +
+            "(institution_id, entry_date) WHERE base_price IS NULL OR base_price <= 0");
     }
 
     private void addTradeBatchTables() {
@@ -481,7 +504,6 @@ public class SymbolSchemaGuard implements ApplicationRunner {
         // Phase 4b: functional indexes matching the UPPER(symbol) expressions in
         // loadDailyBars(), so per-stock daily-bar lookups during ranking eligibility
         // use an index instead of a full table scan (this was the ~3-minute ranking).
-        execute("CREATE INDEX IF NOT EXISTS idx_md_usym_date ON market_data (UPPER(symbol), trade_date DESC)");
         execute("CREATE INDEX IF NOT EXISTS idx_bmc_usym ON broker_market_candles ((UPPER(COALESCE(symbol,'')))) ");
         execute("CREATE INDEX IF NOT EXISTS idx_bmc_utsym ON broker_market_candles ((UPPER(COALESCE(trading_symbol,'')))) ");
         execute("CREATE INDEX IF NOT EXISTS idx_bmc_utsym_eq ON broker_market_candles ((UPPER(REPLACE(COALESCE(trading_symbol,''),'-EQ','')))) ");
@@ -496,8 +518,6 @@ public class SymbolSchemaGuard implements ApplicationRunner {
         // the key so the per-symbol LATERAL "latest candle" seeks resolve as a one-row index
         // scan. Without this pair those lookups scanned ~31% of a 27M-row table repeatedly,
         // which was the ~200-second ranking stage.
-        execute("CREATE INDEX IF NOT EXISTS idx_md_norm_date ON market_data " +
-            "(UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(symbol,'')),'.NS',''),'.BO',''),'-EQ',''),'-BE',''),'-BZ',''),'-SM',''),'-ST',''),' ','')), trade_date DESC)");
         execute("CREATE INDEX IF NOT EXISTS idx_bmc_norm_date ON broker_market_candles " +
             "(UPPER(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(TRIM(COALESCE(symbol,'')),'.NS',''),'.BO',''),'-EQ',''),'-BE',''),'-BZ',''),'-SM',''),'-ST',''),' ','')), trade_date DESC)");
 
@@ -515,8 +535,8 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             {"prevtop10.auto_cycle.enabled",          "Previous Top 10 Auto Cycle",        "false", "BOOLEAN", "3"},
             {"prevtop10.auto_buy.enabled",            "Auto Buy Enabled",                  "false", "BOOLEAN", "4"},
             {"prevtop10.auto_sell.enabled",           "Auto Sell Enabled",                 "false", "BOOLEAN", "5"},
-            {"prevtop10.buy_time",                    "Auto Buy Time (HH:mm IST)",         "15:20", "STRING",  "6"},
-            {"prevtop10.sell_time",                   "Auto Sell Time (HH:mm IST)",        "09:30", "STRING",  "7"},
+            {"prevtop10.buy_time",                    "Auto Buy Time (HH:mm IST)",         "15:15", "STRING",  "6"},
+            {"prevtop10.sell_time",                   "Auto Sell Time (HH:mm IST)",        "10:15", "STRING",  "7"},
             {"prevtop10.execution_mode",              "Execution Mode",                    "PAPER", "STRING",  "8"},
             {"prevtop10.use_real_price_if_executed",  "Use Real Executed Price",           "true",  "BOOLEAN", "9"},
             {"market.holidays",                       "Market Holidays (yyyy-MM-dd list)", "",      "STRING",  "10"},
@@ -534,6 +554,68 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             } catch (Exception e) {
                 log.debug("Automation config seed skipped for {}: {}", d[0], e.getMessage());
             }
+        }
+        retimeTradeLegsOnce();
+    }
+
+    /**
+     * Moves the Stock Upload trade legs to 15:15 buy / 10:15 next-day sell, once.
+     *
+     * <p>The seed above cannot do this. It is {@code ON CONFLICT DO NOTHING}, which is correct -
+     * a seed must never overwrite a value somebody chose - but it means an existing database keeps
+     * the old 15:20 / 11:00 / 15:00 forever while a fresh install gets the new times. So the two
+     * diverge and only one of them matches the code defaults.
+     *
+     * <p>Guarded by a marker row rather than by "update if it still looks like the old value".
+     * The marker applies this exactly once per database; the value test would re-apply on every
+     * restart and would quietly undo the user setting 15:20 back by hand later.
+     *
+     * <p>Why these times are not arbitrary: the price lookups seek forward to the first stored
+     * candle at or after the configured time, and candles are now hourly, anchored on the 09:15
+     * open - 09:15, 10:15 ... 15:15. 15:15 and 10:15 are bar starts. The old 15:20 is past the
+     * final bar, so a buy at 15:20 would match no candle at all and every trade would be skipped.
+     */
+    private void retimeTradeLegsOnce() {
+        String marker = "stockupload.trade_times.version";
+        try {
+            // getResultStream() keeps the JDBC ResultSet open and reads it lazily. There is no
+            // transaction around this call, so the connection is handed back the moment the
+            // query returns and findFirst() then reads from a closed cursor - "This ResultSet is
+            // closed", SQLState 55000, logged as an ERROR on every single startup. The retime
+            // was skipped every time as a result. getResultList() materialises before the
+            // connection goes away.
+            @SuppressWarnings("unchecked")
+            List<Object> appliedRows = em.createNativeQuery(
+                "SELECT setting_value FROM application_settings WHERE setting_key = ?")
+                .setParameter(1, marker).getResultList();
+            Object applied = appliedRows.isEmpty() ? null : appliedRows.get(0);
+            if (applied != null && "2".equals(String.valueOf(applied))) return;
+
+            String[][] legs = {
+                {"prevtop10.buy_time",   "15:15"},
+                {"prevtop10.sell_time",  "10:15"},
+                {"top10.trade.sell_time","10:15"},
+            };
+            for (String[] leg : legs) {
+                tx.executeWithoutResult(status -> em.createNativeQuery(
+                    "UPDATE application_settings SET setting_value = ?, default_value = ?, " +
+                    "updated_at = ? WHERE setting_key = ?")
+                    .setParameter(1, leg[1]).setParameter(2, leg[1])
+                    .setParameter(3, java.time.LocalDateTime.now().toString())
+                    .setParameter(4, leg[0]).executeUpdate());
+            }
+            tx.executeWithoutResult(status -> em.createNativeQuery(
+                "INSERT INTO application_settings(category,setting_key,setting_name,setting_value," +
+                "data_type,default_value,is_editable,is_active,display_order,config_version,created_at) " +
+                "VALUES('STOCK_UPLOAD_AUTOMATION',?,?,'2','STRING','2',0,1,99,2,?) " +
+                "ON CONFLICT (setting_key) DO UPDATE SET setting_value = '2'")
+                .setParameter(1, marker)
+                .setParameter(2, "Trade Leg Times Version")
+                .setParameter(3, java.time.LocalDateTime.now().toString())
+                .executeUpdate());
+            log.info("[Config] Stock Upload trade legs retimed to buy 15:15 / sell 10:15 next day.");
+        } catch (Exception e) {
+            log.warn("[Config] Trade-leg retime skipped: {}", e.getMessage());
         }
     }
 
@@ -671,8 +753,6 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             return;
         }
         long t0 = System.currentTimeMillis();
-        execute("UPDATE broker_instruments SET symbol=UPPER(TRIM(underlying_symbol)) WHERE broker_name='dhan' AND COALESCE(underlying_symbol,'')<>'' AND (COALESCE(symbol,'')='' OR UPPER(TRIM(symbol))<>UPPER(TRIM(underlying_symbol)))");
-        execute("UPDATE broker_market_candles b SET symbol=UPPER(TRIM(bi.underlying_symbol)) FROM broker_instruments bi WHERE b.broker_name='dhan' AND bi.broker_name='dhan' AND b.broker_security_id=bi.broker_security_id AND COALESCE(b.exchange_segment,'')=COALESCE(bi.exchange_segment,'') AND COALESCE(bi.underlying_symbol,'')<>'' AND (COALESCE(b.symbol,'')='' OR UPPER(TRIM(b.symbol))<>UPPER(TRIM(bi.underlying_symbol)))");
         execute("UPDATE broker_market_candles b SET symbol=UPPER(TRIM(di.underlying_symbol)) FROM dhan_instruments di WHERE b.broker_name='dhan' AND b.broker_security_id=di.security_id AND COALESCE(di.underlying_symbol,'')<>'' AND (COALESCE(b.exchange_segment,'')='' OR COALESCE(di.exchange_segment,'')='' OR UPPER(b.exchange_segment)=UPPER(di.exchange_segment)) AND (COALESCE(b.symbol,'')='' OR UPPER(TRIM(b.symbol))<>UPPER(TRIM(di.underlying_symbol)))");
         execute("UPDATE broker_api_fetch_jobs j SET symbol=UPPER(TRIM(di.underlying_symbol)) FROM dhan_instruments di WHERE j.broker_name='dhan' AND j.broker_security_id=di.security_id AND COALESCE(di.underlying_symbol,'')<>'' AND (COALESCE(j.symbol,'')='' OR UPPER(TRIM(j.symbol))<>UPPER(TRIM(di.underlying_symbol)))");
         execute("UPDATE event_calendar SET symbol=UPPER(TRIM(stock_symbol)) WHERE COALESCE(symbol,'')='' AND COALESCE(stock_symbol,'')<>''");

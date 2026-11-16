@@ -5,7 +5,9 @@ import com.traderakshak.service.BlockingHttpService;
 import com.traderakshak.service.DhanBrokerService;
 import com.traderakshak.service.AppConfigService;
 import com.traderakshak.service.LivePriceBroadcaster;
+import com.traderakshak.service.MarketCalendarService;
 import com.traderakshak.service.StockTrackerService;
+import com.traderakshak.service.StockUploadHistoryService;
 import com.traderakshak.service.TechnicalIndicatorEngine;
 import org.junit.jupiter.api.Test;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -22,12 +24,14 @@ class StockTrackerServicePriceSelectionTest {
     void staleMarketCloseCannotReplaceNewerTrackedPrice() throws Exception {
         StockTrackerService service = new StockTrackerService(
             mock(TechnicalIndicatorEngine.class),
+            mock(MarketCalendarService.class),
             new ObjectMapper(),
             mock(BlockingHttpService.class),
             mock(DhanBrokerService.class),
             mock(PlatformTransactionManager.class),
             mock(AppConfigService.class),
-            mock(LivePriceBroadcaster.class)
+            mock(LivePriceBroadcaster.class),
+            mock(StockUploadHistoryService.class)
         );
 
         Method shouldUseNewerPrice = StockTrackerService.class

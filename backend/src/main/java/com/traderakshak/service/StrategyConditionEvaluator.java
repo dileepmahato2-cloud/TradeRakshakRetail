@@ -26,13 +26,34 @@ public class StrategyConditionEvaluator {
     private EntityManager em;
 
     /**
-     * Evaluate a strategy's conditions for a single symbol.
-     * Returns true if all conditions pass.
+     * Evaluate a strategy's conditions for a single symbol, against its LATEST data.
+     *
+     * <p>Suitable for screening "what qualifies right now". Not suitable for a backtest: the
+     * data is always the most recent 200 bars regardless of which day is being simulated, so
+     * every historical day would be judged on today's indicators. Backtests must use
+     * {@link #evaluate(List, Map, String)} with a point-in-time slice instead.
      */
-    @SuppressWarnings("unchecked")
     public boolean evaluate(List<Map<String, Object>> conditions, String symbol,
                             String exchange, String conditionGroup) {
+        return evaluate(conditions, loadSymbolData(symbol, exchange, 200), conditionGroup);
+    }
+
+    /**
+     * Evaluate a strategy's conditions against a supplied price series.
+     *
+     * <p>Same rules as the symbol form, but the caller owns the data. That is what makes a
+     * backtest possible: it can hand in the series truncated at the day being simulated, so an
+     * indicator can only ever see bars that existed at the time, and it can reuse one loaded
+     * history across every day instead of re-querying per symbol per day.
+     *
+     * @param data the map {@link #loadSymbolData} produces - opens/highs/lows/closes/volumes as
+     *             oldest-first {@code List<Double>}, plus delivery_pct and sector_score.
+     */
+    @SuppressWarnings("unchecked")
+    public boolean evaluate(List<Map<String, Object>> conditions, Map<String, Object> data,
+                            String conditionGroup) {
         if (conditions == null || conditions.isEmpty()) return false;
+        if (data == null) return false;
 
         List<Map<String, Object>> group = conditions.stream()
             .filter(c -> conditionGroup.equals(c.get("group")) ||
@@ -40,10 +61,6 @@ public class StrategyConditionEvaluator {
             .collect(Collectors.toList());
 
         if (group.isEmpty()) return false;
-
-        // Load price data once for this symbol
-        Map<String, Object> data = loadSymbolData(symbol, exchange, 200);
-        if (data == null) return false;
 
         boolean result = true;
         boolean firstInGroup = true;
@@ -198,6 +215,17 @@ public class StrategyConditionEvaluator {
                 double p = closes != null && closes.size() >= 2 ? closes.get(closes.size()-2) : c;
                 yield p > 0 ? (c - p) / p * 100 : 0;
             }
+            // The level the crossover rules are written against. It is supplied by the
+            // caller rather than computed, because it is not derived from the price series at
+            // all - it is either the price uploaded with the stock or the price at a reference
+            // date and time the strategy chose. 0 means the caller could not supply one, and a
+            // comparison against 0 would silently pass, so conditions using it are made to fail
+            // instead.
+            case "BASE_PRICE" -> {
+                Object bp = data.get("base_price");
+                double v = bp == null ? 0 : ((Number) bp).doubleValue();
+                yield v > 0 ? v : Double.NaN;
+            }
             case "SECTOR_SCORE"   -> getDouble(data, "sector_score", 50.0);
             case "DELIVERY_RATIO" -> {
                 double dv = delivery != null && !delivery.isEmpty() ? delivery.get(delivery.size()-1) : 0;
@@ -294,7 +322,8 @@ public class StrategyConditionEvaluator {
         try {
             List<Object[]> rows = em.createNativeQuery(
                 "SELECT open, high, low, close, volume, delivery_pct " +
-                "FROM market_data WHERE exchange=:ex AND symbol=:sym " +
+                "FROM broker_market_candles WHERE exchange=:ex AND symbol=:sym " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "ORDER BY trade_date DESC LIMIT :n")
                 .setParameter("ex", exchange).setParameter("sym", symbol)
                 .setParameter("n", bars).getResultList();
@@ -324,7 +353,20 @@ public class StrategyConditionEvaluator {
                 if (ss != null) sectorScore = ((Number)ss).doubleValue();
             } catch (Exception ignored) {}
 
+            // The uploaded base price, so a BASE_PRICE condition means something on the
+            // screening path too. A backtest overrides this with whatever reference point the
+            // strategy chose; here there is only ever the level the stock was uploaded with.
+            double basePrice = 0.0;
+            try {
+                Object bp = em.createNativeQuery(
+                    "SELECT base_price FROM tracked_stocks WHERE symbol=:sym " +
+                    "AND base_price > 0 LIMIT 1")
+                    .setParameter("sym", symbol).getSingleResult();
+                if (bp != null) basePrice = ((Number) bp).doubleValue();
+            } catch (Exception ignored) { }
+
             Map<String, Object> data = new HashMap<>();
+            data.put("base_price", basePrice);
             data.put("opens",   opens);   data.put("highs",   highs);
             data.put("lows",    lows);    data.put("closes",  closes);
             data.put("volumes", volumes); data.put("delivery_pct", deliv);

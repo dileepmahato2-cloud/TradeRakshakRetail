@@ -795,8 +795,10 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   // ── S&R State ─────────────────────────────────────────────────────────────
   srData: Record<string, IndexSR> | null = null;
-  srIndexKeys = ['NIFTY50', 'BANKNIFTY', 'FINNIFTY', 'NIFTY500'];
-  selectedIndex = signal<string>('NIFTY50');
+  // Filled from /sr/indices. The indices on offer and their names come from the broker's
+  // instrument master, so nothing here needs changing when one is renamed, added or dropped.
+  srIndexKeys: string[] = [];
+  selectedIndex = signal<string>('');
   srViewMode    = signal<'ladder' | 'cards' | 'table'>('ladder');
 
   currentSR = computed<IndexSR | null>(() => {
@@ -864,19 +866,24 @@ export class DashboardComponent implements OnInit, OnDestroy {
 
   private loadSR() {
     this.api.get<any>('/sr/indices').subscribe({
-      next: res => { if (res?.data) this.srData = res.data; },
+      next: res => {
+        const data = res?.data;
+        if (!data) return;
+        this.srData = data;
+        this.srIndexKeys = Array.isArray(data.indexes) ? data.indexes : [];
+        if (!this.srIndexKeys.includes(this.selectedIndex()) && this.srIndexKeys.length) {
+          this.selectedIndex.set(this.srIndexKeys[0]);
+        }
+      },
       error: err => console.warn('S&R fetch failed:', err)
     });
   }
 
   // ── Label helpers ─────────────────────────────────────────────────────────
 
+  // The broker's own display name, carried on each index in the payload.
   srLabel(key: string): string {
-    const m: Record<string, string> = {
-      'NIFTY50': 'Nifty 50', 'BANKNIFTY': 'Bank Nifty',
-      'FINNIFTY': 'Fin Nifty', 'NIFTY500': 'Nifty 500'
-    };
-    return m[key] ?? key;
+    return (this.srData?.[key] as any)?.label ?? key;
   }
 
   // ── Visual range helpers (price zone bar) ─────────────────────────────────

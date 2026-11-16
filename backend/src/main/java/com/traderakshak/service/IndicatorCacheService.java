@@ -303,7 +303,8 @@ public class IndicatorCacheService {
     private Map<String, Object> loadOhlcv(String symbol, String exchange, int bars) {
         try {
             List<Object[]> rows = em.createNativeQuery(
-                "SELECT open, high, low, close, volume FROM market_data " +
+                "SELECT open, high, low, close, COALESCE(total_volume,volume) FROM broker_market_candles " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "WHERE symbol=:sym AND (:ex IS NULL OR exchange=:ex) " +
                 "ORDER BY trade_date DESC LIMIT :n")
                 .setParameter("sym", symbol).setParameter("ex", exchange)

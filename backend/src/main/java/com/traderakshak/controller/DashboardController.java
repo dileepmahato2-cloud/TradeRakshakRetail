@@ -24,7 +24,6 @@ import java.util.*;
 @Tag(name = "Dashboard", description = "Dashboard stats and market overview")
 public class DashboardController {
 
-    private final MarketDataRepository     marketDataRepo;
     private final TradeJournalRepository   journalRepo;
     private final PaperTradeRepository     paperRepo;
     private final StrategyRepository       strategyRepo;
@@ -117,7 +116,8 @@ public class DashboardController {
     private Map<String, Object> marketMood() {
         String eff = lastMarketDate();
         List<?> rows = em.createNativeQuery(
-            "SELECT close, prev_close FROM market_data WHERE trade_date=:d")
+            "SELECT close, prev_close FROM broker_market_candles " +
+            "WHERE trade_date=:d AND UPPER(COALESCE(candle_mode,''))='DAILY'")
             .setParameter("d", eff).getResultList();
         if (rows.isEmpty()) return Map.of("score", 50, "label", "Neutral", "color", "yellow");
         long pos = rows.stream().filter(r -> {
@@ -134,7 +134,8 @@ public class DashboardController {
 
     private String lastMarketDate() {
         Object r = em.createNativeQuery(
-            "SELECT MAX(trade_date) FROM market_data WHERE trade_date <= :d")
+            "SELECT MAX(trade_date) FROM broker_market_candles " +
+            "WHERE trade_date <= :d AND UPPER(COALESCE(candle_mode,''))='DAILY'")
             .setParameter("d", DateUtil.today()).getSingleResult();
         return r != null ? r.toString() : DateUtil.today();
     }

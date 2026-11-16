@@ -8,6 +8,25 @@ import { HttpClient } from '@angular/common/http';
 import { environment } from '../../../environments/environment';
 import { Subscription, timeout } from 'rxjs';
 
+/**
+ * Uploaded Stock Details, cached outside the component.
+ *
+ * <p>Angular destroys a routed component when you navigate away, so anything held on the instance
+ * is gone the moment the tracker is left. Kept at module scope the rows survive a trip to Broker
+ * and back, and the section repaints from them instead of re-fetching every page again.
+ */
+const UPLOADED_PAGE_CACHE: Record<string, { stocks: any[], total: number, time: number }> = {};
+
+/**
+ * Width of a stored intraday candle, and the time the session's first bar starts.
+ * Mirrors livecandle.interval.minutes and SESSION_OPEN in LiveCandleAggregator; stored bars run
+ * 09:15, 10:15 ... 15:15. Any buy/sell time offered here must be one of those starts, because the
+ * server seeks forward to the first candle at or after the time it is given.
+ */
+const CANDLE_INTERVAL_MINUTES = 60;
+const SESSION_OPEN_MINUTES = 9 * 60 + 15;
+const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
+
 @Component({
   selector: 'app-stock-tracker',
   standalone: true,
@@ -82,6 +101,23 @@ import { Subscription, timeout } from 'rxjs';
     .stat-sub { font-size:9.5px; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     @media (max-width:1400px) { .summary-strip { grid-template-columns:repeat(4,minmax(0,1fr)); } }
     @media (max-width:820px)  { .summary-strip { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    /* Trend panel controls: label above field, fields aligned across the row. auto-fit means
+       they reflow onto a second line as whole pairs rather than splitting a label from its input. */
+    .trend-controls { display:grid; gap:8px 12px; align-items:end; width:100%; margin:4px 0 8px;
+      grid-template-columns:repeat(auto-fit,minmax(104px,max-content)); }
+    .tc-field { display:flex; flex-direction:column; gap:3px; min-width:0; }
+    .tc-label { font-size:9px; color:#64748b; text-transform:uppercase; letter-spacing:.04em;
+      white-space:nowrap; }
+    .tc-field .select-sm, .tc-field input { width:100%; font-size:10px; box-sizing:border-box; }
+    .tc-divider { border-left:1px solid #2d3f55; padding-left:12px; }
+    .tc-action { justify-content:flex-end; }
+    .tc-btn { width:100%; font-size:9px; padding:4px 10px; white-space:nowrap; }
+    .trend-caption { font-size:9px; color:#60a5fa; width:100%; margin:-2px 0 6px; }
+    @media (max-width:720px) {
+      .trend-controls { grid-template-columns:repeat(2,minmax(0,1fr)); }
+      .tc-divider { border-left:0; padding-left:0; }
+    }
+
     .uploaded-details-card { width:100%; box-sizing:border-box; margin:0 0 14px 0; }
     .uploaded-toolbar { background:#1e2a3b; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; border-bottom:1px solid #2d3f55; box-sizing:border-box; }
     .uploaded-toolbar-left, .uploaded-toolbar-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; min-width:0; }
@@ -101,9 +137,9 @@ import { Subscription, timeout } from 'rxjs';
         Upload Stock
       </button>
       <button class="btn-green" (click)="refreshPrices()" [disabled]="refreshing() || refreshState==='updating'"
-        title="Refresh · Fetch Latest Live Price">
+        title="Fetches fresh prices from the broker and refills any missing base prices. The Refresh button inside Uploaded Stock Details only re-reads the table from the database - it fetches nothing.">
         @if (refreshState==='updating') { <span class="spin"></span> Updating... }
-        @else { Refresh · Fetch Latest Live Price }
+        @else { Refresh - Live Price }
       </button>
       @if (refreshState==='completed') {
         <span style="font-size:11px; color:#4ade80; display:inline-flex; align-items:center; gap:6px;">
@@ -120,7 +156,11 @@ import { Subscription, timeout } from 'rxjs';
         </span>
       }
       <button class="btn-blue" (click)="downloadEligible()">
-        Download Eligible Stocks (0% to 5%)
+        Eligible Stocks 0 to 5%
+      </button>
+      <button class="btn-blue" (click)="downloadAtrBaseCrossover()"
+        title="First crossover up through the base price since it was set, with ATR14(D-1)/Close(D-1) at or above 3%. The export carries the entry, stop (-7%), target (+15%) and 15-session time exit.">
+        ATR_Base_Price_Crossover
       </button>
       <button class="btn-outline" (click)="showProgressDashboard.set(true); loadJobHistory()" style="font-size:11px;">
         Processing Jobs
@@ -286,7 +326,7 @@ import { Subscription, timeout } from 'rxjs';
   @if (showUploadModal()) {
     <div style="position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:100; display:flex; align-items:center; justify-content:center;"
       (click)="showUploadModal.set(false)">
-      <div class="card" style="width:520px; padding:24px; position:relative;" (click)="$event.stopPropagation()">
+      <div class="card" style="width:min(520px,100%); padding:24px; position:relative;" (click)="$event.stopPropagation()">
         <button (click)="showUploadModal.set(false)"
           style="position:absolute; top:12px; right:12px; background:none; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">x</button>
         <div class="section-title" style="margin-bottom:4px;">Upload Stocks</div>
@@ -350,7 +390,7 @@ import { Subscription, timeout } from 'rxjs';
   @if (showProgressDashboard()) {
     <div style="position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:105; display:flex; align-items:center; justify-content:center; padding:16px;"
       (click)="showProgressDashboard.set(false); stopJobPolling()">
-      <div class="card" style="width:720px; max-height:90vh; overflow-y:auto; padding:20px; position:relative;" (click)="$event.stopPropagation()">
+      <div class="card" style="width:min(720px,100%); max-height:90vh; overflow-y:auto; padding:20px; position:relative;" (click)="$event.stopPropagation()">
         <button (click)="showProgressDashboard.set(false); stopJobPolling()"
           style="position:absolute; top:10px; right:10px; background:none; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">x</button>
         <div class="section-title" style="font-size:15px; margin-bottom:12px;">Processing Progress Dashboard</div>
@@ -505,7 +545,7 @@ import { Subscription, timeout } from 'rxjs';
   @if (showTradeModal()) {
     <div style="position:fixed; inset:0; background:rgba(0,0,0,.7); z-index:110; display:flex; align-items:center; justify-content:center; padding:16px;"
       (click)="closeTradeModal()">
-      <div class="card" style="width:440px; padding:20px; position:relative;" (click)="$event.stopPropagation()">
+      <div class="card" style="width:min(440px,100%); padding:20px; position:relative;" (click)="$event.stopPropagation()">
         <button (click)="closeTradeModal()"
           style="position:absolute; top:10px; right:10px; background:none; border:none; color:#94a3b8; font-size:18px; cursor:pointer;">x</button>
         <div class="section-title" style="font-size:15px; margin-bottom:4px;">
@@ -677,7 +717,7 @@ import { Subscription, timeout } from 'rxjs';
           <span style="color:#fbbf24; font-size:11px;">Updating...</span>
         }
         <span style="font-size:10px; color:#64748b;">Click column headers to sort</span>
-        <button class="btn-outline" (click)="loadUploadedStocks(true, true)" [disabled]="uploadedLoading" style="font-size:10px;" title="Refreshes prices and updates Signal (Buy/Sell) and Trend">Refresh</button>
+        <button class="btn-outline" (click)="loadUploadedStocks(true, true)" [disabled]="uploadedLoading" style="font-size:10px;" title="Re-reads this table from the database and recalculates Signal and Trend. Does not fetch new prices - use Refresh - Live Price at the top for that.">Reload Table</button>
         <button class="btn-outline" (click)="downloadUploadedStocks()" [disabled]="!uploadedStocks.length" style="font-size:10px;">Export</button>
         <button class="btn-outline" (click)="loadStaleDiagnostic()" [disabled]="staleLoading" style="font-size:10px;" title="Find stocks whose Previous Close cannot update (stale/missing daily history)">
           @if (staleLoading) { Checking... } @else { Check Stale Prices }
@@ -727,7 +767,16 @@ import { Subscription, timeout } from 'rxjs';
                     <td class="tbl-cell-num" style="color:#fbbf24;">{{ s.days_stale != null ? s.days_stale : '-' }}</td>
                     <td class="tbl-cell-num">{{ s.base_price != null ? (s.base_price | number:'1.2-2') : '-' }}</td>
                     <td class="tbl-cell-num">{{ s.current_price != null ? (s.current_price | number:'1.2-2') : '-' }}</td>
-                    <td class="tbl-cell" style="font-size:10px;">{{ formatFetchDateTime(s.last_refreshed) }}</td>
+                    <!-- The session the price belongs to, not the moment it was fetched.
+                         last_refreshed moves on every background refresh even when nothing
+                         traded, so the column ticked forward against prices that had not
+                         changed - and after the close it moves while the market is shut.
+                         current_price_date is the price's own session; the fetch time stays
+                         available on hover for anyone chasing a sync problem. -->
+                    <td class="tbl-cell" style="font-size:10px;"
+                        [title]="'Price is from the ' + (s.current_price_date || s.close_date || 'last stored') + ' session. Last fetched ' + (s.last_refreshed || '-') + '.'">
+                      {{ s.current_price_date || s.close_date ? (s.current_price_date || s.close_date) : formatFetchDateTime(s.last_refreshed) }}
+                    </td>
                   </tr>
                 }
               </tbody>
@@ -955,10 +1004,17 @@ import { Subscription, timeout } from 'rxjs';
               <span style="color:#cbd5e1; font-weight:600;">{{ rd.run_date }}</span>
             </span>
           }
+          <!-- The time the price TRADED, not the time the page fetched it. This showed
+               dash.last_refreshed - the server's last sync - or, failing that, the moment the
+               browser received the response. Both move when nothing has traded, so after the
+               close the header ticked forward against prices that had stopped changing. The
+               server already returns the traded time; the screen simply was not reading it. -->
           <span style="display:inline-flex; align-items:baseline; gap:5px;"
-                [title]="'Last successful market data synchronisation' + (rd?.market_open === false ? ' - market is closed, so these prices are from the last session.' : '')">
-            <span style="color:#7d92ab; min-width:74px;">Last updated</span>
-            <span style="color:#cbd5e1; font-weight:600;">{{ formatTimestamp(dash.last_refreshed || currentTop10LastUpdated) }}</span>
+                [title]="rd?.market_open
+                  ? 'Live price, updating while the market is open.'
+                  : 'The market is closed. This is when the last price actually traded, taken from the newest stored candle - not when the page was refreshed.'">
+            <span style="color:#7d92ab; min-width:74px;">{{ rd?.market_open ? 'Last traded' : 'Last traded' }}</span>
+            <span style="color:#cbd5e1; font-weight:600;">{{ formatTimestamp(rd?.last_updated || rd?.last_traded_at || dash.last_refreshed || currentTop10LastUpdated) }}</span>
           </span>
           @if (rd && rd.market_open === false) {
             <span style="color:#f59e0b; font-weight:600;">Market closed</span>
@@ -1024,14 +1080,14 @@ import { Subscription, timeout } from 'rxjs';
                 Auto Buy
               </label>
               <span style="font-size:11px; color:#94a3b8;">at
-                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_buy_time" placeholder="15:20" style="width:66px;">
+                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_buy_time" placeholder="15:15" style="width:66px;">
               </span>
               <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
                 <input type="checkbox" [(ngModel)]="automation.prevtop10_auto_sell_enabled" [disabled]="!automation.prevtop10_auto_cycle_enabled">
                 Auto Sell
               </label>
               <span style="font-size:11px; color:#94a3b8;">at
-                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_sell_time" placeholder="09:30" style="width:66px;">
+                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_sell_time" placeholder="10:15" style="width:66px;">
               </span>
             </div>
             <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
@@ -1297,54 +1353,39 @@ import { Subscription, timeout } from 'rxjs';
             <span style="color:#64748b; font-size:10px;">Trade Batches</span>
           </div>
           <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <!-- Day + time-of-day selection (spec §2) — DB-only historical buy pricing -->
-            <span style="font-size:10px; color:#64748b;">Day</span>
-            <select class="select-sm" [(ngModel)]="prevPeriod" (ngModelChange)="onPeriodChange()" style="min-width:96px; font-size:10px;" title="How far back to look. The Top 10 shown is the ranking that was current at the selected day and time.">
-              @for (opt of prevPeriodOptions; track opt.value) {
-                <option [value]="opt.value">{{ opt.label }}</option>
-              }
-            </select>
-            @if (prevPeriod === 'CUSTOM') {
-              <input type="date" class="select-sm" [(ngModel)]="prevCustomDate" (ngModelChange)="onPeriodChange()" [max]="todayIso" style="font-size:10px;" title="Custom buy date (uses stored data only)">
-            }
-            <span style="font-size:10px; color:#64748b;">Time</span>
-            <select class="select-sm" [(ngModel)]="prevBuyTime" (ngModelChange)="onPeriodChange()" style="min-width:78px; font-size:10px;" title="Buy price is taken at this time on the selected day (5-minute steps)">
-              @for (t of buyTimeOptions; track t) {
-                <option [value]="t">{{ t }}</option>
-              }
-            </select>
-            <!-- Sell leg. Leaving this on Now keeps the live price, which is why Buy and
-                 Current read the same on a Now preview. Pick a sell day to back-test a
-                 completed round trip instead. -->
-            <span style="font-size:10px; color:#64748b; border-left:1px solid #2d3f55; padding-left:8px;">Sell Day</span>
-            <select class="select-sm" [(ngModel)]="prevSellPeriod" (ngModelChange)="onPeriodChange()" style="min-width:96px; font-size:10px;" title="Day the position is sold. Now = mark to market at the live price.">
-              @for (opt of prevSellPeriodOptions; track opt.value) {
-                <option [value]="opt.value">{{ opt.label }}</option>
-              }
-            </select>
-            @if (prevSellPeriod === 'CUSTOM') {
-              <input type="date" class="select-sm" [(ngModel)]="prevSellCustomDate" (ngModelChange)="onPeriodChange()" [max]="todayIso" style="font-size:10px;" title="Custom sell date (uses stored data only)">
-            }
-            @if (prevSellPeriod !== 'NOW') {
-              <span style="font-size:10px; color:#64748b;">Sell Time</span>
-              <select class="select-sm" [(ngModel)]="prevSellTime" (ngModelChange)="onPeriodChange()" style="min-width:78px; font-size:10px;" title="Sell price is taken at this time on the selected sell day (5-minute steps)">
-                @for (t of buyTimeOptions; track t) {
-                  <option [value]="t">{{ t }}</option>
-                }
-              </select>
-            }
+            <!-- Day, Time and Sell Day removed. This section has one rule, not a set of
+                 choices: bought at 15:20 on the previous trading day, sold at 11:00 on the next
+                 one. Offering pickers implied the rule was negotiable and let the screen be put
+                 into states the automation would never produce. -->
+            <span style="font-size:10px; color:#64748b;"
+                  title="Fixed for this section: bought at 15:20 on the previous trading day, sold at 11:00 on the next trading day. Weekends and market holidays are skipped - a Friday buy sells on Monday.">
+              Buy {{ PREV_BUY_TIME }} previous session &middot; Sell {{ PREV_SELL_TIME }} next session
+            </span>
             <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="loadPeriodPreview(); loadTradeBatches()" [disabled]="tradeBatchLoading || previewLoading">
               @if (tradeBatchLoading || previewLoading) { <span class="spin"></span> } @else { Refresh }
+            </button>
+            <!-- Back-dated download. Empty replays the section's current view; a date replays
+                 that session instead, rebuilt from stored candles at this section's own times. -->
+            <input type="date" class="select-sm" [(ngModel)]="prevExportDate" [max]="todayIso"
+                   style="font-size:10px;" title="Optional: download a past session instead of the current view">
+            <button class="btn-outline" style="font-size:10px; padding:4px 10px;"
+                    (click)="downloadPrevTop10()"
+                    title="Excel/CSV of exactly these rows - the same columns, buy and sell dates, times, prices and returns">
+              Download stocks
             </button>
             <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="togglePrevAutomationPanel()"
               [style.borderColor]="automation.prevtop10_auto_refresh_enabled ? '#22c55e' : '#334155'"
               title="Auto-refresh settings for Previous Top 10 and its average-return bars">
               Automation {{ automation.prevtop10_auto_refresh_enabled ? 'ON' : 'OFF' }}
             </button>
-            <button class="btn-green" style="padding:6px 12px; font-size:11px;" (click)="createTradeBatch()" [disabled]="tradeBatchCreating || !(rd?.current_top10?.length)">
+            <!-- Disabled only while its own request is in flight. It used to grey out whenever
+                 the Top 10 was empty, which through a whole stretch of this month was every
+                 evening - a permanently dead button with nothing on screen explaining why. It
+                 now stays live and says what is missing when pressed. -->
+            <button class="btn-green" style="padding:6px 12px; font-size:11px;" (click)="createTradeBatch()" [disabled]="tradeBatchCreating">
               @if (tradeBatchCreating) { <span class="spin"></span> Creating... } @else { Buy All 10 }
             </button>
-            <button class="trade-mini sell" style="padding:6px 12px; font-size:11px;" (click)="sellAllOpenBatch()" [disabled]="!!tradeBatchSelling || !hasOpenBatch()"
+            <button class="trade-mini sell" style="padding:6px 12px; font-size:11px;" (click)="sellAllOpenBatch()" [disabled]="!!tradeBatchSelling"
               title="Close the active Previous Top 10 batch — records sell price, P/L, and updates history">
               @if (tradeBatchSelling) { <span class="spin"></span> Selling... } @else { Sell All 10 }
             </button>
@@ -1537,6 +1578,12 @@ import { Subscription, timeout } from 'rxjs';
               {{ rankingTrendRule }}
               @if (rankingTrendEndDate) {
                 <span style="margin-left:6px;">Last bar ({{ formatChartDate(rankingTrendEndDate) }}) is the table above, averaged.</span>
+                @if (rankingTrendStale) {
+                  <span style="margin-left:6px; color:#f59e0b;"
+                        title="The chart ends on the newest session that has stored data. Later sessions will appear once market data for them is fetched.">
+                    No market data after {{ formatChartDate(rankingTrendEndDate) }}.
+                  </span>
+                }
               }
             </div>
           </div>
@@ -1712,53 +1759,97 @@ import { Subscription, timeout } from 'rxjs';
                 </div>
               </div>
             }
-            @if (trendMode === 'closed') {
-              <button class="btn-outline" style="font-size:9px; padding:3px 8px;" (click)="loadTradeBatchTrend()" [disabled]="trendRefreshing">
-                @if (trendRefreshing) { <span class="spin"></span> } @else { Refresh }
-              </button>
-            }
-            <!-- Time selection — same options/logic as the Previous Top 10 panel above -->
-            <span style="font-size:10px; color:#64748b;">Time</span>
-            <select class="select-sm" [(ngModel)]="trendPeriod" (ngModelChange)="onTrendPeriodChange()" style="min-width:96px; font-size:10px;" title="Trend window — matches the Previous Top 10 time selection">
-              @for (opt of prevPeriodOptions; track opt.value) {
-                <option [value]="opt.value">{{ opt.label }}</option>
-              }
-            </select>
-            @if (trendPeriod === 'CUSTOM') {
-              <input type="date" class="select-sm" [(ngModel)]="trendCustomDate" (ngModelChange)="onTrendPeriodChange()" [max]="todayIso" style="font-size:10px;" title="Trend from this date to today">
-            }
-            <!-- Configurable backtest controls (spec §7) — actual stored intraday prices -->
-            <span style="font-size:10px; color:#64748b;">Buy</span>
-            <input type="text" class="select-sm" [(ngModel)]="trendBuyTime" placeholder="15:00" style="width:58px;" title="Buy time (HH:mm)">
-            <span style="font-size:10px; color:#64748b;">Sell</span>
-            <input type="text" class="select-sm" [(ngModel)]="trendSellTime" placeholder="10:00" style="width:58px;" title="Sell time next trading day (HH:mm)">
-            <span style="font-size:10px; color:#64748b;">Days</span>
-            <input type="number" class="select-sm" [(ngModel)]="trendDays" min="1" max="90" style="width:54px;" title="Number of days to back-test">
-            <span style="font-size:10px; color:#64748b; border-left:1px solid #2d3f55; padding-left:8px;">From</span>
-            <input type="date" class="select-sm" [(ngModel)]="rangeFrom" [max]="todayIso" style="font-size:10px;"
-                   title="Replay the Current Top 10 from this date. Uses stored data, so it works outside market hours.">
-            <span style="font-size:10px; color:#64748b;">To</span>
-            <input type="date" class="select-sm" [(ngModel)]="rangeTo" [max]="todayIso" style="font-size:10px;"
-                   title="...through to this date. Each trading day in between becomes one bar.">
-            <button class="btn-outline" style="font-size:9px; padding:3px 10px;"
-                    (click)="downloadChartTrades(null)"
-                    title="Excel/CSV of every stock behind these bars - buy and sell date, time, price and return">
-              Download stocks
-            </button>
-            <button class="btn-outline" style="font-size:9px; padding:3px 10px;" (click)="runRangeBacktest()"
-                    [disabled]="trendRefreshing || !rangeFrom || !rangeTo"
-                    title="Replay every trading day in the range: that day's Top 10, bought and sold at the times above.">
-              @if (trendRefreshing && trendMode === 'range') { <span class="spin"></span> Running... } @else { Run Range }
-            </button>
-            <button class="btn-green" style="font-size:9px; padding:3px 10px;" (click)="runBacktestTrend()" [disabled]="trendRefreshing">
-              @if (trendRefreshing && trendMode === 'backtest') { <span class="spin"></span> Backtesting... } @else { Backtest }
-            </button>
-            @if (trendMode === 'backtest') {
-              <span style="font-size:9px; color:#60a5fa;">
-                Buy the Top 10 at {{ hhmmLabel(trendBuyTime) }}, sell the next trading day at {{ hhmmLabel(trendSellTime) }} · real stored prices
-              </span>
-            }
           </div>
+
+          <!-- Controls on their own full-width row.
+               They used to sit in the header flex beside the title and the two stat tiles, so a
+               dozen inputs and their loose text labels wrapped wherever they happened to land -
+               "Time 1 Month Buy 15:15 Sell 10:00 Days 30 From ... To ..." running together with
+               nothing lining up. Each control is now a label-over-field pair on a grid, so the
+               labels sit above their own inputs and the fields align down the row. -->
+          <div class="trend-controls">
+            @if (trendMode === 'closed') {
+              <label class="tc-field tc-action">
+                <span class="tc-label">&nbsp;</span>
+                <button class="btn-outline tc-btn" (click)="loadTradeBatchTrend()" [disabled]="trendRefreshing">
+                  @if (trendRefreshing) { <span class="spin"></span> } @else { Refresh }
+                </button>
+              </label>
+            }
+
+            <!-- Window for this panel only: the Previous Top 10 selection above does not change it. -->
+            <label class="tc-field">
+              <span class="tc-label">Time</span>
+              <select class="select-sm" [(ngModel)]="trendPeriod" (ngModelChange)="onTrendPeriodChange()"
+                      title="Trend window for this panel only - the Previous Top 10 selection above does not change it">
+                @for (opt of prevPeriodOptions; track opt.value) {
+                  <option [value]="opt.value">{{ opt.label }}</option>
+                }
+              </select>
+            </label>
+            @if (trendPeriod === 'CUSTOM') {
+              <label class="tc-field">
+                <span class="tc-label">Custom date</span>
+                <input type="date" class="select-sm" [(ngModel)]="trendCustomDate"
+                       (ngModelChange)="onTrendPeriodChange()" [max]="todayIso"
+                       title="Trend from this date to today">
+              </label>
+            }
+
+            <label class="tc-field">
+              <span class="tc-label">Buy</span>
+              <input type="text" class="select-sm" [(ngModel)]="trendBuyTime" placeholder="15:15"
+                     title="Buy time (HH:mm) - the day's final ranking run">
+            </label>
+            <label class="tc-field">
+              <span class="tc-label">Sell</span>
+              <input type="text" class="select-sm" [(ngModel)]="trendSellTime" placeholder="10:00"
+                     title="Sell time on the next trading day (HH:mm)">
+            </label>
+            <label class="tc-field">
+              <span class="tc-label">Days</span>
+              <input type="number" class="select-sm" [(ngModel)]="trendDays" min="1" max="90"
+                     title="Number of days to back-test">
+            </label>
+
+            <label class="tc-field tc-divider">
+              <span class="tc-label">From</span>
+              <input type="date" class="select-sm" [(ngModel)]="rangeFrom" [max]="todayIso"
+                     title="Replay the Current Top 10 from this date. Uses stored data, so it works outside market hours.">
+            </label>
+            <label class="tc-field">
+              <span class="tc-label">To</span>
+              <input type="date" class="select-sm" [(ngModel)]="rangeTo" [max]="todayIso"
+                     title="...through to this date. Each trading day in between becomes one bar.">
+            </label>
+
+            <label class="tc-field tc-action">
+              <span class="tc-label">&nbsp;</span>
+              <button class="btn-outline tc-btn" (click)="downloadChartTrades(null)"
+                      title="Excel/CSV of every stock behind these bars - buy and sell date, time, price and return">
+                Download stocks
+              </button>
+            </label>
+            <!-- One button instead of Run Range and Backtest. Both rebuilt each day's Top 10 and
+                 measured it, differing only in where the window came from - which the controls
+                 beside them already say. It reads From/To when filled, the Time selection when not. -->
+            <label class="tc-field tc-action">
+              <span class="tc-label">&nbsp;</span>
+              <button class="btn-green tc-btn" (click)="runAndRefreshTop10()" [disabled]="trendRefreshing"
+                      [title]="rangeFrom && rangeTo
+                        ? ('Rebuild the Top 10 for every trading day from ' + rangeFrom + ' to ' + rangeTo + ', bought and sold at the times above.')
+                        : 'Rebuild the Top 10 for each of the last ' + trendDays + ' days, bought and sold at the times above.'">
+                @if (trendRefreshing) { <span class="spin"></span> Running... } @else { Run &amp; Refresh top 10 }
+              </button>
+            </label>
+          </div>
+
+          @if (trendMode === 'backtest') {
+            <div class="trend-caption">
+              Buy the Top 10 at {{ hhmmLabel(trendBuyTime) }}, sell the next trading day at
+              {{ hhmmLabel(trendSellTime) }} &middot; real stored prices
+            </div>
+          }
           <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
             <div style="background:#0f172a; border-radius:6px; padding:6px 10px; display:flex; align-items:center; gap:6px;"
                  title="Average of the daily average returns across the window.">
@@ -1827,7 +1918,9 @@ import { Subscription, timeout } from 'rxjs';
                   <th class="sb-hdr">Sector</th>
                   <th class="sb-hdr" style="text-align:right;">Prev Close</th>
                   <th class="sb-hdr" style="text-align:right;">Base Price</th>
-                  <th class="sb-hdr" style="text-align:right;" title="Traded price at the cut-off on the day this list was frozen - the price the position was opened at">Entry &#64; 15:20</th>
+                  <!-- Bound, not hardcoded: this read 15:20 while the section's cut-off had
+                       moved, so the header contradicted the price beneath it. -->
+                  <th class="sb-hdr" style="text-align:right;" title="Traded price at the cut-off on the day this list was frozen - the price the position was opened at">Entry &#64; {{ mainTop?.top10?.[0]?.entry_time || '15:15' }}</th>
                   <th class="sb-hdr" style="text-align:right;" title="Must be at or above the base price">Current</th>
                   <th class="sb-hdr" style="text-align:right;" title="Move since the entry price above, not since the base price">Return %</th>
                   <th class="sb-hdr" style="text-align:right;" title="Had to beat the 20-day average to qualify">Volume</th>
@@ -1997,12 +2090,12 @@ import { Subscription, timeout } from 'rxjs';
         <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:8px;">
           <div style="flex:1 1 420px;">
             <span style="font-size:13px; font-weight:800; color:#60a5fa;">
-              Previous Top 10 with Avg Return Trend (%)
+              RSI 45 Previous Close Less the Base Price
             </span>
             <div style="font-size:10px; color:#94a3b8; margin-top:3px;">
               Entry test: Previous Close &lt; Base Price <strong>and</strong> Current Price &ge; Base Price
-              (the crossing) <strong>and</strong> Current Volume &gt; 20-Day Average Volume.
-              Then Rank, then Buy/Sell &mdash; in that order.
+              (the crossing). <strong>No ranking</strong> &mdash; every stock that qualifies is listed,
+              strongest move first. Volume and ATR are shown on each row; neither excludes a stock.
             </div>
           </div>
 
@@ -2027,6 +2120,24 @@ import { Subscription, timeout } from 'rxjs';
                     <span style="color:#22c55e; font-weight:700;">&middot; LIVE</span>
                   }
                 </div>
+              </div>
+
+              <div style="background:#0f172a; border-radius:6px; padding:6px 14px; min-width:180px;
+                          display:flex; flex-direction:column; justify-content:space-between;">
+                <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px;"
+                     title="Average move of these stocks from the first run of the day to now. Outside market hours 'now' is the last completed close, so the figure settles rather than drifting.">Today Avg Return</div>
+                @if (lowTop.avg_return_from_first_run == null) {
+                  <div style="font-size:17px; font-weight:800; color:#94a3b8; line-height:1.2;">&mdash;</div>
+                  <div style="font-size:9px; color:#64748b;">No first-run price stored for today yet</div>
+                } @else {
+                  <div style="font-size:17px; font-weight:800; line-height:1.2;"
+                       [class]="lowTop.avg_return_from_first_run >= 0 ? 'pos' : 'neg'">
+                    {{ lowTop.avg_return_from_first_run > 0 ? '+' : '' }}{{ lowTop.avg_return_from_first_run | number:'1.2-2' }}%
+                  </div>
+                  <div style="font-size:9px; color:#64748b;">
+                    first run &rarr; now &middot; {{ lowTop.first_run_priced }} of {{ lowTop.count }} priced
+                  </div>
+                }
               </div>
 
               <div style="background:#0f172a; border-radius:6px; padding:6px 14px; min-width:200px;
@@ -2066,8 +2177,8 @@ import { Subscription, timeout } from 'rxjs';
               @if (lowTopLoading) { <span class="spin"></span> } @else { Refresh Top 10 }
             </button>
             <button class="btn-outline" style="font-size:9px; padding:3px 10px;"
-                    (click)="downloadChartTrades(null)"
-                    title="Excel/CSV of the stocks behind these bars, day by day - base price below the value set here">
+                    (click)="downloadRsi45Section()"
+                    title="Excel/CSV of exactly the stocks listed below, laid out like the ATR Base Price Crossover file">
               Download stocks
             </button>
           </div>
@@ -2085,13 +2196,13 @@ import { Subscription, timeout } from 'rxjs';
                   <th class="sb-hdr">Sector</th>
                   <th class="sb-hdr" style="text-align:right;" title="Price on the day before - must be below the base price">Prev Close</th>
                   <th class="sb-hdr" style="text-align:right;">Base Price</th>
-                  <th class="sb-hdr" style="text-align:right;" title="Traded price at the cut-off on the day this list was frozen - the price the position was opened at">Entry &#64; 15:20</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Traded price at the cut-off on the day this list was frozen - the price the position was opened at">Entry &#64; {{ lowTop?.top10?.[0]?.entry_time || '15:15' }}</th>
                   <th class="sb-hdr" style="text-align:right;" title="Must be at or above the base price - together with the previous close below it, that is the crossing">Current</th>
                   <th class="sb-hdr" style="text-align:right;" title="Move since the entry price, not since the base price">Return %</th>
                   <th class="sb-hdr" style="text-align:right;" title="Traded volume, which had to beat the 20-day average to qualify">Volume</th>
                   <th class="sb-hdr" style="text-align:right;">20D Avg Vol</th>
-                  <th class="sb-hdr" style="text-align:right;" title="From the same ranking engine and weights as the main Top 10">Score</th>
-                  <th class="sb-hdr" style="text-align:right;" title="Weight of the components that had data">Weight Used</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Average True Range over the 14 sessions ending at the previous close">ATR14</th>
+                  <th class="sb-hdr" style="text-align:right;" title="ATR14 as a percentage of the previous close - the same measure the ATR Base Price Crossover screen filters on">ATR %</th>
                   <th class="sb-hdr" style="text-align:center;" title="From the existing Buy/Sell logic, applied after ranking">Signal</th>
                   <th class="sb-hdr">Trend</th>
                 </tr>
@@ -2114,8 +2225,10 @@ import { Subscription, timeout } from 'rxjs';
                     <td class="sb-cell" style="text-align:right;" [class]="(r.return_pct || 0) >= 0 ? 'pos' : 'neg'">{{ r.return_pct | number:'1.2-2' }}%</td>
                     <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ r.volume | number:'1.0-0' }}</td>
                     <td class="sb-cell" style="text-align:right; color:#64748b;">{{ r.avg_20d_volume | number:'1.0-0' }}</td>
-                    <td class="sb-cell" style="text-align:right; color:#60a5fa; font-weight:800;">{{ r.score | number:'1.2-2' }}</td>
-                    <td class="sb-cell" style="text-align:right; color:#e2e8f0;">{{ r.weight_used | number:'1.0-0' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#cbd5e1;">{{ r.atr14 ? (r.atr14 | number:'1.2-2') : '-' }}</td>
+                    <td class="sb-cell" style="text-align:right; font-weight:600;"
+                        [style.color]="(r.atr_pct || 0) >= atrHighlightPct ? '#22c55e' : '#94a3b8'"
+                        [title]="(r.atr_pct || 0) >= atrHighlightPct ? 'At or above the ' + atrHighlightPct + '% mark' : 'Below the ' + atrHighlightPct + '% mark'">{{ r.atr_pct ? (r.atr_pct | number:'1.2-2') + '%' : '-' }}</td>
                     <td class="sb-cell" style="text-align:center;">
                       <span style="font-weight:800; padding:2px 8px; border-radius:4px;"
                             [style.color]="r.signal === 'BUY' ? '#22c55e' : r.signal === 'SELL' ? '#ef4444' : '#94a3b8'"
@@ -2211,9 +2324,45 @@ import { Subscription, timeout } from 'rxjs';
           </div>
         }
 
+        @if (lowTrend.length) {
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Holding period</span>
+            @for (dnum of holdingDayChoices; track dnum) {
+              <button class="btn-outline" style="font-size:10px; padding:4px 11px;"
+                      [style.background]="lowHoldingDay === dnum ? '#1d6adb' : 'transparent'"
+                      [style.color]="lowHoldingDay === dnum ? '#fff' : '#cbd5e1'"
+                      [style.borderColor]="lowHoldingDay === dnum ? '#1d6adb' : '#334155'"
+                      (click)="setHoldingDay(dnum)"
+                      [title]="'Return ' + dnum + ' trading day(s) after entry, measured from the entry price'">
+                Day {{ dnum }}
+              </button>
+            }
+          </div>
+
+          <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; padding:6px 10px;
+                      margin-bottom:8px; background:#0f172a; border-radius:6px; font-size:11px;">
+            <span style="color:#94a3b8;">Holding <strong style="color:#e2e8f0;">Day {{ lowHoldingDay }}</strong></span>
+            <span style="color:#94a3b8;">Trades <strong style="color:#e2e8f0;">{{ lowHoldingStats.trades }}</strong></span>
+            <span style="color:#22c55e;">Win {{ lowHoldingStats.wins }}</span>
+            <span style="color:#ef4444;">Loss {{ lowHoldingStats.losses }}</span>
+            <span style="color:#94a3b8;">Win Rate
+              <strong [style.color]="lowHoldingStats.winRate >= 60 ? '#22c55e' : '#e2e8f0'">{{ lowHoldingStats.winRate | number:'1.1-1' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;">Avg
+              <strong [style.color]="lowHoldingStats.avg >= 0 ? '#22c55e' : '#ef4444'">{{ lowHoldingStats.avg | number:'1.2-2' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;">Median
+              <strong [style.color]="lowHoldingStats.median >= 0 ? '#22c55e' : '#ef4444'">{{ lowHoldingStats.median | number:'1.2-2' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;" title="Gross profit divided by gross loss across every trade at this holding day">Profit Factor
+              <strong style="color:#e2e8f0;">{{ lowHoldingStats.profitFactor == null ? 'no losses' : (lowHoldingStats.profitFactor | number:'1.2-2') }}</strong>
+            </span>
+          </div>
+        }
+
         <div style="display:flex; align-items:flex-end; gap:4px; height:200px; overflow-x:auto; padding-bottom:26px; position:relative;">
           <div style="position:absolute; bottom:24px; left:0; right:0; height:1px; background:#1e2a3b;"></div>
-          @for (d of lowTrend; track d.batch_id) {
+          @for (d of lowHoldingBars; track d.batch_id) {
             <div style="display:flex; flex-direction:column; align-items:center; gap:2px; min-width:38px;"
                  [title]="d.no_stock ? (d.trade_date + ' - no stock met the entry rules' + (d.note ? ': ' + d.note : ''))
                           : d.is_open ? (d.trade_date + ' - OPEN position, ' + d.open_priced + ' stock(s) valued live. ' + (d.note || ''))
@@ -2234,14 +2383,22 @@ import { Subscription, timeout } from 'rxjs';
                      [style.border]="'1.5px dashed ' + ((d.open_return || 0) >= 0 ? '#22c55e' : '#ef4444')"
                      style="width:22px; border-radius:2px; background:transparent;"></div>
                 <div style="font-size:6.5px; font-weight:700; color:#facc15; letter-spacing:.2px;">OPEN</div>
+              } @else if (d.day_return == null) {
+                <!-- The trades exist but this holding day has not traded yet. Shown as absent
+                     rather than as 0%, which would read as a flat day that never happened. -->
+                <div style="font-size:7px; font-weight:700; color:#64748b; writing-mode:vertical-rl;
+                            text-orientation:mixed; height:56px; display:flex; align-items:flex-end;
+                            justify-content:center;">Day {{ lowHoldingDay }} pending</div>
+                <div style="width:16px; height:2px; background:#3a4a5f; border-radius:1px;"></div>
               } @else {
                 <div style="font-size:8px; font-weight:700;"
-                     [style.color]="d.avg_return_pct >= 0 ? '#22c55e' : '#ef4444'">
-                  {{ d.avg_return_pct | number:'1.1-1' }}
+                     [style.color]="d.day_return >= 0 ? '#22c55e' : '#ef4444'">
+                  {{ d.day_return | number:'1.1-1' }}
                 </div>
                 <div class="bar-chart-bar"
-                     [style.height]="barH(d.avg_return_pct, lowTrendMax)+'px'"
-                     [style.background]="d.avg_return_pct >= 0 ? '#1d6adb' : '#dc2626'"></div>
+                     [style.height]="barH(d.day_return, lowHoldingMax)+'px'"
+                     [style.background]="d.day_return >= 0 ? '#1d6adb' : '#dc2626'"
+                     [title]="d.trade_date + ' - Day ' + lowHoldingDay + ': average of ' + d.day_trades + ' trade(s)'"></div>
               }
               <div style="font-size:8.5px; color:#94a3b8; white-space:nowrap; margin-top:7px; width:100%; text-align:center; letter-spacing:-.1px;">
                 {{ formatChartDate(d.trade_date) }}
@@ -2445,8 +2602,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     prevtop10_auto_cycle_enabled: false,
     prevtop10_auto_buy_enabled: false,
     prevtop10_auto_sell_enabled: false,
-    prevtop10_buy_time: '15:20',
-    prevtop10_sell_time: '09:30',
+    prevtop10_buy_time: '15:15',
+    prevtop10_sell_time: '10:15',
     prevtop10_execution_mode: 'PAPER',
     prevtop10_use_real_price_if_executed: true,
     market_holidays: ''
@@ -2495,8 +2652,11 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   perStockAllocation = 10000;
   filterBuyerSeller = false;
   excludedCount = 0;
-  trendBuyTime = '15:20';
-  trendSellTime = '10:00';
+  // 15:15, matching top10.lock.time - the day's final ranking run is what the panel buys at.
+  trendBuyTime = '15:15';
+  // 15:00 on the next trading day - fifteen minutes before the 15:15 that buys the next
+  // position, so a sell and a buy never land on the same minute.
+  trendSellTime = '15:00';
   trendHoldDays = 1;
   trendDays = 30;                        // number of days to back-test (spec §7)
   trendPeriod = '1M';                    // Time selection for the Avg Return Trend panel
@@ -2522,7 +2682,9 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   // Historical Trade Analysis (BUYER / SELLER)
   htaDirection: 'BUY' | 'SELL' = 'BUY';
   htaPrimaryDate = '';
-  htaPrimaryTime = '15:20';
+  // A bar start. Candles are hourly from the 09:15 open, so the last one is 15:15 - and the
+  // EXACT price rule matches inside a single minute, so an off-grid time resolves to nothing.
+  htaPrimaryTime = '15:15';
   htaSecondaryDate = '';
   htaSecondaryTime = '10:00';
   htaCapital = 100000;
@@ -2554,22 +2716,46 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   // that has not happened yet and every row showed "No price" - which reads as broken data rather
   // than as a time that has not arrived. 1D is the last completed cut-off: the same frozen list the
   // trend section below shows, so the two agree instead of contradicting each other.
+  /**
+   * This section's trading rule, fixed rather than chosen.
+   *
+   * <p>Buy at 15:20 on the previous trading day, sell at 11:00 on the next. Deliberately NOT
+   * the 15:15/15:00 the RSI 45 section uses - these are two different strategies that happen to
+   * share a screen, and tying them to one global setting made a change to either silently move
+   * the other.
+   */
+  readonly PREV_BUY_TIME  = '15:15';
+  readonly PREV_SELL_TIME = '10:15';
+
   prevPeriod = '1D';
   prevCustomDate = '';
-  prevBuyTime = '15:20';                 // time-of-day the Previous Top 10 is priced at
-  /** 09:00 → 15:30 in 5-minute steps, matching the intraday candles that are stored. */
+  prevBuyTime = '15:15';                 // fixed - see PREV_BUY_TIME
+  /**
+   * The times a stored candle actually starts at: 09:15 → 15:15, one per hour.
+   *
+   * This listed 09:00 → 15:30 in 5-minute steps, which was right while candles were 5 minutes
+   * wide. Candles are now hourly and anchored on the 09:15 open (livecandle.interval.minutes),
+   * so 66 of the 79 options it offered no longer correspond to any bar - and picking one did not
+   * fail visibly, it silently priced off the NEXT bar up to 59 minutes later. Offer only real
+   * bar starts. Keep in step with livecandle.interval.minutes if that is ever changed again.
+   */
+  readonly CANDLE_INTERVAL_MINUTES = CANDLE_INTERVAL_MINUTES;
   buyTimeOptions: string[] = (() => {
     const out: string[] = [];
-    for (let mins = 9 * 60; mins <= 15 * 60 + 30; mins += 5) {
+    // mins < close, not <= : a bar that would start exactly at the close is not a bar. The last
+    // one is 15:15, which is short (15 minutes) but real, and is the buy leg's time.
+    for (let mins = SESSION_OPEN_MINUTES; mins < SESSION_CLOSE_MINUTES; mins += CANDLE_INTERVAL_MINUTES) {
       out.push(`${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`);
     }
     return out;
   })();
   // Sell leg of the Previous Top 10 back-test. NOW keeps the original
   // mark-to-market behaviour; any other value prices the sell from history.
-  prevSellPeriod = 'NOW';
+  // The sell leg is the NEXT trading day, never "now" - a position bought yesterday at 15:20
+  // is closed at 11:00 today, and the server skips weekends and holidays when resolving it.
+  prevSellPeriod = '1D';
   prevSellCustomDate = '';
-  prevSellTime = '15:20';
+  prevSellTime = '10:15';                // fixed - see PREV_SELL_TIME
   previewLoading = false;
   periodPreview: any = null;
   todayIso = new Date().toISOString().slice(0, 10);
@@ -2655,6 +2841,13 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.loadAll();
     this.timer = setInterval(() => {
       this.loadDashboard();
+      // Uploaded Stock Details was missing from this cycle entirely - it was only ever loaded
+      // by loadAll() on init, so its Last Update column sat at the page-load time until the
+      // whole page was reloaded, however often prices actually moved behind it. forceReload
+      // skips the 2-minute page cache; silent keeps the pager usable while it refreshes.
+      // Keeps whatever view is on screen - passing false here would strip the signal
+      // columns out from under the reader every five minutes.
+      this.loadUploadedStocks(true, this.uploadedWithSignals, true);
       // Skip while the user's own refresh is running, so the two cannot interleave.
       if (!this.manualTop10Refresh) this.loadRanking();
       this.loadChartData();
@@ -2853,6 +3046,20 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.loadBelowPriceTop10();   // crossing panel table
     this.runLowPriceTrend();      // crossing panel bars
     this.loadMainTop10();         // main trend table + provisional
+  }
+
+  /** ATR % at or above this is highlighted - the same 3% the ATR crossover screen filters on. */
+  atrHighlightPct = 3.0;
+
+  /**
+   * The RSI 45 section's own export. It used to call downloadChartTrades, which fetches the
+   * bar-chart dataset over the OTHER section's date range - a different set of rows entirely,
+   * which is why the button appeared to do nothing useful. This asks the server for exactly the
+   * list on screen, with the same parameters the panel was loaded with.
+   */
+  downloadRsi45Section() {
+    this.downloadCsv('/tracker/export/rsi45-section?requireVolume=false&applyRanking=false',
+                     'TradeRakshak_RSI45_Previous_Close_Less_Base_Price.csv');
   }
 
   loadAll() { this.initBelowPricePanel(); this.loadDashboard(); this.loadRanking(); this.loadChartData(); this.loadPositions(); this.loadPortfolios(); this.loadUploadedStocks(); this.recalcAllocation(); this.loadUploadStats(); this.loadTradeBatches(); this.runBacktestTrend(); this.loadPeriodPreview(); }
@@ -3244,6 +3451,18 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     });
   }
 
+  /**
+   * The single Run & Refresh top 10 action.
+   *
+   * A filled From/To pair is an explicit instruction and wins; with the dates empty it falls back
+   * to the Time selection. That keeps both windows reachable without asking which of two buttons
+   * corresponds to which control.
+   */
+  runAndRefreshTop10(): void {
+    if (this.rangeFrom && this.rangeTo) this.runRangeBacktest();
+    else this.runBacktestTrend();
+  }
+
   runRangeBacktest() {
     if (!this.rangeFrom || !this.rangeTo) return;
     this.trendMode = 'range';
@@ -3255,6 +3474,76 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     const to = new Date();
     const from = new Date(to.getTime() - (Number(this.trendDays) || 30) * 86400000);
     this.loadReconstructedTrend(from.toISOString().slice(0, 10), to.toISOString().slice(0, 10));
+  }
+
+  /** Which holding day the chart is showing. Day 1 is the first trading session after entry. */
+  lowHoldingDay = 1;
+  readonly holdingDayChoices = [1, 2, 3, 4, 5];
+
+  setHoldingDay(d: number): void { this.lowHoldingDay = d; }
+
+  /** The selected day's return for one trade, or null when that day has not traded yet. */
+  private tradeDayReturn(t: any, day: number): number | null {
+    const v = t ? t['day' + day + '_return'] : null;
+    return v == null ? null : Number(v);
+  }
+
+  /**
+   * One bar per trading date, valued at the selected holding day.
+   *
+   * <p>The average is taken only across trades that actually have that day's price, and only
+   * after each trade's own return has been computed. A missing day is left out of the average
+   * rather than counted as 0%, which would pull the bar towards flat.
+   */
+  get lowHoldingBars(): any[] {
+    return (this.lowTrend || []).map(d => {
+      const rs = (d.trades || [])
+        .map((t: any) => this.tradeDayReturn(t, this.lowHoldingDay))
+        .filter((v: number | null) => v != null) as number[];
+      const avg = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+      return { ...d, day_return: avg, day_trades: rs.length };
+    });
+  }
+
+  /** Scale from the bars actually drawn, so switching day rescales the axis with it. */
+  get lowHoldingMax(): number {
+    const vals = this.lowHoldingBars.map(b => Math.abs(b.day_return || 0));
+    return Math.max(0.1, ...vals);
+  }
+
+  /**
+   * Win rate, profit factor and the rest for the selected holding day.
+   *
+   * <p>Computed from individual trade returns across every date - not from the per-date averages,
+   * which would weight a day holding one trade the same as a day holding eight.
+   */
+  get lowHoldingStats(): any {
+    const rs: number[] = [];
+    for (const d of this.lowTrend || []) {
+      for (const t of (d.trades || [])) {
+        const v = this.tradeDayReturn(t, this.lowHoldingDay);
+        if (v != null) rs.push(v);
+      }
+    }
+    if (!rs.length) {
+      return { trades: 0, wins: 0, losses: 0, winRate: 0, avg: 0, median: 0, profitFactor: 0 };
+    }
+    const wins = rs.filter(v => v > 0), losses = rs.filter(v => v <= 0);
+    const gain = wins.reduce((a, b) => a + b, 0);
+    const pain = Math.abs(losses.reduce((a, b) => a + b, 0));
+    const sorted = [...rs].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return {
+      trades: rs.length,
+      wins: wins.length,
+      losses: losses.length,
+      winRate: wins.length / rs.length * 100,
+      avg: rs.reduce((a, b) => a + b, 0) / rs.length,
+      median: sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2,
+      // No losing trade means there is nothing to divide by; report it as such rather than
+      // printing Infinity or a silent 0.
+      profitFactor: pain > 0 ? gain / pain : (gain > 0 ? null : 0)
+    };
   }
 
   get lowTrendMax(): number {
@@ -3288,7 +3577,12 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       next: r => { this.mainTop = r?.data || null; },
       error: () => { this.mainTop = null; }
     });
-    this.api.get<any>('/tracker/ranking/provisional-top10', { requireCrossing: 'false' }).subscribe({
+    // mainProvisional belongs to the Avg Return Trend panel, so it must use THAT panel's
+    // entry test - requireCrossing=false, exactly as mainTop above. It was briefly given the
+    // RSI 45 section's rules by mistake, which is why the list headed "tomorrow" here stopped
+    // resembling the ranked list it is supposed to precede.
+    this.api.get<any>('/tracker/ranking/provisional-top10',
+                      { requireCrossing: 'false' }).subscribe({
       next: r => { this.mainProvisional = r?.data || null; },
       error: () => { this.mainProvisional = null; }
     });
@@ -3297,11 +3591,21 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   loadBelowPriceTop10() {
     if (this.lowTopLoading) return;
     this.lowTopLoading = true;
-    this.api.get<any>('/tracker/ranking/provisional-top10').subscribe({
+    // THIS is the provisional that renders inside the RSI 45 section, so it takes that
+    // section's rules: the crossing required, ranking off, shortlisted by volume to six. It was
+    // running on endpoint defaults - ranked, top ten - so the preview never matched the holding
+    // it was previewing.
+    this.api.get<any>('/tracker/ranking/provisional-top10',
+                      { requireCrossing: 'true', applyRanking: 'false' }).subscribe({
       next: r => { this.provisional = r?.data || null; },
       error: () => { this.provisional = null; }
     });
-    this.api.get<any>('/tracker/ranking/below-price-top10', {}).subscribe({
+    // requireVolume=false: this section is defined by its price rules alone. Volume is still
+    // reported on every row, it just no longer excludes a stock.
+    // applyRanking=false: it is a screen, not a Top 10. Scoring would cut qualifying stocks out
+    // of a list whose whole purpose is to show which ones qualify.
+    this.api.get<any>('/tracker/ranking/below-price-top10',
+                      { requireVolume: 'false', applyRanking: 'false' }).subscribe({
       next: r => { this.lowTop = r?.data || null; this.lowTopLoading = false; },
       error: () => {
         this.lowTop = { top10: [], message: 'Could not build the list. Check that prices are loaded.' };
@@ -3314,22 +3618,28 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     // The table and the bars describe the same basket, so refresh them together - unless a load is
     // already in flight, which is the case on first paint where both are kicked off at once.
     if (!this.lowTopLoading) this.loadBelowPriceTop10();
-    if (!this.lowFrom || !this.lowTo) {
-      const today = new Date();
-      const past = new Date(today.getTime() - 30 * 86400000);
-      this.lowTo = this.lowTo || today.toISOString().slice(0, 10);
-      this.lowFrom = this.lowFrom || past.toISOString().slice(0, 10);
-    }
+    // No default window. This used to force the last 30 calendar days, so the chart drew about
+    // nine bars while the database held 301 sessions and an upload history reaching back to
+    // January - the back-dated bars were never missing, they were never asked for. Leaving the
+    // range empty makes the server return everything it can honestly rebuild, and the dates it
+    // used come back as coverage_from for the picker below.
+    if (!this.lowTo) this.lowTo = new Date().toISOString().slice(0, 10);
     this.lowRefreshing = true;
     this.api.get<any>('/tracker/ranking/reconstruct-trend', {
       // applyReturnBand=false is sent explicitly. The server turns the 0-5% band back ON when no
       // price ceiling is supplied, so removing the ceiling alone would quietly change this
       // section's entry test away from the three stated conditions.
       // This panel's bars must use the same three-condition entry test as its table.
-      from: this.lowFrom, to: this.lowTo, applyReturnBand: 'false', requireCrossing: 'true'
+      // applyRanking=false so the bars average the same population the table lists. With
+      // ranking on, each bar was the average of a ranked ten while the table showed every match.
+      ...(this.lowFrom ? { from: this.lowFrom } : {}),
+      to: this.lowTo, applyReturnBand: 'false', requireCrossing: 'true',
+      applyRanking: 'false'
     }).subscribe({
       next: r => {
         const d = r?.data || {};
+        // Show the picker the span actually drawn, so "from" is not left blank after a full load.
+        if (!this.lowFrom && d.coverage_from) this.lowFrom = d.coverage_from;
         // Days where nothing qualified are KEPT and flagged. Dropping them left an unexplained
         // hole in the run of dates, which reads as missing data rather than as the real and
         // meaningful outcome it is: no stock met the entry rules that day.
@@ -3350,6 +3660,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
             total_stocks:   x.trade_symbol_count ?? 0,
             symbols:        x.symbols || [],
             sell_date:      x.sell_date,
+            // Each trade kept whole, with its own Day 1-5 returns as the backtest recorded them.
+            // The bar is derived from these, never the other way round: averaging first and then
+            // trying to split the result by holding day is what mixed the days together.
+            trades:         x.priced || [],
             strategy:       'Top 10'
           }));
         this.lowResult = {
@@ -3421,10 +3735,18 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   }
 
   // Spec §2: named time selection — refresh the preview immediately on change.
+  //
+  // This used to call syncTrendToPeriod(), which copied the Day, buy time and sell time into the
+  // Avg Return Trend panel and re-ran it. The two are separate questions - one is "what did this
+  // basket do", the other is "how has the strategy performed over a window" - and tying them
+  // meant the trend's own Time control silently moved whenever the table above it changed, so a
+  // range chosen on the trend could not be kept. The trend now holds whatever you set on it.
+  //
+  // The Ranking Chart Bar stays anchored to this table on purpose: it lives inside this section
+  // and is that table drawn day by day.
   onPeriodChange() {
     if (this.prevPeriod === 'CUSTOM' && !this.prevCustomDate) return; // wait for a date
     this.loadPeriodPreview();
-    this.syncTrendToPeriod();
   }
 
   /**
@@ -3455,21 +3777,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     }
   }
 
-  /**
-   * Previous Top 10 drives the trend below it: mirror its selection into the trend's own
-   * Time control so the two never disagree, then re-run over that window.
-   */
-  private syncTrendToPeriod(): void {
-    if (this.prevPeriod === 'PAPER') return;   // live buy price — no historical window
-    this.trendPeriod = this.prevPeriod;
-    this.trendCustomDate = this.prevCustomDate;
-    this.trendDays = this.periodDays(this.prevPeriod, this.prevCustomDate);
-    // Bars must be computed from the same moments as the table above them.
-    this.trendBuyTime = this.prevBuyTime;
-    if (this.prevSellPeriod !== 'NOW') this.trendSellTime = this.prevSellTime;
-    this.runBacktestTrend();
-  }
-
   /** Time selection on the Avg Return Trend panel — same options and logic as Previous Top 10. */
   onTrendPeriodChange(): void {
     if (this.trendPeriod === 'CUSTOM' && !this.trendCustomDate) return;   // wait for a date
@@ -3484,6 +3791,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   rankingTrendDays = 30;
   rankingTrendDayOptions = [10, 15, 30, 60, 90];
   rankingTrendEndDate = '';
+  /** True when the newest bar predates today - the feed is behind, not the chart. */
+  rankingTrendStale = false;
   rankingTrendRule = '';
 
   /**
@@ -3525,6 +3834,20 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       next: r => {
         this.rankingTrend = r?.data?.days || [];
         this.rankingTrendRule = r?.data?.rule || '';
+
+        // Name the bar that was actually drawn, not the day that was asked for.
+        //
+        // The window is requested against the calendar, but the rebuild only returns sessions
+        // that have stored data - so when the feed is behind, the newest bar is older than the
+        // requested end. The caption said "Last bar (4 Sep) is the table above" while the last
+        // bar on screen was 28 Aug, which reads as a chart showing stale figures rather than a
+        // chart that is honestly out of data. Re-anchoring to the last returned day makes the
+        // caption true, and makes the gap between it and today visible instead of hidden.
+        const last = this.rankingTrend.length
+          ? this.rankingTrend[this.rankingTrend.length - 1]?.date : null;
+        if (last) this.rankingTrendEndDate = last;
+        this.rankingTrendStale = !!(last && last < this.todayIso);
+
         this.rankingTrendLoading = false;
       },
       error: () => {
@@ -3572,6 +3895,13 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   }
 
   createTradeBatch() {
+    // The button no longer greys out when there is nothing to buy, so the reason has to be
+    // stated here instead - a live button that does nothing is worse than a dead one.
+    if (!(this.rd?.current_top10?.length)) {
+      alert('There is no Current Top 10 to buy yet.\n\nNothing met the entry test on the last '
+          + 'completed session, or prices have not been loaded. Refresh the Top 10 and try again.');
+      return;
+    }
     if (this.prevPeriod === 'CUSTOM' && !this.prevCustomDate) { alert('Please pick a custom date first.'); return; }
     const when = this.prevPeriod === 'NOW' || this.prevPeriod === 'PAPER'
       ? 'at the current market price'
@@ -4305,21 +4635,51 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     return ['buy_sell_signal','trend','today_volume_change_pct','below_52wh_pct','above_52wl_pct','pe_ratio'].includes(col);
   }
 
-  private uploadedPageCache: Record<string, { stocks: any[], total: number, time: number }> = {};
+  // Module scope on purpose: the router destroys this component when you leave the tracker, so
+  // an instance field took the whole table with it. Coming back rebuilt every page from scratch -
+  // which is why the section took just as long on the second visit as on the first. Held here it
+  // survives navigation, and a return paints from it immediately.
+  private uploadedPageCache = UPLOADED_PAGE_CACHE;
+
+  /** Empties the shared cache in place - reassigning it would silently unshare it. */
+  private clearUploadedCache(): void {
+    for (const k of Object.keys(this.uploadedPageCache)) delete this.uploadedPageCache[k];
+  }
 
   // withSignals=true → full enriched fetch so Signal (Sell) and Trend update.
-  loadUploadedStocks(forceReload = false, withSignals = false) {
+  /**
+   * @param silent skip the loading state. A background refresh must not flash a loading row or
+   *        disable the pager under someone who is reading the table.
+   */
+  /**
+   * Whether the table is currently showing the signal columns.
+   *
+   * <p>Every caller used to decide this for itself, and all of them but "Reload Table" defaulted
+   * to false. So loading the table with signals and then turning a page silently dropped back to
+   * the lite view - Signal, Trend and the 52-week columns vanishing mid-read, which is the
+   * section "changing on its own" when nothing was asked of it. The choice is remembered here
+   * and every later load keeps it.
+   */
+  uploadedWithSignals = false;
+
+  loadUploadedStocks(forceReload = false, withSignals = this.uploadedWithSignals, silent = false) {
+    this.uploadedWithSignals = withSignals;
     const cacheKey = `${this.uploadedPage}_${this.uploadedPageSize}_${this.uploadedSortBy}_${this.uploadedSortDir}_${withSignals ? 'full' : 'lite'}`;
     if (!forceReload) {
       const cached = this.uploadedPageCache[cacheKey];
-      if (cached && (Date.now() - cached.time) < 120000) {
+      if (cached) {
+        // Paint what we already have, always - including when it is past its 2 minutes. Returning
+        // to the section then shows the table instantly instead of an empty loading state, and
+        // anything stale is replaced quietly underneath. Blocking on the network to re-fetch rows
+        // that are already on hand is the wait being complained about.
         this.uploadedStocks = cached.stocks;
         this.uploadedTotal = cached.total;
-        return;
+        if ((Date.now() - cached.time) < 120000) return;
+        silent = true;           // revalidate without a spinner or a disabled pager
       }
     }
     const requestId = ++this.uploadedRequestId;
-    this.uploadedLoading = true;
+    this.uploadedLoading = !silent;
     this.uploadedDetailsLoading = false;
     this.api.get<any>('/tracker/stocks', {
       page: this.uploadedPage,
@@ -4476,11 +4836,11 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
 
   onUploadSearchChange(): void {
     if (this.searchDebounce) clearTimeout(this.searchDebounce);
-    this.searchDebounce = setTimeout(() => { this.uploadedPageCache = {}; this.loadUploadedStocks(true); }, 400);
+    this.searchDebounce = setTimeout(() => { this.clearUploadedCache(); this.loadUploadedStocks(true); }, 400);
   }
 
   private refreshAfterDelete(): void {
-    this.uploadedPageCache = {};
+    this.clearUploadedCache();
     this.loadUploadedStocks(true);
     this.loadDashboard();
     this.loadRanking();
@@ -4524,7 +4884,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       this.uploadedSortDir = 'desc';
     }
     this.uploadedPage = 0;
-    this.uploadedPageCache = {};
+    this.clearUploadedCache();
     this.loadUploadedStocks(true);
   }
 
@@ -4804,7 +5164,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.currentTop10LastUpdated = now;
     this.previousTop10LastUpdated = now;
     this.trendLastUpdated = now;
-    this.uploadedPageCache = {};
+    this.clearUploadedCache();
     this.loadDashboard();
     this.loadRanking();
     this.loadChartData();
@@ -4868,7 +5228,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
         this.loadDashboard();
         break;
       case 'STOCK_DETAILS':
-        this.uploadedPageCache = {};
+        this.clearUploadedCache();
         this.loadUploadedStocks(true);
         break;
       case 'CURRENT_TOP10':
@@ -4916,6 +5276,12 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   // â”€â”€ All downloads use authenticated HTTP (JWT token passed in header) â”€â”€â”€â”€â”€â”€â”€
   // window.open() cannot pass Authorization header â€” replaced with HttpClient blob
   downloadEligible()        { this.downloadCsv('/tracker/export/eligible',    'TradeRakshak_Eligible_Stocks.csv'); }
+  /** First touch of the base price since it was set, ATR14(D-1)/Close(D-1) >= 3%. No volume or
+   *  ADX filter - both failed out-of-sample. The CSV carries the exit bracket with each row. */
+  downloadAtrBaseCrossover() {
+    this.downloadCsv('/tracker/export/atr-base-crossover?minAtrPct=3.0',
+                     'TradeRakshak_ATR_Base_Price_Crossover.csv');
+  }
   downloadRankingCurrent()  { this.downloadCsv('/tracker/export/ranking',     'TradeRakshak_Current_Top10.csv'); }
   downloadRankingPrevious() { this.downloadCsv('/tracker/export/previous',    'TradeRakshak_Previous_Top10.csv'); }
   downloadHistorical()      { this.downloadCsv('/tracker/export/historical',  'TradeRakshak_Historical_Rankings.csv'); }
@@ -4944,6 +5310,15 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
    *
    * @param maxPrice price ceiling for the low-priced basket, or null for the full Top 10
    */
+  /** Optional past session for the Previous Top 10 download; empty means the current view. */
+  prevExportDate = '';
+
+  downloadPrevTop10() {
+    const q = this.prevExportDate ? `?runDate=${this.prevExportDate}` : '';
+    this.downloadCsv('/tracker/export/prev-top10' + q,
+      `TradeRakshak_Previous_Top10_${this.prevExportDate || 'current'}.csv`);
+  }
+
   downloadChartTrades(maxPrice: number | null) {
     // Follow whichever range the matching section is showing, so the file always matches
     // the bars on screen.

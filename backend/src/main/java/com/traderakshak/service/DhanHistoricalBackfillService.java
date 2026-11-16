@@ -9,6 +9,8 @@ import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.hibernate.Session;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -31,7 +33,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.stream.Collectors;
+import java.util.stream.Collectors;
+
 import java.sql.Timestamp;
 
 @Service
@@ -47,8 +50,22 @@ public class DhanHistoricalBackfillService {
     private static final DateTimeFormatter DHAN_DATE = DateTimeFormatter.ofPattern("yyyy-MM-dd");
     private static final DateTimeFormatter DHAN_INTRADAY = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
     private static final Set<String> DHAN_INTRADAY_INTERVALS = Set.of("1", "5", "15", "25", "60");
-    private static final Set<String> DHAN_EXCHANGE_SEGMENTS = Set.of("NSE_EQ", "NSE_FNO", "BSE_EQ", "BSE_FNO", "MCX_COMM");
+    // IDX_I is Dhan's segment for index candles (NIFTY, BANKNIFTY, ...). The instrument master
+    // stores these rows as NSE_I / BSE_I; normalizeExchangeSegment maps both onto IDX_I, which is
+    // what the charts API expects. Without IDX_I here every index request was rejected locally.
+    private static final Set<String> DHAN_EXCHANGE_SEGMENTS = Set.of("NSE_EQ", "NSE_FNO", "BSE_EQ", "BSE_FNO", "MCX_COMM", "IDX_I");
     private static final int STALE_JOB_MINUTES = 10;
+
+    /**
+     * Stable marker carried by {@link #refuseIfAnotherJobIsRunning()}'s message.
+     *
+     * <p>Callers that expect the refusal match on this rather than on the prose around it, so the
+     * wording can change without turning an expected skip back into a logged fault - which is
+     * exactly what happened: the refusal was new, StartupSyncService's catch only recognised the
+     * older "DATA-ACTIVE" phrasing, and its two-minute watchdog logged a three-line WARN for a
+     * backfill that was behaving perfectly normally.
+     */
+    public static final String ANOTHER_JOB_RUNNING_MARKER = "Only one backfill can run at a time";
 
     private final BlockingHttpService http;
 
@@ -64,7 +81,10 @@ public class DhanHistoricalBackfillService {
     // speed, a busy one is backed off from within one request, and neither case needs a guess
     // baked into the source. The retry handler with its 8-second backoff remains underneath as the
     // safety net if the gap is still too small.
-    private static final long GAP_FLOOR_MS   = 250;
+    // 250 ms was never sustainable: across 2h30m of job #6 the gap reached the floor nine times
+    // and was rate-limited within seconds on every one of them. Start where the evidence says
+    // the API is comfortable.
+    private static final long GAP_FLOOR_MS   = 500;
     private static final long GAP_CEILING_MS = 2500;
     private static final int  CLEAN_CALLS_BEFORE_NARROWING = 25;
 
@@ -72,6 +92,9 @@ public class DhanHistoricalBackfillService {
         new java.util.concurrent.atomic.AtomicLong(GAP_FLOOR_MS);
     private final java.util.concurrent.atomic.AtomicInteger cleanCallStreak =
         new java.util.concurrent.atomic.AtomicInteger(0);
+    /** Widest gap Dhan has already refused this run; narrowing never goes back below it. */
+    private final java.util.concurrent.atomic.AtomicLong lastRefusedGapMs =
+        new java.util.concurrent.atomic.AtomicLong(0);
     private final java.util.concurrent.atomic.AtomicLong lastHistoricalCallMs = new java.util.concurrent.atomic.AtomicLong(0);
     private final DhanBrokerService dhanBrokerService;
     private final MarketCalendarService calendar;
@@ -173,36 +196,10 @@ public class DhanHistoricalBackfillService {
                     .setParameter(16, lotSize)
                     .setParameter(17, DateUtil.now())
                     .executeUpdate();
-                em.createNativeQuery(
-                    "INSERT INTO broker_instruments(broker_name,broker_credential_id,broker_security_id,exchange,segment,exchange_segment,instrument_type," +
-                    "symbol,trading_symbol,display_name,isin,underlying_security_id,underlying_symbol,expiry_date,strike_price,option_type,lot_size,tick_size,updated_at) " +
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
-                    "ON CONFLICT (broker_name, broker_security_id, exchange_segment) DO UPDATE SET " +
-                    "broker_credential_id=EXCLUDED.broker_credential_id, exchange=EXCLUDED.exchange, segment=EXCLUDED.segment, instrument_type=EXCLUDED.instrument_type, symbol=EXCLUDED.symbol, " +
-                    "trading_symbol=EXCLUDED.trading_symbol, display_name=EXCLUDED.display_name, isin=EXCLUDED.isin, " +
-                    "underlying_security_id=EXCLUDED.underlying_security_id, underlying_symbol=EXCLUDED.underlying_symbol, " +
-                    "expiry_date=EXCLUDED.expiry_date, strike_price=EXCLUDED.strike_price, option_type=EXCLUDED.option_type, " +
-                    "lot_size=EXCLUDED.lot_size, tick_size=EXCLUDED.tick_size, updated_at=EXCLUDED.updated_at")
-                    .setParameter(1, "dhan")
-                    .setParameter(2, credential == null ? null : credential.id())
-                    .setParameter(3, securityId)
-                    .setParameter(4, exchange)
-                    .setParameter(5, segment)
-                    .setParameter(6, exchangeSegment)
-                    .setParameter(7, instrumentType)
-                    .setParameter(8, underlyingSymbol)
-                    .setParameter(9, dhanTradingSymbol.isBlank() ? symbol : dhanTradingSymbol)
-                    .setParameter(10, display)
-                    .setParameter(11, isin)
-                    .setParameter(12, underlyingSecurityId)
-                    .setParameter(13, underlyingSymbol)
-                    .setParameter(14, expiryDate)
-                    .setParameter(15, number(first(row, "SEM_STRIKE_PRICE", "STRIKE_PRICE")))
-                    .setParameter(16, optionType)
-                    .setParameter(17, lotSize)
-                    .setParameter(18, tickSize)
-                    .setParameter(19, DateUtil.now())
-                    .executeUpdate();
+                // broker_instruments used to receive a byte-for-byte second copy of every row
+                // written to dhan_instruments above (212,736 rows, ~70 MB). dhan_instruments is
+                // the single instrument master; its underlying_symbol already carries the ticker
+                // that copy's `symbol` column held, so the duplicate write is gone.
                 if (isEquityStockInstrument(exchange, exchangeSegment, instrument, instrumentType)) {
                     String masterSymbol = underlyingSymbol;
                     if (!masterSymbol.isBlank()) {
@@ -315,14 +312,84 @@ public class DhanHistoricalBackfillService {
         return "NSE";
     }
 
+    /**
+     * Candle modes this endpoint can actually produce, keyed by the "Type of Data" selection.
+     * A {@code null} value means the type is valid here but does not pin the mode, so whatever
+     * the Mode dropdown says is used.
+     */
+    private static final Map<String, String> CANDLE_DATA_TYPES = Map.of(
+        "HISTORICAL OHLCV", "DAILY",
+        "INTRADAY OHLCV",   "INTRADAY"
+    );
+    private static final Set<String> MODE_FREE_DATA_TYPES = Set.of("FUTURES DATA");
+
+    /**
+     * Where each unsupported "Type of Data" actually comes from. The historical backfill calls
+     * one Dhan endpoint - /charts/historical and /charts/intraday - so anything that is not a
+     * candle has to be fetched somewhere else, and the message has to say where instead of
+     * failing with a bare "unsupported".
+     */
+    private static final Map<String, String> DATA_TYPE_ELSEWHERE = Map.ofEntries(
+        Map.entry("INSTRUMENT MASTER", "Use the Fetch Public Stock List button in this panel - it loads the Dhan instrument master."),
+        Map.entry("EQUITY LTP",        "Live prices come from the broker live-price feed, not from historical candles."),
+        Map.entry("HOLDINGS",          "Holdings are a portfolio snapshot. Fetch them from the Broker section."),
+        Map.entry("POSITIONS",         "Positions are a portfolio snapshot. Fetch them from the Broker section."),
+        Map.entry("ORDERS",            "Orders are a portfolio snapshot. Fetch them from the Broker section."),
+        Map.entry("TRADES",            "Trades are a portfolio snapshot. Fetch them from the Broker section."),
+        Map.entry("FUNDS / MARGIN",    "Funds and margin are a portfolio snapshot. Fetch them from the Broker section."),
+        Map.entry("DAILY BHAVCOPY",    "Not available from the Dhan candle API. Use manual upload or the NSE source."),
+        Map.entry("F&O BHAVCOPY",      "Not available from the Dhan candle API. Use manual upload or the NSE source."),
+        Map.entry("OPTION CHAIN",      "Not available from the Dhan candle API. Use manual upload."),
+        Map.entry("INDEX DATA",        "Not available from the Dhan candle API. Use manual upload."),
+        Map.entry("CORPORATE ACTIONS", "Not available from the Dhan API."),
+        Map.entry("FII/DII DATA",      "Not available from the Dhan API. Use manual upload."),
+        Map.entry("DELIVERY VOLUME",   "Not available from the Dhan API. Use manual upload."),
+        Map.entry("FUNDAMENTALS",      "Not available from the Dhan API. Use manual upload.")
+    );
+
+    /**
+     * Validates the "Type of Data" selection against what a candle backfill can do and returns
+     * the mode to run in. Throws for anything this endpoint cannot fetch, so the caller sees why
+     * nothing happened instead of receiving an unrelated candle job.
+     */
+    private String applyDataTypeSelection(String dataType, String requestedMode) {
+        String key = norm(dataType);
+        if (key.isBlank()) return requestedMode;                 // older clients send no dataType
+        String pinnedMode = CANDLE_DATA_TYPES.get(key);
+        if (pinnedMode != null) {
+            if (!pinnedMode.equals(requestedMode)) {
+                log.info("[Backfill] Type of Data '{}' pins mode to {} (Mode dropdown said {}).",
+                    dataType, pinnedMode, requestedMode);
+            }
+            return pinnedMode;
+        }
+        if (MODE_FREE_DATA_TYPES.contains(key)) return requestedMode;
+        String where = DATA_TYPE_ELSEWHERE.get(key);
+        throw new IllegalStateException(
+            "Historical OHLCV Backfill cannot fetch \"" + dataType + "\", so nothing was requested from Dhan. "
+          + (where != null ? where : "This panel fetches historical candles only.")
+          + " Choose Historical OHLCV, Intraday OHLCV or Futures Data to use this panel.");
+    }
+
     public Map<String, Object> startHistoricalBackfill(User user, Map<String, Object> req) {
         ensureBackfillAuditSchema();
         markStaleJobs(user);
+        refuseIfAnotherJobIsRunning();
         Long brokerCredentialId = longValue(req.get("brokerCredentialId"));
         DhanBrokerService.Credential credential = brokerCredentialId == null
             ? dhanBrokerService.activeDhanCredential(user)
             : dhanBrokerService.activeDhanCredential(user, brokerCredentialId);
-        String mode = norm(req.getOrDefault("mode", "DAILY"));
+        // The "Type of Data" dropdown used to be sent and then ignored: whatever was selected,
+        // this method ran a historical candle backfill. Picking Holdings or Orders and pressing
+        // Start Backfill fetched equity candles instead, with nothing on screen to say so.
+        // Honour the selection - drive the mode from it where it implies one, and refuse the
+        // types this endpoint cannot fetch rather than quietly doing something else.
+        // Default empty, not "Historical OHLCV": StartupSyncService calls this with a mode but
+        // no dataType, and one of those runs is INTRADAY. Defaulting to a type that pins DAILY
+        // would silently turn the scheduled intraday sync into a daily one. Absent means
+        // "no opinion" and the Mode field is left to decide.
+        String dataType = String.valueOf(req.getOrDefault("dataType", "")).trim();
+        String mode = applyDataTypeSelection(dataType, norm(req.getOrDefault("mode", "DAILY")));
         int interval = intValue(req.get("intervalMinutes"), 1);
         LocalDate requestedFrom = parseDhanUiDate(req.getOrDefault("fromDate", "2020-01-01"), LocalDate.of(2020, 1, 1));
         LocalDate requestedTo = parseDhanUiDate(req.getOrDefault("toDate", LocalDate.now(IST).toString()), LocalDate.now(IST));
@@ -331,6 +398,15 @@ public class DhanHistoricalBackfillService {
         String exchanges = String.valueOf(req.getOrDefault("exchanges", "NSE"));
         String segments = String.valueOf(req.getOrDefault("segments", "NSE_EQ"));
         String instrumentFilter = String.valueOf(req.getOrDefault("instrumentFilter", "ES"));
+        // "Futures Data" is a candle fetch, but only over futures instruments. Left unchecked it
+        // runs happily against the default ES filter and downloads equities, which is the same
+        // "fetched something other than what was selected" problem one level down.
+        if (MODE_FREE_DATA_TYPES.contains(norm(dataType)) && !norm(instrumentFilter).startsWith("FUT")) {
+            throw new IllegalStateException(
+                "Type of Data is \"" + dataType + "\" but Instrument Filter is \"" + instrumentFilter
+              + "\", which selects " + ("ES".equals(norm(instrumentFilter)) ? "equities" : "non-futures instruments")
+              + ". Set Instrument Filter to Futures Index, Futures Stock or All Futures, and Segments to an F&O segment.");
+        }
         int maxInstruments = intValue(req.get("maxInstruments"), 0);
         // A Data Warehouse fetch populates a whole category by default. Pass scope=TRACKED to
         // restrict it to uploaded symbols (what the startup sync does).
@@ -356,7 +432,20 @@ public class DhanHistoricalBackfillService {
         String coverageReport = describeExistingCoverage(effectiveFrom, cappedTo, matchingRows);
 
         if (matchingRows == 0) {
-            throw new IllegalStateException("No valid Dhan Stock List symbols matched the selected exchange, segment, and instrument filter. Test/blank instruments are skipped before Dhan API calls.");
+            // Name the three values and what each one on its own would have matched. The old
+            // message just said "nothing matched", which gave no way to tell a broken Stock List
+            // apart from an impossible combination - NSE_EQ with an INDEX filter, say, where the
+            // segment holds thousands of instruments but none of them are indices.
+            long inSegment = countInstruments(exchanges, segments, "ALL");
+            long inFilter  = countInstruments("ALL", "ALL", instrumentFilter);
+            throw new IllegalStateException(
+                "No Dhan instruments match exchange " + exchanges + ", segment " + segments
+              + ", instrument filter " + instrumentFilter + ". That segment holds " + inSegment
+              + " instrument(s), and " + inFilter + " instrument(s) anywhere match that filter"
+              + (inSegment > 0 && inFilter > 0
+                    ? " - so the two are valid on their own but never occur together. Change the"
+                      + " Instrument Filter (equities in NSE_EQ are 'ES')."
+                    : " - fetch the Stock List first, or pick a different exchange and segment."));
         }
 
         Long jobId = new TransactionTemplate(transactionManager).execute(status -> {
@@ -369,7 +458,7 @@ public class DhanHistoricalBackfillService {
                 .setParameter(4, mode)
                 .setParameter(5, "INTRADAY".equals(mode) ? interval : null)
                 .setParameter(6, effectiveFrom.toString())
-                .setParameter(7, requestedTo.toString())
+                .setParameter(7, cappedTo.toString())
                 .setParameter(8, requestedFrom.toString())
                 .setParameter(9, requestedTo.toString())
                 .setParameter(10, exchanges)
@@ -381,10 +470,13 @@ public class DhanHistoricalBackfillService {
                 .getSingleResult()).longValue();
         });
 
-        List<DateRange> batches = monthlyBatches(effectiveFrom, requestedTo);
-        createBatchRecords(jobId, effectiveFrom, requestedTo);
+        // cappedTo, not requestedTo: the cap above exists to stop requests for days the source
+        // cannot serve yet, which come back as DH-907 "no data present" for every symbol. It was
+        // only ever used for the message, so the whole run still went out uncapped.
+        List<DateRange> batches = monthlyBatches(effectiveFrom, cappedTo);
+        createBatchRecords(jobId, effectiveFrom, cappedTo);
 
-        Thread worker = new Thread(() -> runJob(jobId, credential, mode, interval, effectiveFrom, requestedTo, exchanges, segments, instrumentFilter, maxInstruments, true, scopeToTracked),
+        Thread worker = new Thread(() -> runJob(jobId, credential, mode, interval, effectiveFrom, cappedTo, exchanges, segments, instrumentFilter, maxInstruments, true, scopeToTracked),
             "dhan-history-job-" + jobId);
         worker.setDaemon(true);
         worker.start();
@@ -394,7 +486,7 @@ public class DhanHistoricalBackfillService {
         result.put("status", "started");
         result.put("mode", mode);
         result.put("fromDate", effectiveFrom.toString());
-        result.put("toDate", requestedTo.toString());
+        result.put("toDate", cappedTo.toString());
         result.put("stockListRows", stockListRows);
         result.put("matchedInstruments", matchingRows);
         result.put("totalBatches", batches.size());
@@ -412,7 +504,7 @@ public class DhanHistoricalBackfillService {
         List<Object[]> rows = em.createNativeQuery(
             "SELECT id,status,mode,interval_minutes,from_date,to_date,total_instruments,processed_instruments,total_chunks,processed_chunks," +
             "imported_candles,failed_chunks,current_symbol,message,created_at,updated_at,completed_at,successful_instruments,failed_instruments,skipped_instruments " +
-            "FROM dhan_historical_jobs WHERE user_id=? ORDER BY id DESC LIMIT 1")
+            "FROM dhan_historical_jobs WHERE user_id=? AND COALESCE(dismissed,0)=0 ORDER BY id DESC LIMIT 1")
             .setParameter(1, user.getId())
             .getResultList();
         if (rows.isEmpty()) return Map.of("status", "idle");
@@ -433,6 +525,60 @@ public class DhanHistoricalBackfillService {
                 .setParameter(3, user.getId())
                 .executeUpdate());
         return latestJob(user);
+    }
+
+    /**
+     * Release a backfill that can no longer be started, without deleting anything.
+     *
+     * <p>Stop only reaches jobs this user still has in queued/running/stopping. When a start
+     * fails after the activity was marked running - a browser closed mid-fetch, a start that
+     * threw before the job row was written - there is nothing left for Stop to act on, yet the
+     * in-memory activity gate in DataController still answers "running" and refuses every
+     * later fetch. Until now the only cure was restarting the application; markStaleJobs only
+     * intervenes after {@value #STALE_JOB_MINUTES} minutes and never touches that map.
+     *
+     * <p>stop_requested is set as well as the status, because a worker thread that is still
+     * alive reads that column and not the status - clearing the row alone would leave it
+     * fetching against a job the screen believes is finished.
+     *
+     * <p>Finished jobs are marked dismissed rather than deleted. Clearing the activity flag on
+     * its own was not enough: the panel reads the newest job row whatever its status, so a
+     * stopped request stayed on screen with its Resume banner and monthly batches - and worse,
+     * every poll of /latest wrote that status straight back into the activity map, undoing the
+     * clear within a second. The flag takes the row out of both paths at once.
+     *
+     * <p>Deletes no history: job rows, batches and the per-symbol error log all survive in the
+     * database, so nothing recorded about a run is lost by clearing it off the screen.
+     */
+    public Map<String, Object> cleanBackfillState(User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        if (user == null) {
+            out.put("clearedJobs", 0);
+            return out;
+        }
+        markStaleJobs(user);
+        int[] cleared = {0};
+        new TransactionTemplate(transactionManager).executeWithoutResult(status ->
+            cleared[0] = em.createNativeQuery(
+                "UPDATE dhan_historical_jobs SET stop_requested=1, status='stopped', " +
+                "message='Cleared from Data Warehouse. A worker still running stops at its next chunk.', " +
+                "completed_at=?, updated_at=? WHERE user_id=? AND status IN ('queued','running','stopping')")
+                .setParameter(1, DateUtil.now())
+                .setParameter(2, DateUtil.now())
+                .setParameter(3, user.getId())
+                .executeUpdate());
+        int[] dismissed = {0};
+        new TransactionTemplate(transactionManager).executeWithoutResult(status ->
+            dismissed[0] = em.createNativeQuery(
+                "UPDATE dhan_historical_jobs SET dismissed=1, updated_at=? " +
+                "WHERE user_id=? AND COALESCE(dismissed,0)=0")
+                .setParameter(1, DateUtil.now())
+                .setParameter(2, user.getId())
+                .executeUpdate());
+        out.put("clearedJobs", cleared[0]);
+        out.put("dismissedJobs", dismissed[0]);
+        out.put("latestJob", latestJob(user));
+        return out;
     }
 
     public byte[] latestErrorLogCsv(User user) {
@@ -1155,7 +1301,7 @@ public class DhanHistoricalBackfillService {
 
     private Long latestJobId(User user) {
         @SuppressWarnings("unchecked")
-        List<Object> rows = em.createNativeQuery("SELECT id FROM dhan_historical_jobs WHERE user_id=? ORDER BY id DESC LIMIT 1")
+        List<Object> rows = em.createNativeQuery("SELECT id FROM dhan_historical_jobs WHERE user_id=? AND COALESCE(dismissed,0)=0 ORDER BY id DESC LIMIT 1")
             .setParameter(1, user.getId())
             .getResultList();
         return rows.isEmpty() ? null : ((Number) rows.get(0)).longValue();
@@ -1236,24 +1382,57 @@ public class DhanHistoricalBackfillService {
      * skipped. Deliberately conservative: it only reports true when rows exist for both ends of the
      * range, so a partially-fetched instrument is still re-fetched rather than silently left short.
      */
+    /**
+     * Whether this instrument's candles for a window are already stored, month by month.
+     *
+     * <p>Coverage is judged per calendar month inside the window, not once across the whole of it.
+     * The 80% rule used to be applied to the window as a single span, which was equivalent while a
+     * window was one calendar month - but it also meant the window width silently set the
+     * resolution at which a gap could be seen. At a 365-day window an instrument missing one whole
+     * month still reads as about 92% covered, clears the threshold, and is skipped: the gap
+     * becomes permanent and no Resume would ever go back for it.
+     *
+     * <p>Requiring every month in the window to carry 80% of its own weekdays decouples the two.
+     * Gap detection stays at month resolution whatever the window is, so the window is free to be
+     * as wide as the broker will serve - which is the whole point of widening it.
+     *
+     * <p>Identical in behaviour to the old check for a one-month window, so nothing about the
+     * existing 90-day default changes.
+     */
     private boolean hasStoredCandles(Instrument instrument, String mode, int interval, DateRange batch) {
         try {
-            Object n = em.createNativeQuery(
-                "SELECT COUNT(DISTINCT trade_date) FROM broker_market_candles " +
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT substr(trade_date,1,7) AS ym, COUNT(DISTINCT trade_date) " +
+                "FROM broker_market_candles " +
                 "WHERE broker_security_id = ? AND UPPER(COALESCE(candle_mode,'')) = ? " +
-                "AND trade_date BETWEEN ? AND ?")
+                "AND trade_date BETWEEN ? AND ? GROUP BY substr(trade_date,1,7)")
                 .setParameter(1, instrument.securityId())
                 .setParameter(2, mode.toUpperCase(Locale.ROOT))
                 .setParameter(3, batch.from().toString())
                 .setParameter(4, batch.to().toString())
-                .getSingleResult();
-            if (n == null) return false;
-            long days = ((Number) n).longValue();
-            // A calendar month holds ~19-23 trading sessions; requiring most of the weekdays in the
-            // window avoids treating a half-finished instrument as complete.
-            long weekdays = batch.from().datesUntil(batch.to().plusDays(1))
-                .filter(d -> d.getDayOfWeek().getValue() <= 5).count();
-            return weekdays > 0 && days >= (weekdays * 0.8);
+                .getResultList();
+
+            Map<String, Long> stored = new LinkedHashMap<>();
+            for (Object[] r : rows) {
+                if (r[0] == null || r[1] == null) continue;
+                stored.put(String.valueOf(r[0]), ((Number) r[1]).longValue());
+            }
+
+            // Weekdays the window actually contains in each month - the first and last month of a
+            // window are usually partial, so a month's own length is the wrong denominator.
+            Map<String, Long> expected = new LinkedHashMap<>();
+            batch.from().datesUntil(batch.to().plusDays(1))
+                .filter(d -> d.getDayOfWeek().getValue() <= 5)
+                .forEach(d -> expected.merge(d.toString().substring(0, 7), 1L, Long::sum));
+            if (expected.isEmpty()) return false;
+
+            for (Map.Entry<String, Long> e : expected.entrySet()) {
+                // A calendar month holds ~19-23 trading sessions, so most of its weekdays being
+                // present is what distinguishes a finished month from a half-finished one.
+                if (stored.getOrDefault(e.getKey(), 0L) < e.getValue() * 0.8) return false;
+            }
+            return true;
         } catch (Exception e) {
             return false;   // cannot tell - fetch it
         }
@@ -1289,6 +1468,7 @@ public class DhanHistoricalBackfillService {
                         JsonNode json = fetchCandlesWithRetry(headers, instrument, mode, interval, chunk);
                         int imported = saveCandles(jobId, credential.id(), instrument, mode, interval, json);
                         importedForInstrument += imported;
+                        if (!"INTRADAY".equals(mode)) noteDailyChunkAccepted();
                         incrementJob(jobId, 1, imported, 0);
                     } catch (Exception e) {
                         String emsg = e.getMessage() == null ? "" : e.getMessage().toLowerCase(Locale.ROOT);
@@ -1302,6 +1482,12 @@ public class DhanHistoricalBackfillService {
                             break;
                         }
                         boolean noData = isDhanNoDataError(e);
+                        // DH-905 is Dhan's catch-all "bad values for parameters". It is how an
+                        // over-wide date range would come back, and also how an instrument with no
+                        // listing in the window comes back, so it is counted rather than acted on.
+                        if (!"INTRADAY".equals(mode) && emsg.contains("dh-905")) {
+                            noteDailyChunkRejected(chunk);
+                        }
                         recordBackfillIssue(jobId, instrument, mode, interval, chunk, noData ? "SKIPPED" : "FAILED", dhanErrorCode(e), dhanErrorMessage(e));
                         incrementJob(jobId, 1, 0, 1);
                         if (noData) skippedInstrument = true;
@@ -1366,7 +1552,7 @@ public class DhanHistoricalBackfillService {
                 Long batchId = bi < batchIds.size() ? batchIds.get(bi) : null;
                 if (batchId != null) updateBatchStatus(batchId, "running", null, Map.of("started_at", DateUtil.now()));
                 if (batchId != null) updateBatchInstrumentCount(batchId, instruments.size());
-                String batchLabel = batch.from().getMonth().toString().substring(0, 3) + " " + batch.from().getYear();
+                String batchLabel = windowLabel(batch);
                 updateJob(jobId, "running", "Processing batch " + (bi + 1) + "/" + batches.size() + " (" + batchLabel + ").", Map.of());
                 int batchProcessed = 0, batchImported = 0, batchSuccess = 0, batchFailed = 0, batchSkipped = 0;
                 for (Instrument instrument : instruments) {
@@ -1384,9 +1570,27 @@ public class DhanHistoricalBackfillService {
                     // limits. Only the range backfill skips - the retry path must always re-ask,
                     // since it exists precisely to repair symbols that have no rows.
                     if (hasStoredCandles(instrument, mode, interval, batch)) {
+                        // An instrument already holding candles for this range counts as a
+                        // success without a download - but it is still one instrument dealt
+                        // with, so it has to advance the processed counter like any other.
+                        //
+                        // This "continue" used to jump straight past the batchProcessed++ at the
+                        // bottom of the loop, so re-running a range that was mostly already
+                        // fetched produced cards that contradicted themselves: AUG 2025 read
+                        // "Processed: 717/3136" beside "Saved: 2615", and the stated rule
+                        // Saved + No data + Failed = Processed came out as 3131 = 717. The 2,414
+                        // instruments that were already stored were counted in Saved and nowhere
+                        // else.
                         batchSuccess++;
                         incrementInstrumentOutcome(jobId, 1, 0, 0);
                         incrementJob(jobId, 1, 0, 0);
+                        batchProcessed++;
+                        globalProcessed++;
+                        updateProcessedInstruments(jobId, globalProcessed);
+                        if (batchId != null) {
+                            updateBatchProgress(batchId, batchProcessed, batchImported,
+                                                batchSuccess, batchFailed, batchSkipped);
+                        }
                         continue;
                     }
                     try {
@@ -1434,6 +1638,7 @@ public class DhanHistoricalBackfillService {
                     ", Failed: " + summary.getOrDefault("failedInstruments", 0) +
                     ", Skipped: " + summary.getOrDefault("skippedInstruments", 0) + ".",
                 Map.of("completed_at", DateUtil.now()));
+            logSkipSummary(jobId);
         } catch (Exception e) {
             updateJob(jobId, "failed", friendlyJobError(e), Map.of("completed_at", DateUtil.now()));
         }
@@ -1476,6 +1681,9 @@ public class DhanHistoricalBackfillService {
     private void widenHistoricalGap(String reason) {
         cleanCallStreak.set(0);
         long before = historicalGapMs.get();
+        // Remember the gap that just failed. Narrowing will stop one step above it instead of
+        // walking all the way back to the floor and provoking the same refusal again.
+        lastRefusedGapMs.set(Math.max(lastRefusedGapMs.get(), before));
         long after = Math.min(GAP_CEILING_MS, Math.max(GAP_FLOOR_MS, before * 2));
         if (after != before) {
             historicalGapMs.set(after);
@@ -1484,16 +1692,28 @@ public class DhanHistoricalBackfillService {
         }
     }
 
-    /** Narrow the gap after a sustained run of clean calls, one step at a time. */
+    /**
+     * Narrow the gap after a sustained run of clean calls - but never back below a width Dhan
+     * has already refused.
+     *
+     * <p>Widening doubles and narrowing subtracts 250 ms, so the gap used to climb to the
+     * ceiling and then take 225 clean calls to walk back to the floor, where it was refused
+     * again immediately. Job #6 logged 13 widenings against 28 narrowings: it spent its life
+     * sawtoothing rather than settling. Holding a floor at the last refused width turns that
+     * oscillation into convergence.
+     */
     private void noteCleanHistoricalCall() {
         if (cleanCallStreak.incrementAndGet() < CLEAN_CALLS_BEFORE_NARROWING) return;
         cleanCallStreak.set(0);
         long before = historicalGapMs.get();
-        long after = Math.max(GAP_FLOOR_MS, before - 250);
+        long refused = lastRefusedGapMs.get();
+        long safeFloor = refused > 0 ? Math.min(GAP_CEILING_MS, refused + 250) : GAP_FLOOR_MS;
+        long after = Math.max(Math.max(GAP_FLOOR_MS, safeFloor), before - 250);
         if (after != before) {
             historicalGapMs.set(after);
-            log.info("[Backfill] {} clean calls, speeding candle calls {} ms -> {} ms",
-                CLEAN_CALLS_BEFORE_NARROWING, before, after);
+            log.info("[Backfill] {} clean calls, speeding candle calls {} ms -> {} ms{}",
+                CLEAN_CALLS_BEFORE_NARROWING, before, after,
+                refused > 0 ? " (holding above " + refused + " ms, which was refused)" : "");
         }
     }
 
@@ -1509,12 +1729,13 @@ public class DhanHistoricalBackfillService {
             body.put("interval", normalizeIntradayInterval(interval));
             body.put("fromDate", range.from().atTime(9, 15).format(DHAN_INTRADAY));
             body.put("toDate", range.to().atTime(15, 30).format(DHAN_INTRADAY));
-            return mapper.readTree(http.postJsonWithRetry(DHAN_INTRADAY_URL, headers, body, 30000));
+            // postJson, NOT postJsonWithRetry - see the note on fetchCandlesWithRetry.
+            return mapper.readTree(http.postJson(DHAN_INTRADAY_URL, headers, body, 30000));
         }
         body.put("expiryCode", 0);
         body.put("fromDate", range.from().format(DHAN_DATE));
         body.put("toDate", range.to().plusDays(1).format(DHAN_DATE));
-        return mapper.readTree(http.postJsonWithRetry(DHAN_HISTORICAL_URL, headers, body, 30000));
+        return mapper.readTree(http.postJson(DHAN_HISTORICAL_URL, headers, body, 30000));
     }
 
     private void validateCandleRequest(Instrument instrument, String mode, int interval, DateRange range) {
@@ -1564,20 +1785,12 @@ public class DhanHistoricalBackfillService {
         "open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, volume=EXCLUDED.volume, " +
         "total_volume=EXCLUDED.total_volume, open_interest=EXCLUDED.open_interest, source=EXCLUDED.source, updated_at=EXCLUDED.updated_at";
 
-    private static final String MARKET_DATA_UPSERT_SQL =
-        "INSERT INTO market_data(exchange,symbol,trade_date,open,high,low,close,volume,total_volume,source,segment) VALUES(?,?,?,?,?,?,?,?,?,?,?) " +
-        "ON CONFLICT (exchange, symbol, trade_date) DO UPDATE SET " +
-        "open=EXCLUDED.open, high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close, " +
-        "volume=EXCLUDED.volume, total_volume=EXCLUDED.total_volume, source=EXCLUDED.source, segment=EXCLUDED.segment";
-
     private int saveCandles(Long jobId, Long brokerCredentialId, Instrument instrument, String mode, int interval, JsonNode json) {
         JsonNode timestamps = json.path("timestamp");
         if (!timestamps.isArray() || timestamps.isEmpty()) return 0;
         TransactionTemplate tx = new TransactionTemplate(transactionManager);
         return tx.execute(status -> {
             boolean isDaily = "DAILY".equals(mode);
-            boolean isEquity = "NSE_EQ".equals(instrument.exchangeSegment()) || "BSE_EQ".equals(instrument.exchangeSegment());
-            boolean writeMarketData = isDaily && isEquity;
             int intervalKey = "INTRADAY".equals(mode) ? interval : 0;
             Integer intervalMinutes = "INTRADAY".equals(mode) ? interval : null;
             String dataType = isDaily ? "Daily Bhavcopy (OHLCV)" : "Intraday Candles";
@@ -1587,8 +1800,10 @@ public class DhanHistoricalBackfillService {
             int[] result = {0};
             Session session = em.unwrap(Session.class);
             session.doWork(connection -> {
-                try (PreparedStatement ps2 = connection.prepareStatement(BROKER_CANDLE_UPSERT_SQL);
-                     PreparedStatement ps3 = writeMarketData ? connection.prepareStatement(MARKET_DATA_UPSERT_SQL) : null) {
+                // One store: every candle is written to broker_market_candles and nowhere else.
+                // Each daily equity candle used to be inserted into market_data as well, which is
+                // how that table came to hold a full copy of the daily candles.
+                try (PreparedStatement ps2 = connection.prepareStatement(BROKER_CANDLE_UPSERT_SQL)) {
                     // Dhan sometimes returns the same candle_time twice in one response - now and
                     // then an exact duplicate, now and then the same bar with every price scaled by
                     // ten (seen on AQYLON: 156.79 and 1567.9 both stamped 2026-02-01). Both rows
@@ -1654,30 +1869,13 @@ public class DhanHistoricalBackfillService {
                         ps2.setTimestamp(27, nowTs);
                         ps2.addBatch();
 
-                        if (ps3 != null) {
-                            ps3.setString(1, instrument.exchange());
-                            ps3.setString(2, instrument.symbol());
-                            ps3.setString(3, tradeDate);
-                            ps3.setDouble(4, open);
-                            ps3.setDouble(5, high);
-                            ps3.setDouble(6, low);
-                            ps3.setDouble(7, close);
-                            ps3.setDouble(8, volume);
-                            ps3.setDouble(9, volume);
-                            ps3.setString(10, "DHAN");
-                            ps3.setString(11, instrument.instrument());
-                            ps3.addBatch();
-                        }
-
                         batchCount++;
                         if (batchCount % CANDLE_BATCH_SIZE == 0) {
                             ps2.executeBatch();
-                            if (ps3 != null) ps3.executeBatch();
                         }
                     }
                     if (batchCount % CANDLE_BATCH_SIZE != 0) {
                         ps2.executeBatch();
-                        if (ps3 != null) ps3.executeBatch();
                     }
                     result[0] = batchCount;
                 }
@@ -1803,6 +2001,17 @@ public class DhanHistoricalBackfillService {
         }
     }
 
+    /** How many instruments a selection would match, for explaining an empty result. */
+    private long countInstruments(String exchanges, String segments, String instrumentFilter) {
+        try {
+            Object n = em.createNativeQuery(instrumentSelectionSql(exchanges, segments,
+                instrumentFilter, "SELECT COUNT(*) FROM dhan_instruments")).getSingleResult();
+            return n == null ? 0 : ((Number) n).longValue();
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
     private String instrumentSelectionSql(String exchanges, String segments, String instrumentFilter, String selectClause) {
         String sql = selectClause + " WHERE security_id IS NOT NULL AND security_id<>''";
         sql += " AND COALESCE(underlying_symbol, '')<>''";
@@ -1826,37 +2035,163 @@ public class DhanHistoricalBackfillService {
         return sql;
     }
 
+    /**
+     * Splits a date range into one request per chunk.
+     *
+     * <p>DAILY used to be cut into calendar months, which is what made a wide fetch take hours.
+     * The request count is instruments x chunks and the pace is one request every
+     * {@value #GAP_FLOOR_MS} ms, so the chunk width sets the runtime directly. Measured on job #8
+     * (DAILY, 2026-04-01 to 2026-10-30, 3,222 instruments): 7 months became 7 chunks per
+     * instrument - 22,554 requests, 8,843 of them done in 73.9 minutes, dead on 1.99/s. At one
+     * request per instrument the same fetch is 3,222 requests, about 27 minutes.
+     *
+     * <p>Nothing about the endpoint required months. INTRADAY - which is the narrower of the two,
+     * being capped at 90 days - has always used 89-day windows here; DAILY, the wider one, was
+     * being cut thirty times finer. Month chunking also multiplied the dead requests: of job #8's
+     * 1,115 errors, every one was DH-907 "no data present" or DH-905, spread over 413 instruments
+     * at about 2.7 months each, i.e. the same instrument asked again for each month it has no
+     * data in. One wide request per instrument asks once.
+     *
+     * <p>Width comes from configuration and narrows itself if the broker ever rejects it - see
+     * {@link #currentDailyChunkDays()}. There were no DH-904 rate-limit errors anywhere in job
+     * #8, so the pacing floor is left exactly as it is: this reduces the amount of work, not the
+     * safety margin that stopped the earlier 429 storm.
+     */
     private List<DateRange> chunks(String mode, LocalDate from, LocalDate to) {
         List<DateRange> ranges = new ArrayList<>();
         LocalDate cursor = from;
-        if ("INTRADAY".equals(mode)) {
-            while (!cursor.isAfter(to)) {
-                LocalDate end = cursor.plusDays(89);
-                if (end.isAfter(to)) end = to;
-                ranges.add(new DateRange(cursor, end));
-                cursor = end.plusDays(1);
-            }
-        } else {
-            while (!cursor.isAfter(to)) {
-                LocalDate monthEnd = cursor.withDayOfMonth(cursor.lengthOfMonth());
-                if (monthEnd.isAfter(to)) monthEnd = to;
-                ranges.add(new DateRange(cursor, monthEnd));
-                cursor = monthEnd.plusDays(1);
-            }
+        int span = "INTRADAY".equals(mode) ? 89 : currentDailyChunkDays();
+        while (!cursor.isAfter(to)) {
+            LocalDate end = cursor.plusDays(span - 1);
+            if (end.isAfter(to)) end = to;
+            ranges.add(new DateRange(cursor, end));
+            cursor = end.plusDays(1);
         }
         return ranges;
     }
 
+    /**
+     * Days of history asked of Dhan in one request, and therefore one progress batch.
+     *
+     * <p>90, because that is the widest window this codebase has ever proven Dhan accepts: the
+     * intraday path has used 89-day windows against the same chart endpoints since it was written.
+     * Wider is very likely allowed for daily candles - a 7-month daily request returns about 145
+     * rows - but "likely" is not a basis for the setting, so the default stays at the proven
+     * figure and {@link #noteDailyChunkRejected} makes raising it safe.
+     *
+     * <p>It cannot usefully exceed 90 for INTRADAY, which Dhan caps at 90 days.
+     */
+    @org.springframework.beans.factory.annotation.Value("${dhan.history.batch.days:90}")
+    private int configuredDailyChunkDays;
+
+    /** 0 until first use, then the width in force; only ever decreases within a run. */
+    private final java.util.concurrent.atomic.AtomicInteger dailyChunkDays =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * Consecutive wide-range rejections with no success in between.
+     *
+     * <p>Deliberately not "narrow on the first rejection". DH-905 is also what Dhan returns for an
+     * instrument asked about a period it has no listing for - 108 symbols hit it in job #8 at
+     * month width, where no width question can be involved - so a single rejection says nothing
+     * about the width. A width that is genuinely too wide fails for every instrument, so it shows
+     * up as an unbroken run; anything instrument-specific is interrupted by the successes around
+     * it and resets this.
+     */
+    private final java.util.concurrent.atomic.AtomicInteger consecutiveWideRejections =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    private static final int WIDE_REJECTIONS_BEFORE_NARROWING = 10;
+
+    private int currentDailyChunkDays() {
+        int now = dailyChunkDays.get();
+        if (now > 0) return now;
+        int start = configuredDailyChunkDays > 0 ? configuredDailyChunkDays : 90;
+        dailyChunkDays.compareAndSet(0, start);
+        return dailyChunkDays.get();
+    }
+
+    /** A DAILY chunk came back clean, so the width in force is fine. */
+    private void noteDailyChunkAccepted() {
+        consecutiveWideRejections.set(0);
+    }
+
+    /**
+     * Records a possible width rejection, and steps the width down once enough pile up unbroken.
+     *
+     * <p>The ladder's last rung is 31 days, which is the old month behaviour, so the worst case of
+     * getting this wrong is the speed we had before - never a fetch that cannot run.
+     *
+     * <p>This narrows {@link #chunks}, which the retry path calls per instrument. The main range
+     * backfill fixes its windows once at job start, so a narrowing reaches it on the next run, not
+     * mid-job. At the default 90 nothing here can fire; it exists for a raised setting.
+     */
+    private void noteDailyChunkRejected(DateRange chunk) {
+        int span = (int) (chunk.to().toEpochDay() - chunk.from().toEpochDay()) + 1;
+        if (span <= 90) return;
+        if (consecutiveWideRejections.incrementAndGet() < WIDE_REJECTIONS_BEFORE_NARROWING) return;
+        consecutiveWideRejections.set(0);
+        int before = currentDailyChunkDays();
+        int after = before > 90 ? 90 : 31;
+        if (after >= before) return;
+        if (dailyChunkDays.compareAndSet(before, after)) {
+            log.warn("[Backfill] Dhan rejected {}-day daily windows {} times in a row; narrowing to "
+                   + "{} days for the rest of this run. Set dhan.history.daily.chunk.days to {} to "
+                   + "start there next time.", before, WIDE_REJECTIONS_BEFORE_NARROWING, after, after);
+        }
+    }
+
+    /**
+     * The windows the range backfill fetches, one broker request per instrument per window.
+     *
+     * <p>This, not {@link #chunks}, is what sets the runtime of a Data Warehouse fetch: the main
+     * loop asks Dhan for one window at a time and the pace is one request every
+     * {@value #GAP_FLOOR_MS} ms. It used to cut the range into calendar months, which is why a
+     * wide fetch ran for hours. Job #8 - DAILY, 2026-04-01 to 2026-10-30, 3,222 instruments -
+     * became 3,222 x 7 = 22,554 requests and was measured at 1.99/s, i.e. 3h 09m, all of it
+     * explained by the request count and the pacing floor rather than by the broker being slow.
+     * There was not one DH-904 rate-limit error in the job, so there was no rate problem to
+     * solve; there was simply seven times more asking than the data needed. At 90-day windows the
+     * same fetch is 3 windows per instrument, 9,666 requests, about 81 minutes.
+     *
+     * <p>Month chunking also multiplied the dead requests. All 1,151 of job #8's errors were
+     * DH-907 "no data present" or DH-905, spread across 413 instruments at roughly 2.7 months
+     * each: the same instrument asked again for every month it has nothing in. A wider window
+     * asks once.
+     *
+     * <p>Width is deliberately not unbounded. {@link #hasStoredCandles} decides a window is
+     * already done when 80% of its weekdays are present, so the window is also the resolution at
+     * which Resume detects a gap. At 90 days a wholly missing month inside the window leaves
+     * coverage near 67% and is correctly re-fetched; at a year it would be ~92% and would be
+     * skipped. 90 keeps gap detection honest and is the width Dhan is known to accept.
+     */
     private List<DateRange> monthlyBatches(LocalDate from, LocalDate to) {
         List<DateRange> batches = new ArrayList<>();
+        int span = Math.max(1, currentDailyChunkDays());
         LocalDate cursor = from;
         while (!cursor.isAfter(to)) {
-            LocalDate monthEnd = cursor.withDayOfMonth(cursor.lengthOfMonth());
-            if (monthEnd.isAfter(to)) monthEnd = to;
-            batches.add(new DateRange(cursor, monthEnd));
-            cursor = monthEnd.plusDays(1);
+            LocalDate end = cursor.plusDays(span - 1);
+            if (end.isAfter(to)) end = to;
+            batches.add(new DateRange(cursor, end));
+            cursor = end.plusDays(1);
         }
         return batches;
+    }
+
+    /**
+     * Label for a fetch window, for the batch cards.
+     *
+     * <p>A window is no longer one calendar month, so naming it after its first month alone would
+     * put "APR 2026" on a card covering April to June.
+     */
+    private String windowLabel(DateRange w) {
+        String fromMonth = w.from().getMonth().toString().substring(0, 3);
+        String toMonth = w.to().getMonth().toString().substring(0, 3);
+        int fromYear = w.from().getYear();
+        int toYear = w.to().getYear();
+        if (fromYear == toYear && fromMonth.equals(toMonth)) return fromMonth + " " + fromYear;
+        if (fromYear == toYear) return fromMonth + "-" + toMonth + " " + fromYear;
+        return fromMonth + " " + fromYear + "-" + toMonth + " " + toYear;
     }
 
     private List<Map<String, String>> parseCsv(String csv) {
@@ -1919,6 +2254,106 @@ public class DhanHistoricalBackfillService {
                 .setParameter(8, jobId)
                 .executeUpdate();
         });
+    }
+
+    /**
+     * Releases jobs left marked running by a process that no longer exists.
+     *
+     * <p>A backfill runs on a plain worker thread, so it dies with the JVM - but its row stays
+     * {@code running} in the database. Nothing was reading that row before, so the orphan was
+     * invisible. Now that {@link #refuseIfAnotherJobIsRunning()} treats the row as the truth, an
+     * orphan blocks every subsequent start: on 2026-11-10 job #5 was started at 17:16, the
+     * application was restarted at 17:18, and every attempt afterwards was refused on behalf of a
+     * job whose thread had been gone for minutes. The symptom reads as "the backfill is very
+     * slow" because progress simply stops.
+     *
+     * <p>Waiting for {@link #markStaleJobs(User)} is not enough: it needs
+     * {@value #STALE_JOB_MINUTES} minutes of silence, only runs when somebody tries to start a
+     * backfill, and is scoped to one user. At startup the conclusion is certain and global - no
+     * worker survives a restart - so say so immediately and leave the partial work resumable.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void releaseOrphanedJobsOnStartup() {
+        try {
+            int released = new TransactionTemplate(transactionManager).execute(tx ->
+                em.createNativeQuery(
+                    "UPDATE dhan_historical_jobs SET status='stopped', completed_at=?, updated_at=?, " +
+                    "message='Stopped because the application restarted while this backfill was running. " +
+                    "Press Resume to continue from the last completed batch.' " +
+                    "WHERE status IN ('queued','running','stopping')")
+                    .setParameter(1, DateUtil.now())
+                    .setParameter(2, DateUtil.now())
+                    .executeUpdate());
+            if (released > 0) {
+                log.warn("[Backfill] Released {} backfill job(s) left running by a previous process. "
+                       + "Their worker threads did not survive the restart - press Resume to continue.", released);
+            }
+        } catch (Exception e) {
+            log.warn("[Backfill] Could not release orphaned backfill jobs: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Refuses to start a second backfill while one is already running.
+     *
+     * <p>The only guard used to be an in-memory map in DataController, keyed by user id and set
+     * after the job had already started. It missed two whole routes. {@link StartupSyncService}
+     * calls this method directly, so its two-minute intraday catch-up never saw that map at all;
+     * and the map is cleared by a restart, so a job still running in the database looked idle to
+     * the next request.
+     *
+     * <p>The cost of missing it is not a tidy "two jobs are slower" - Dhan rate-limits per user,
+     * so every extra job makes all of them fail. Observed on 2026-11-10: jobs 2, 3 and 4 running
+     * together with the tracker's own base-price lookups, producing an unbroken wall of DH-904
+     * "Too many requests" and importing nothing. The database row is the one piece of state every
+     * caller shares, so it is what decides.
+     *
+     * <p>Stale rows cannot wedge this shut: {@link #markStaleJobs(User)} runs first and fails any
+     * job that has recorded no progress for {@value #STALE_JOB_MINUTES} minutes.
+     */
+    /**
+     * True while any Dhan historical backfill job is queued, running or stopping.
+     *
+     * <p>Lets a scheduled caller decide not to ask at all, instead of asking every two minutes and
+     * catching the refusal. The refusal itself is right, but it is an exception, and an exception
+     * thrown on a recurring timer reads in the log as a fault when nothing is wrong.
+     */
+    public boolean isAnyJobActive() {
+        try {
+            Object c = em.createNativeQuery(
+                "SELECT COUNT(*) FROM dhan_historical_jobs WHERE status IN ('queued','running','stopping')")
+                .getSingleResult();
+            return c instanceof Number n && n.longValue() > 0;
+        } catch (Exception e) {
+            // Unknown means "do not block" - the same stance refuseIfAnotherJobIsRunning() takes.
+            return false;
+        }
+    }
+
+    private void refuseIfAnotherJobIsRunning() {
+        Object[] active;
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT id, status, COALESCE(processed_chunks,0), COALESCE(total_chunks,0), COALESCE(message,'') " +
+                "FROM dhan_historical_jobs WHERE status IN ('queued','running','stopping') " +
+                "ORDER BY id DESC LIMIT 1").getResultList();
+            active = rows.isEmpty() ? null : rows.get(0);
+        } catch (Exception e) {
+            // Never block a fetch because the guard itself could not run.
+            log.debug("Dhan historical concurrency check skipped: {}", e.getMessage());
+            return;
+        }
+        if (active == null) return;
+        long done = ((Number) active[2]).longValue();
+        long total = ((Number) active[3]).longValue();
+        String progress = total > 0 ? done + " of " + total + " chunks" : done + " chunks";
+        String message = String.valueOf(active[4]);
+        throw new IllegalStateException(
+            "Dhan historical backfill job #" + active[0] + " is still " + active[1] + " (" + progress + ")"
+          + (message.isBlank() ? "" : " - " + message)
+          + ". " + ANOTHER_JOB_RUNNING_MARKER + ": Dhan rate-limits per user, so a second one makes "
+          + "both fail with \"Too many requests\". Wait for it to finish, or press Stop first.");
     }
 
     private void markStaleJobs(User user) {
@@ -1997,6 +2432,38 @@ public class DhanHistoricalBackfillService {
                 .executeUpdate());
     }
 
+    /**
+     * One line per REASON at the end of a job, instead of one line per symbol during it.
+     *
+     * <p>A run across ~3,000 instruments logged hundreds of identical warnings, which read as a
+     * failing job and buried everything else in the file. Grouping them says the same thing in
+     * a form that can actually be acted on: how many, why, and which symbols to look at.
+     */
+    private void logSkipSummary(Long jobId) {
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT COALESCE(error_code,'?'), COUNT(*), " +
+                "       STRING_AGG(symbol, ', ' ORDER BY symbol) " +
+                "FROM dhan_historical_errors WHERE job_id=? GROUP BY 1 ORDER BY 2 DESC")
+                .setParameter(1, jobId).getResultList();
+            if (rows.isEmpty()) {
+                log.info("[Backfill] Job {} finished with no skipped symbols.", jobId);
+                return;
+            }
+            for (Object[] r : rows) {
+                String code = String.valueOf(r[0]);
+                long n = ((Number) r[1]).longValue();
+                String syms = String.valueOf(r[2]);
+                if (syms.length() > 400) syms = syms.substring(0, 400) + " ...";
+                log.info("[Backfill] Job {}: {} symbol(s) skipped - {} | {}",
+                         jobId, n, explainDhanSkip(code, code), syms);
+            }
+        } catch (Exception e) {
+            log.debug("Skip summary unavailable for job {}: {}", jobId, e.getMessage());
+        }
+    }
+
     private Map<String, Object> latestJobById(Long jobId) {
         try {
             @SuppressWarnings("unchecked")
@@ -2012,8 +2479,43 @@ public class DhanHistoricalBackfillService {
         }
     }
 
+    /**
+     * Dhan's error code, in words, with what it means for this fetch.
+     *
+     * <p>The HTTP layer could only ever say "symbol skipped (no data / bad params)" because it
+     * does not know which symbol, which dates, or which of the two very different causes
+     * applied. Both are worth telling apart: DH-907 is routine and self-correcting, DH-905
+     * means the instrument will never return data and the row is dead weight in the upload.
+     */
+    private String explainDhanSkip(String errorCode, String errorMessage) {
+        String code = errorCode == null ? "" : errorCode.trim().toUpperCase(java.util.Locale.ROOT);
+        String body = errorMessage == null ? "" : errorMessage.toLowerCase(java.util.Locale.ROOT);
+        if (code.contains("DH-907") || body.contains("dh-907") || body.contains("no data present")) {
+            return "Dhan holds no candles for this range - the stock did not trade on those "
+                 + "sessions, or is suspended. Nothing to fix; it fills in if it trades again.";
+        }
+        if (code.contains("DH-905") || body.contains("dh-905") || body.contains("missing required fields")) {
+            return "Dhan will not serve this instrument - almost always delisted, or the "
+                 + "security id is no longer valid. It will keep failing until it is removed "
+                 + "from the uploaded list.";
+        }
+        if (code.contains("DH-904") || body.contains("rate") || body.contains("429")) {
+            return "Rate limited by Dhan. The job backs off and retries; no data is lost.";
+        }
+        if (body.contains("401") || body.contains("unauthor") || body.contains("token")) {
+            return "Dhan rejected the credentials - the access token has most likely expired. "
+                 + "Regenerate it in Broker Connect.";
+        }
+        return errorMessage == null || errorMessage.isBlank() ? "No reason returned." : errorMessage;
+    }
+
     private void recordBackfillIssue(Long jobId, Instrument instrument, String mode, int interval, DateRange range,
                                      String status, String errorCode, String errorMessage) {
+        // Named, dated and explained - the generic HTTP line could give none of these.
+        log.debug("[Backfill] {} ({}) {} to {} skipped: {}",
+                  instrument.symbol(), instrument.securityId(),
+                  range == null ? "?" : range.from(), range == null ? "?" : range.to(),
+                  explainDhanSkip(errorCode, errorMessage));
         try {
             DhanRequestLog request = requestLog(instrument, mode, interval, range);
             new TransactionTemplate(transactionManager).executeWithoutResult(tx ->
@@ -2139,10 +2641,17 @@ public class DhanHistoricalBackfillService {
         if ("NFO".equals(v) || "NSE_FNO".equals(v) || "NSE_FO".equals(v)) return "NSE_FNO";
         if ("BFO".equals(v) || "BSE_FNO".equals(v) || "BSE_FO".equals(v)) return "BSE_FNO";
         if ("MCX".equals(v) || "MCX_COMM".equals(v)) return "MCX_COMM";
+        // Index rows arrive from the instrument master as NSE_I / BSE_I (segment_code "I").
+        // Dhan's charts API addresses every index, NSE or BSE, as IDX_I.
+        if ("NSE_I".equals(v) || "BSE_I".equals(v) || "IDX_I".equals(v) || "I".equals(v)) return "IDX_I";
         return v;
     }
 
     private String exchangeFromSegment(String segment) {
+        // Read the raw value first: BSE_I normalizes to IDX_I, which no longer carries the prefix.
+        String raw = norm(segment).replace("-", "_");
+        if (raw.startsWith("BSE")) return "BSE";
+        if (raw.startsWith("MCX")) return "MCX";
         String value = normalizeExchangeSegment(segment);
         if (value.startsWith("BSE")) return "BSE";
         if (value.startsWith("MCX")) return "MCX";
@@ -2186,7 +2695,11 @@ public class DhanHistoricalBackfillService {
         String segment = normalizeExchangeSegment(instrument.exchangeSegment());
         if (!DHAN_EXCHANGE_SEGMENTS.contains(segment)) return false;
         String inst = historicalInstrument(instrument.instrument());
-        return !inst.isBlank() && !"INDEX".equals(inst);
+        if (inst.isBlank()) return false;
+        // Indices used to be rejected here unconditionally because no index segment was
+        // supported. Dhan does serve their candles, but only under IDX_I.
+        if ("INDEX".equals(inst)) return "IDX_I".equals(segment);
+        return true;
     }
 
     private void ensureBackfillAuditSchema() {
@@ -2196,6 +2709,10 @@ public class DhanHistoricalBackfillService {
                 em.createNativeQuery("ALTER TABLE dhan_historical_jobs ADD COLUMN IF NOT EXISTS successful_instruments INTEGER DEFAULT 0").executeUpdate();
                 em.createNativeQuery("ALTER TABLE dhan_historical_jobs ADD COLUMN IF NOT EXISTS failed_instruments INTEGER DEFAULT 0").executeUpdate();
                 em.createNativeQuery("ALTER TABLE dhan_historical_jobs ADD COLUMN IF NOT EXISTS skipped_instruments INTEGER DEFAULT 0").executeUpdate();
+                // Set by Remove Existing Request. The row and its error log stay; it just stops
+                // being the job the Data Warehouse panel reads, so a finished request can be
+                // cleared off the screen without destroying what it recorded.
+                em.createNativeQuery("ALTER TABLE dhan_historical_jobs ADD COLUMN IF NOT EXISTS dismissed SMALLINT DEFAULT 0").executeUpdate();
                 em.createNativeQuery(
                     "CREATE TABLE IF NOT EXISTS dhan_historical_errors (" +
                     "id BIGSERIAL PRIMARY KEY, job_id INTEGER, symbol TEXT, security_id TEXT, exchange_segment TEXT, instrument TEXT, " +
@@ -2226,7 +2743,7 @@ public class DhanHistoricalBackfillService {
         tx.executeWithoutResult(status -> {
             for (int i = 0; i < months.size(); i++) {
                 DateRange m = months.get(i);
-                String monthLabel = m.from().getMonth().toString().substring(0, 3) + " " + m.from().getYear();
+                String monthLabel = windowLabel(m);
                 em.createNativeQuery(
                     "INSERT INTO dhan_backfill_batches(job_id,batch_index,month_label,from_date,to_date,status,created_at) VALUES(?,?,?,?,?,?,?)")
                     .setParameter(1, jobId).setParameter(2, i).setParameter(3, monthLabel)
@@ -2353,6 +2870,17 @@ public class DhanHistoricalBackfillService {
         }
     }
 
+    /**
+     * The single retry layer for candle calls. {@link #fetchCandles} deliberately uses
+     * {@code postJson} rather than {@code postJsonWithRetry}: there used to be two nested retry
+     * loops - 4 HTTP attempts inside 5 of these - so one rate-limited chunk could cost twenty
+     * requests. Worse, the inner loop fired its attempts on its own 1s/2s/4s schedule without
+     * going back through {@link #historicalThrottle()}, so the adaptive gap was bypassed exactly
+     * when it mattered. Measured on 2026-11-10: 330 chunks hit the limit and 506 requests were
+     * spent on them; BOROSCI alone burned 20 requests over two minutes and returned nothing.
+     * Retrying here instead means every failure also widens the gap, which is the response the
+     * API is actually asking for.
+     */
     private JsonNode fetchCandlesWithRetry(Map<String, String> headers, Instrument instrument, String mode, int interval, DateRange range) throws Exception {
         int maxRetries = 5;
         for (int attempt = 1; attempt <= maxRetries; attempt++) {

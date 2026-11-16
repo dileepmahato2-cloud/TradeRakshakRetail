@@ -509,6 +509,7 @@ public class AppConfigService {
 
         // ── Trading Settings ─────────────────────────────────────────────────
         seed("TRADING", "trading.market_open_time", "Market Open Time", "09:15", "STRING", "09:15", null, null, "NSE market open time (HH:MM IST)", ++order, now);
+        seed("TRADING", "sr.indices", "Support/Resistance Indices", "NIFTY,BANKNIFTY,FINNIFTY,NIFTY 500", "STRING", "NIFTY,BANKNIFTY,FINNIFTY,NIFTY 500", null, null, "Comma-separated broker index symbols to publish S&R for, named as Dhan's instrument master names them (NIFTY = Nifty 50). Display names are read from the master.", ++order, now);
         seed("TRADING", "trading.market_close_time", "Market Close Time", "15:30", "STRING", "15:30", null, null, "NSE market close time (HH:MM IST)", ++order, now);
         seed("TRADING", "trading.paper_trading_allowed", "Paper Trading Allowed", "true", "BOOLEAN", "true", null, null, "Allow paper trading simulation", ++order, now);
         seed("TRADING", "trading.live_trading_allowed", "Live Trading Allowed", "false", "BOOLEAN", "false", null, null, "Allow live trading (requires broker)", ++order, now);
@@ -518,6 +519,7 @@ public class AppConfigService {
         seed("TRADING", "trading.default_risk_pct", "Default Risk %", "2.0", "DOUBLE", "2.0", "0.1", "50", "Default risk percentage per trade", ++order, now);
         seed("TRADING", "trading.default_stop_loss_pct", "Default Stop Loss %", "5.0", "DOUBLE", "5.0", "0.1", "50", "Default stop loss percentage", ++order, now);
         seed("TRADING", "trading.default_target_pct", "Default Target %", "10.0", "DOUBLE", "10.0", "0.1", "100", "Default profit target percentage", ++order, now);
+        seed("TRADING", "trading.default_trailing_stop_loss_pct", "Default Trailing Stop Loss %", "2.0", "DOUBLE", "2.0", "0.1", "50", "Default trailing stop loss percentage", ++order, now);
 
         // ── Technical Indicator Settings ──────────────────────────────────────
         seed("INDICATOR", "indicator.rsi.period", "RSI Period", "14", "INTEGER", "14", "2", "100", "Relative Strength Index calculation period", ++order, now);

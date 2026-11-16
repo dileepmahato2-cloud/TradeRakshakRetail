@@ -367,6 +367,136 @@ type DependentSection = {
     </div>
   </div>
 
+  <!-- INDEX MEMBERSHIP - which stocks come under which index -->
+  <div class="panel" style="margin-top:14px; padding:14px;">
+    <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;">
+      <div>
+        <div style="font-weight:800; color:#fff; margin-bottom:4px;">Index Membership</div>
+        <p class="subtle" style="line-height:1.6; max-width:940px;">
+          Which stocks come under which index, taken from NSE&rsquo;s own published constituent lists.
+          A stock can sit in several at once &mdash; NIFTY 500, NIFTY MIDCAP 150 and NIFTY PHARMA together &mdash;
+          so each membership is stored as its own row rather than a column per index.
+          NSE reviews these twice a year; refresh after a rebalance.
+        </p>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button class="btn btn-primary" (click)="refreshIndexMembership()" [disabled]="indexMembershipLoading">
+          {{ indexMembershipLoading ? 'Fetching from NSE...' : 'Fetch Index Membership' }}
+        </button>
+        <button class="btn btn-secondary" (click)="loadIndexMembership()" [disabled]="indexMembershipLoading">Refresh Status</button>
+      </div>
+    </div>
+
+    <!-- Status strip, same shape as the backfill panel above: the headline numbers on one row
+         before any per-item detail. -->
+    <div style="margin-top:12px; display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:8px;">
+      <div class="status-line"><span>Status</span><strong>{{ indexMembershipStatus() }}</strong></div>
+      <div class="status-line"><span>Lists Loaded</span><strong>{{ indexMembershipLoaded.length }} / {{ indexMembershipAvailable.length || 24 }}</strong></div>
+      <div class="status-line"><span>Memberships</span><strong>{{ indexMembershipTotalStocks() | number }}</strong></div>
+      <div class="status-line"><span>Dropped</span><strong>{{ indexMembershipTotalDropped() | number }}</strong></div>
+      <div class="status-line"><span>As On</span><strong>{{ indexMembershipAsOn() }}</strong></div>
+    </div>
+
+    @if (indexMembershipMessage) {
+      <div style="margin-top:10px; font-size:11px;"
+           [style.color]="indexMembershipFailed ? '#f87171' : '#34d399'">{{ indexMembershipMessage }}</div>
+    }
+
+    @if (indexMembershipLoaded.length > 0) {
+      <div style="margin-top:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+          <div style="font-weight:700; color:#fff; font-size:13px;">Index Lists
+            <span class="subtle" style="margin-left:8px;">{{ indexMembershipLoaded.length }} of {{ indexMembershipAvailable.length || 24 }} loaded</span>
+          </div>
+          <button class="btn btn-secondary" style="font-size:10px; padding:3px 8px;" (click)="loadIndexMembership()">Refresh</button>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:10px;">
+          @for (ix of indexMembershipLoaded; track ix.index_key) {
+            <div style="background:#0b1a2d; border:1px solid #203650; border-radius:8px; padding:12px; border-left:3px solid {{ indexBorderColor(ix) }};">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:6px; margin-bottom:6px;">
+                <strong style="color:#fff; font-size:13px;">{{ ix.index_name }}</strong>
+                <span [class]="'badge ' + indexBadgeClass(ix)">{{ ix.stocks > 0 ? 'loaded' : 'empty' }}</span>
+              </div>
+              <div style="font-size:11px; color:#94a3b8; margin-bottom:4px;">as on {{ ix.as_on || '-' }}</div>
+              <div style="display:grid; grid-template-columns:1fr 1fr; gap:4px; font-size:10px; color:#94a3b8; margin-top:4px;">
+                <div title="Stocks currently in this index.">Stocks: <span style="color:#60a5fa;">{{ ix.stocks }}</span></div>
+                <div title="Stocks that were in this index at an earlier refresh and have since dropped out. Kept, not deleted, so a past ranking stays explainable.">Dropped: <span style="color:#fbbf24;">{{ ix.dropped || 0 }}</span></div>
+              </div>
+            </div>
+          }
+        </div>
+      </div>
+    } @else if (!indexMembershipLoading) {
+      <div class="subtle" style="margin-top:12px; font-size:11px;">
+        Nothing loaded yet. Press <strong>Fetch Index Membership</strong> to pull
+        {{ indexMembershipAvailable.length || 24 }} constituent lists from NSE.
+      </div>
+    }
+
+    <!-- Index price history. Separate concern from membership: one is who is in the index,
+         the other is what the index did. -->
+    <div style="margin-top:14px; padding-top:12px; border-top:1px solid #203650;">
+      <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+        <div>
+          <div style="font-weight:700; color:#fff; font-size:12px; margin-bottom:3px;">Index Price History</div>
+          <p class="subtle" style="line-height:1.6; max-width:820px; margin:0;">
+            Daily open/high/low/close for every NSE index, plus P/E, P/B and dividend yield, from
+            NSE&rsquo;s all-index close file &mdash; one request per trading day covers every index
+            at once. Market holidays publish no file and are skipped.
+          </p>
+        </div>
+        <div style="display:flex; gap:8px; align-items:flex-end; flex-wrap:wrap;">
+          <div>
+            <label class="subtle">From</label>
+            <input class="input" type="date" style="max-width:150px;" [(ngModel)]="indexHistoryFrom" [disabled]="indexHistoryLoading">
+          </div>
+          <div>
+            <label class="subtle">To</label>
+            <input class="input" type="date" style="max-width:150px;" [(ngModel)]="indexHistoryTo" [disabled]="indexHistoryLoading">
+          </div>
+          <button class="btn btn-primary" (click)="fetchIndexHistory()" [disabled]="indexHistoryLoading">
+            {{ indexHistoryLoading ? 'Fetching...' : 'Fetch Index History' }}
+          </button>
+        </div>
+      </div>
+
+      @if (indexHistoryCoverage?.rows) {
+        <div style="font-size:11px; color:#94a3b8; margin-top:8px;">
+          Stored: <strong style="color:#60a5fa;">{{ indexHistoryCoverage.rows }}</strong> rows &middot;
+          <strong style="color:#e2e8f0;">{{ indexHistoryCoverage.indices }}</strong> indices &middot;
+          <strong style="color:#e2e8f0;">{{ indexHistoryCoverage.trading_days }}</strong> trading days
+          ({{ indexHistoryCoverage.first_date }} to {{ indexHistoryCoverage.last_date }})
+        </div>
+      } @else if (!indexHistoryLoading) {
+        <div class="subtle" style="font-size:11px; margin-top:8px;">No index history stored yet.</div>
+      }
+      @if (indexHistoryMessage) {
+        <div style="margin-top:8px; font-size:11px;"
+             [style.color]="indexHistoryFailed ? '#f87171' : '#34d399'">{{ indexHistoryMessage }}</div>
+      }
+    </div>
+
+    <!-- Ask about one stock without leaving the screen. -->
+    <div style="display:flex; gap:8px; align-items:center; margin-top:12px; flex-wrap:wrap;">
+      <input class="input" style="max-width:200px;" placeholder="Symbol, e.g. RELIANCE"
+             [(ngModel)]="indexLookupSymbol" (keyup.enter)="lookupIndexesForSymbol()">
+      <button class="btn btn-secondary" (click)="lookupIndexesForSymbol()"
+              [disabled]="!indexLookupSymbol">Which indices?</button>
+      @if (indexLookupDone) {
+        @if (indexLookupResult.length > 0) {
+          <span style="font-size:11px; color:#94a3b8;">
+            {{ indexLookupSymbol.toUpperCase() }} is in:
+            <strong style="color:#e2e8f0;">{{ indexLookupNames }}</strong>
+          </span>
+        } @else {
+          <span style="font-size:11px; color:#fbbf24;">
+            {{ indexLookupSymbol.toUpperCase() }} is not in any loaded index.
+          </span>
+        }
+      }
+    </div>
+  </div>
+
   <div class="panel" style="margin-top:14px; padding:14px;">
     <div style="display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;">
       <div>
@@ -392,10 +522,13 @@ type DependentSection = {
       </div>
       <div>
         <label class="subtle">Mode</label>
-        <select class="select" [(ngModel)]="dhanBackfill.mode" [disabled]="isActivityRunning()">
+        <select class="select" [(ngModel)]="dhanBackfill.mode" [disabled]="isActivityRunning() || isModePinned()">
           <option value="DAILY">Daily OHLCV</option>
           <option value="INTRADAY">Intraday Candles</option>
         </select>
+        @if (isModePinned()) {
+          <div style="margin-top:4px; color:#94a3b8; font-size:10px;">Set by Type of Data.</div>
+        }
       </div>
       <div>
         <label class="subtle">Broker Account</label>
@@ -455,6 +588,9 @@ type DependentSection = {
     <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px;">
       <div class="subtle">
         Fetch Stock List first, then run backfill. Default selects Dhan instruments where exchange is NSE, segment is NSE_EQ, and instrument is ES.
+        @if (dhanSelectionWarning()) {
+          <div style="color:#fbbf24; margin-top:6px;">{{ dhanSelectionWarning() }}</div>
+        }
       </div>
       <div style="display:flex; gap:8px; flex-wrap:wrap;">
         <button class="btn btn-primary" (click)="startDhanBackfill()" [disabled]="isActivityRunning()">Start Backfill</button>
@@ -466,6 +602,8 @@ type DependentSection = {
         <button class="btn btn-secondary" (click)="downloadDhanBackfillErrorLog()" [disabled]="isDhanBackfillRunning()">Download Error Log</button>
         <button class="btn btn-secondary" (click)="retryFailedDhanBackfill()" [disabled]="isActivityRunning()">Retry Failed & Skipped</button>
         <button class="btn btn-danger" (click)="stopDhanBackfill()" [disabled]="!isDhanBackfillRunning()">Stop Backfill</button>
+        <button class="btn btn-secondary" (click)="cleanDhanBackfill()"
+                title="Use when Start Backfill is refused with 'Finish or stop the current activity'. Releases the stuck request. Deletes no history - job records, error logs and skipped symbols are all kept.">Remove Existing Request</button>
       </div>
     </div>
     @if (dhanBackfillJob?.status && dhanBackfillJob.status !== 'idle') {
@@ -517,7 +655,7 @@ type DependentSection = {
                 <div title="Stocks that hit a real error. Use Retry This Batch.">Failed: <span style="color:#f87171;">{{ batch.failedInstruments || 0 }}</span></div>
               </div>
               @if (batch.status === 'failed' || batch.status === 'partially_completed' || batch.status === 'pending' || batch.status === 'stopped') {
-                <button class="btn btn-primary" style="margin-top:8px; padding:4px 10px; font-size:10px; width:100%;" (click)="retryDhanBatch(batch.id)" [disabled]="isDhanBackfillRunning()">{{ batch.status === 'pending' ? 'Run This Month' : 'Retry This Batch' }}</button>
+                <button class="btn btn-primary" style="margin-top:8px; padding:4px 10px; font-size:10px; width:100%;" (click)="retryDhanBatch(batch.id)" [disabled]="isDhanBackfillActive()">{{ batch.status === 'pending' ? 'Run This Month' : 'Retry This Batch' }}</button>
               }
             </div>
           }
@@ -1338,12 +1476,15 @@ export class DataManagementComponent implements OnInit, OnDestroy {
     { value: 'NSE_FNO', label: 'NSE F&O' },
     { value: 'BSE_FNO', label: 'BSE F&O' },
     { value: 'MCX_COMM', label: 'MCX Commodity' },
+    { value: 'NSE_I', label: 'NSE Index (use with Instrument Filter: Index)' },
+    { value: 'BSE_I', label: 'BSE Index (use with Instrument Filter: Index)' },
+    { value: 'NSE_I,BSE_I', label: 'NSE + BSE Index (use with Instrument Filter: Index)' },
     { value: 'ALL', label: 'All Segments' }
   ];
   dhanInstrumentOptions = [
     { value: 'ES', label: 'ES - Equity Stock' },
     { value: 'EQUITY', label: 'Equity' },
-    { value: 'INDEX', label: 'Index' },
+    { value: 'INDEX', label: 'Index (needs segment NSE Index / BSE Index)' },
     { value: 'FUTIDX', label: 'Futures Index' },
     { value: 'FUTSTK', label: 'Futures Stock' },
     { value: 'OPTIDX', label: 'Options Index' },
@@ -1353,26 +1494,38 @@ export class DataManagementComponent implements OnInit, OnDestroy {
     { value: 'ALL', label: 'All Instruments' }
   ];
   dhanBackfillDataType = 'Historical OHLCV';
+  /**
+   * This panel calls one Dhan endpoint family - historical and intraday candles - so only the
+   * three candle types belong in its dropdown. The others were listed as enabled and sent to
+   * the server, which ignored the field entirely: picking Holdings and pressing Start Backfill
+   * downloaded equity candles instead, with nothing on screen to say so. They are marked
+   * unavailable here and rejected server-side, each with the place it is actually fetched from.
+   */
   dhanBackfillDataTypes = [
     { value: 'Historical OHLCV', enabled: true },
     { value: 'Intraday OHLCV', enabled: true },
+    { value: 'Futures Data', enabled: true },
+    { value: 'Instrument Master', enabled: false, reason: 'Use the Fetch Public Stock List button above.' },
+    { value: 'Equity LTP', enabled: false, reason: 'Live prices come from the broker live-price feed, not historical candles.' },
+    { value: 'Holdings', enabled: false, reason: 'Portfolio snapshot - fetch from the Broker section.' },
+    { value: 'Positions', enabled: false, reason: 'Portfolio snapshot - fetch from the Broker section.' },
+    { value: 'Orders', enabled: false, reason: 'Portfolio snapshot - fetch from the Broker section.' },
+    { value: 'Trades', enabled: false, reason: 'Portfolio snapshot - fetch from the Broker section.' },
+    { value: 'Funds / Margin', enabled: false, reason: 'Portfolio snapshot - fetch from the Broker section.' },
     { value: 'Daily Bhavcopy', enabled: false, reason: 'Use manual upload or NSE source.' },
     { value: 'F&O Bhavcopy', enabled: false, reason: 'Use manual upload or NSE source.' },
     { value: 'Option Chain', enabled: false, reason: 'Not available from Dhan API. Use manual upload.' },
-    { value: 'Futures Data', enabled: true },
-    { value: 'Equity LTP', enabled: true },
     { value: 'Index Data', enabled: false, reason: 'Not available from Dhan API. Use manual upload.' },
-    { value: 'Holdings', enabled: true },
-    { value: 'Positions', enabled: true },
-    { value: 'Orders', enabled: true },
-    { value: 'Trades', enabled: true },
-    { value: 'Funds / Margin', enabled: true },
     { value: 'Corporate Actions', enabled: false, reason: 'Not available from Dhan API.' },
-    { value: 'Instrument Master', enabled: true },
     { value: 'FII/DII Data', enabled: false, reason: 'Not available from Dhan API. Use manual upload.' },
     { value: 'Delivery Volume', enabled: false, reason: 'Not available from Dhan API. Use manual upload.' },
     { value: 'Fundamentals', enabled: false, reason: 'Not available from Dhan API. Use manual upload.' },
   ];
+  /** Type of Data values that fix the candle mode, so Mode cannot contradict the selection. */
+  private dhanDataTypeModes: Record<string, string> = {
+    'Historical OHLCV': 'DAILY',
+    'Intraday OHLCV': 'INTRADAY'
+  };
   dhanDataTypeMessage = '';
   private dhanContinuePromptedFor: any = null;
   warehouseTab: 'technical' | 'fundamental' = 'technical';
@@ -1401,6 +1554,8 @@ export class DataManagementComponent implements OnInit, OnDestroy {
         this.loadCleanupSummary();
         this.loadDashboardStats();
         this.loadRecentFetchLogs();
+        this.loadIndexMembership();
+        this.loadIndexHistoryCoverage();
         this.loading.set(false);
       },
       error: () => {
@@ -1856,6 +2011,11 @@ export class DataManagementComponent implements OnInit, OnDestroy {
     return this.dhanBackfillDataTypes.filter(dt => dt.enabled);
   }
 
+  /** True when Type of Data already decides the candle mode, so Mode cannot contradict it. */
+  isModePinned() {
+    return !!this.dhanDataTypeModes[this.dhanBackfillDataType];
+  }
+
   loadCleanupSummary() {
     this.api.get<any>('/data/cleanup/summary').subscribe({
       next: r => this.cleanupSummary = r.data || {},
@@ -2049,13 +2209,23 @@ export class DataManagementComponent implements OnInit, OnDestroy {
 
   startDhanBackfill(continueOnMissingData = false) {
     if (!this.dhanBackfill.brokerCredentialId) {
+      // showModal was false here, so pressing Fetch with no usable broker did nothing at all:
+      // no request, no message, no spinner - the screen simply sat there. The cause is almost
+      // always an expired Dhan access token, because /broker/active only lists connections with
+      // is_verified=1, so an expired one disappears from the dropdown entirely and this guard
+      // fires with nothing on screen to explain why.
       this.activeActivity = {
         status: 'failed',
-        showModal: false,
+        showModal: true,
         activityName: 'Dhan historical OHLCV backfill',
         dataType: 'Dhan Historical Candles',
         source: 'DHAN',
-        message: 'Please connect and verify Dhan broker first. Stock List is public, but Dhan candle backfill needs your access token.'
+        targetTable: 'broker_market_candles',
+        message: 'No verified Dhan connection is available, so nothing was fetched. '
+               + 'A Dhan access token lasts about a day and yours has most likely expired - '
+               + 'saving the same client ID and API key again will not renew it. '
+               + 'Open Broker Connect, use Generate Token with your PIN and TOTP, then Verify. '
+               + 'The Stock List is public and does not need this; candle backfill does.'
       };
       return;
     }
@@ -2083,7 +2253,19 @@ export class DataManagementComponent implements OnInit, OnDestroy {
         };
         this.loadDhanBackfillJob();
       },
-      error: e => this.activeActivity = { ...this.activeActivity, status: 'failed', message: e.error?.message || 'Dhan historical backfill could not be started.' }
+      // Deliberately NOT spreading the previous activity. Doing so left the last completed
+      // run's totals on screen beside a 0% failure - the modal read "Saved 36,501, No data
+      // 4,251, Failed 16" under "Status: Failed", which looks like a run that lost its data
+      // rather than one that never started.
+      error: e => this.activeActivity = {
+        status: 'failed',
+        showModal: true,
+        activityName: 'Dhan historical OHLCV backfill',
+        dataType: 'Dhan Historical Candles',
+        source: 'DHAN',
+        targetTable: 'broker_market_candles',
+        message: this.errorMessage(e, 'Dhan historical backfill could not be started.')
+      }
     });
   }
 
@@ -2091,9 +2273,10 @@ export class DataManagementComponent implements OnInit, OnDestroy {
     this.api.get<any>('/data/dhan/historical-backfill/latest').subscribe({
       next: r => {
         this.dhanBackfillJob = r.data || { status: 'idle' };
+        // Refreshes the batch rows and re-decides polling once they arrive.
         this.loadDhanBatches();
+        this.syncDhanBackfillPolling();
         if (this.isDhanBackfillRunning()) {
-          this.startDhanBackfillPolling();
           this.activeActivity = {
             status: this.dhanBackfillJob.status,
             showModal: this.activeActivity?.showModal !== false,
@@ -2109,7 +2292,6 @@ export class DataManagementComponent implements OnInit, OnDestroy {
             details: this.dhanBackfillJob
           };
         } else {
-          this.stopDhanBackfillPolling();
           if (this.dhanBackfillJob?.status && this.dhanBackfillJob.status !== 'idle') {
             this.activeActivity = {
               status: this.dhanBackfillJob.status,
@@ -2142,6 +2324,35 @@ export class DataManagementComponent implements OnInit, OnDestroy {
         this.activeActivity = { ...this.activeActivity, status: 'stopped', message: 'Dhan historical backfill stopped by user.' };
       },
       error: e => this.activeActivity = { ...this.activeActivity, status: 'failed', message: e.error?.message || 'Dhan historical backfill stop could not be requested.' }
+    });
+  }
+
+  /**
+   * Release a backfill request that can no longer be started.
+   *
+   * Stop needs a live job. This does not - it also clears the server-side activity flag, which
+   * is what refuses a new fetch with "Finish or stop the current activity" long after the job
+   * itself is gone. Deletes no history.
+   */
+  cleanDhanBackfill() {
+    if (!confirm('Remove the existing fetch request? This releases a backfill that will not start. No history is deleted - job records, error logs and skipped symbols are kept.')) return;
+    this.api.post<any>('/data/dhan/historical-backfill/clean', {}).subscribe({
+      next: r => {
+        this.stopDhanBackfillPolling();
+        this.dhanBackfillJob = r.data?.latestJob || this.dhanBackfillJob;
+        this.activeActivity = {
+          status: 'idle',
+          activityName: 'Dhan historical OHLCV backfill',
+          dataType: 'Dhan Historical Candles',
+          source: 'DHAN',
+          message: r.message || 'Backfill request cleared. You can start a new fetch now.'
+        };
+        this.loadDhanBackfillJob();
+      },
+      error: e => this.activeActivity = {
+        status: 'failed',
+        message: e.error?.message || 'The backfill request could not be cleared.'
+      }
     });
   }
 
@@ -2329,8 +2540,40 @@ export class DataManagementComponent implements OnInit, OnDestroy {
     });
   }
 
+  /** The whole-job run. Stop Backfill acts on this, so it stays job-scoped. */
   isDhanBackfillRunning(): boolean {
     return ['queued', 'running'].includes((this.dhanBackfillJob?.status || '').toLowerCase());
+  }
+
+  /** A single month started from "Retry This Batch" / "Run This Month". */
+  isDhanBatchRunning(): boolean {
+    return this.dhanBatches.some(
+      b => ['queued', 'running'].includes(String(b?.status || '').toLowerCase()));
+  }
+
+  /**
+   * Anything at all is fetching, whether that is the whole job or one retried month.
+   *
+   * Retrying a single batch never puts the parent job back to "running" - it updates only
+   * dhan_backfill_batches and starts its own thread. Polling keyed off the job status alone
+   * therefore stopped immediately, and the card sat frozen on its first reading: JAN 2026 showed
+   * RUNNING 0/1214, Candles 0 for the entire run and never moved, even though the batch finished
+   * and imported 24,050 candles. It looked like nothing had been written to the database.
+   *
+   * The grace window covers the gap between asking for a retry and the worker thread flipping
+   * the row to "running" - without it the very next poll would find nothing active and switch
+   * polling straight back off.
+   */
+  isDhanBackfillActive(): boolean {
+    if (this.isDhanBackfillRunning() || this.isDhanBatchRunning()) return true;
+    return this.dhanRetryRequestedAt > 0
+        && (Date.now() - this.dhanRetryRequestedAt) < 60000;
+  }
+
+  /** Poll while anything is fetching, and only while it is. */
+  private syncDhanBackfillPolling(): void {
+    if (this.isDhanBackfillActive()) this.startDhanBackfillPolling();
+    else this.stopDhanBackfillPolling();
   }
 
   dhanBackfillProgressPct(): number {
@@ -2346,15 +2589,171 @@ export class DataManagementComponent implements OnInit, OnDestroy {
       this.dhanDataTypeMessage = (selected as any).reason || 'This data type is not available from Dhan API. Please use manual upload or another source.';
     } else {
       this.dhanDataTypeMessage = '';
-      if (this.dhanBackfillDataType === 'Intraday OHLCV') {
-        this.dhanBackfill.mode = 'INTRADAY';
-      } else if (this.dhanBackfillDataType === 'Futures Data') {
+      if (this.dhanBackfillDataType === 'Futures Data') {
+        // Futures candles need a futures instrument filter; the server rejects the request
+        // otherwise rather than downloading equities under a Futures label.
         this.dhanBackfill.mode = 'DAILY';
         this.dhanBackfill.instrumentFilter = 'FUTSTK';
       } else {
-        this.dhanBackfill.mode = 'DAILY';
+        this.dhanBackfill.mode = this.dhanDataTypeModes[this.dhanBackfillDataType] || 'DAILY';
+        // Switching to Futures forces FUTSTK; switching back used to leave it there, so the next
+        // equity backfill silently asked NSE_EQ for futures and matched nothing. Only the value
+        // this code set is undone - a filter the user chose themselves is left alone.
+        if (this.dhanBackfill.instrumentFilter === 'FUTSTK') this.dhanBackfill.instrumentFilter = 'ES';
       }
     }
+  }
+
+  /**
+   * Segment and Instrument Filter have to agree, and the pairing is not obvious: indices are not
+   * in NSE_EQ, they are their own segment. Asking NSE Equity for INDEX matches nothing, which
+   * came back as a bare "no symbols matched" only after the request had been sent.
+   */
+  dhanSelectionWarning(): string {
+    const seg = String(this.dhanBackfill?.segments || '');
+    const flt = String(this.dhanBackfill?.instrumentFilter || '');
+    const segIsIndex = seg.includes('_I') && !seg.includes('_EQ') && !seg.includes('FNO');
+    if (flt === 'INDEX' && !segIsIndex && seg !== 'ALL') {
+      return 'Indices are not in ' + seg + '. Set Segments to NSE Index (or BSE Index) to fetch '
+           + 'NIFTY, BANKNIFTY, INDIA VIX and the rest.';
+    }
+    if (segIsIndex && flt !== 'INDEX' && flt !== 'ALL') {
+      return 'The index segments hold only indices. Set Instrument Filter to Index.';
+    }
+    if ((flt === 'ES' || flt === 'EQUITY') && segIsIndex) {
+      return 'Equities are not in an index segment. Set Segments to NSE Equity.';
+    }
+    return '';
+  }
+
+  // ---- Index membership ----
+  indexMembershipLoaded: any[] = [];
+  indexMembershipAvailable: any[] = [];
+  indexMembershipLoading = false;
+  indexMembershipMessage = '';
+  indexMembershipFailed = false;
+  indexLookupSymbol = '';
+  indexLookupResult: any[] = [];
+  indexLookupDone = false;
+
+  get indexLookupNames(): string {
+    return this.indexLookupResult.map(r => r.index_name).join(', ');
+  }
+
+  // ---- Index price history ----
+  indexHistoryFrom = '2025-08-01';
+  indexHistoryTo = new Date().toISOString().slice(0, 10);
+  indexHistoryLoading = false;
+  indexHistoryMessage = '';
+  indexHistoryFailed = false;
+  indexHistoryCoverage: any = null;
+
+  loadIndexHistoryCoverage(): void {
+    this.api.get<any>('/data/index-history/coverage').subscribe({
+      next: r => this.indexHistoryCoverage = r?.data || null,
+      error: () => this.indexHistoryCoverage = null
+    });
+  }
+
+  /**
+   * Roughly 250 requests for a year, so this takes a minute or two by nature. The button says so
+   * rather than looking hung, and progress is not lost if it ends early: each day is written as
+   * it arrives, and re-running upserts on (symbol, trade_date) rather than duplicating.
+   */
+  fetchIndexHistory(): void {
+    if (!this.indexHistoryFrom || !this.indexHistoryTo) return;
+    this.indexHistoryLoading = true;
+    this.indexHistoryMessage = '';
+    this.indexHistoryFailed = false;
+    // post() takes only a body, so the range travels on the query string.
+    const qs = 'from=' + encodeURIComponent(this.indexHistoryFrom)
+             + '&to=' + encodeURIComponent(this.indexHistoryTo);
+    this.api.post<any>('/data/index-history/fetch?' + qs, {}).subscribe({
+      next: r => {
+        this.indexHistoryLoading = false;
+        this.indexHistoryFailed = !!(r?.data?.days_failed);
+        this.indexHistoryMessage = r?.data?.message || r?.message || 'Index history updated.';
+        this.loadIndexHistoryCoverage();
+      },
+      error: e => {
+        this.indexHistoryLoading = false;
+        this.indexHistoryFailed = true;
+        this.indexHistoryMessage = this.errorMessage(e, 'Could not fetch index history from NSE.');
+      }
+    });
+  }
+
+  /** Headline status, phrased the way the backfill panel phrases its job status. */
+  indexMembershipStatus(): string {
+    if (this.indexMembershipLoading) return 'running';
+    if (this.indexMembershipFailed) return 'partial';
+    return this.indexMembershipLoaded.length ? 'completed' : 'idle';
+  }
+
+  indexMembershipTotalStocks(): number {
+    return this.indexMembershipLoaded.reduce((s, i) => s + (Number(i?.stocks) || 0), 0);
+  }
+
+  indexMembershipTotalDropped(): number {
+    return this.indexMembershipLoaded.reduce((s, i) => s + (Number(i?.dropped) || 0), 0);
+  }
+
+  /** Most recent refresh date across the loaded lists. */
+  indexMembershipAsOn(): string {
+    const dates = this.indexMembershipLoaded.map(i => String(i?.as_on || '')).filter(d => d);
+    return dates.length ? dates.sort().slice(-1)[0] : '-';
+  }
+
+  indexBorderColor(ix: any): string {
+    return (Number(ix?.stocks) || 0) > 0 ? '#22c55e' : '#64748b';
+  }
+
+  indexBadgeClass(ix: any): string {
+    return (Number(ix?.stocks) || 0) > 0 ? 'badge-green' : 'badge-slate';
+  }
+
+  loadIndexMembership(): void {
+    this.api.get<any>('/data/index-membership').subscribe({
+      next: r => {
+        this.indexMembershipLoaded = r?.data?.loaded || [];
+        this.indexMembershipAvailable = r?.data?.available || [];
+      },
+      error: () => { this.indexMembershipLoaded = []; this.indexMembershipAvailable = []; }
+    });
+  }
+
+  /**
+   * Pulls every constituent list from NSE. Takes a few seconds - roughly two dozen files, each
+   * needing NSE's cookie handshake - so the button reports progress rather than looking dead.
+   */
+  refreshIndexMembership(): void {
+    this.indexMembershipLoading = true;
+    this.indexMembershipMessage = '';
+    this.indexMembershipFailed = false;
+    this.api.post<any>('/data/index-membership/refresh', {}).subscribe({
+      next: r => {
+        this.indexMembershipLoading = false;
+        // Partial success is normal: NSE renames a file now and then, and one missing list
+        // should read as "23 of 24 loaded", not as a failure of the whole refresh.
+        this.indexMembershipFailed = !!(r?.data?.indices_failed);
+        this.indexMembershipMessage = r?.data?.message || r?.message || 'Index membership updated.';
+        this.loadIndexMembership();
+      },
+      error: e => {
+        this.indexMembershipLoading = false;
+        this.indexMembershipFailed = true;
+        this.indexMembershipMessage = this.errorMessage(e, 'Could not fetch index membership from NSE.');
+      }
+    });
+  }
+
+  lookupIndexesForSymbol(): void {
+    const sym = (this.indexLookupSymbol || '').trim();
+    if (!sym) return;
+    this.api.get<any>('/data/index-membership/symbol', { symbol: sym }).subscribe({
+      next: r => { this.indexLookupResult = r?.data || []; this.indexLookupDone = true; },
+      error: () => { this.indexLookupResult = []; this.indexLookupDone = true; }
+    });
   }
 
   canResumeBackfill(): boolean {
@@ -2364,16 +2763,28 @@ export class DataManagementComponent implements OnInit, OnDestroy {
 
   loadDhanBatches() {
     this.api.get<any>('/data/dhan/historical-backfill/batches').subscribe({
-      next: r => this.dhanBatches = (r.data || []).map((b: any) => ({
-        id: b.id, monthLabel: b.month_label || b.monthLabel || '-',
-        fromDate: b.from_date || b.fromDate, toDate: b.to_date || b.toDate,
-        status: b.status || 'pending',
-        totalInstruments: b.total_instruments ?? b.totalInstruments ?? 0,
-        processedInstruments: b.processed_instruments ?? b.processedInstruments ?? 0,
-        importedCandles: b.imported_candles ?? b.importedCandles ?? 0,
-        failedInstruments: b.failed_instruments ?? b.failedInstruments ?? 0,
-        successfulInstruments: b.successful_instruments ?? b.successfulInstruments ?? 0,
-      })),
+      next: r => {
+        this.dhanBatches = (r.data || []).map((b: any) => ({
+          id: b.id, monthLabel: b.month_label || b.monthLabel || '-',
+          fromDate: b.from_date || b.fromDate, toDate: b.to_date || b.toDate,
+          status: b.status || 'pending',
+          totalInstruments: b.total_instruments ?? b.totalInstruments ?? 0,
+          processedInstruments: b.processed_instruments ?? b.processedInstruments ?? 0,
+          importedCandles: b.imported_candles ?? b.importedCandles ?? 0,
+          failedInstruments: b.failed_instruments ?? b.failedInstruments ?? 0,
+          successfulInstruments: b.successful_instruments ?? b.successfulInstruments ?? 0,
+          // The card has always read these three; the mapper never set them, so every batch
+          // reported "No data: 0" however many stocks the broker actually had no history for -
+          // 194 in JUL 2026, 346 in MAR 2026 - and a failed batch showed no reason.
+          skippedInstruments: b.skipped_instruments ?? b.skippedInstruments ?? 0,
+          startedAt: b.started_at ?? b.startedAt ?? null,
+          completedAt: b.completed_at ?? b.completedAt ?? null,
+          errorMessage: b.error_message ?? b.errorMessage ?? null,
+        }));
+        // A batch retry runs without the parent job leaving "completed", so the decision to keep
+        // polling can only be made once the batch rows are in hand.
+        this.syncDhanBackfillPolling();
+      },
       error: () => this.dhanBatches = []
     });
   }
@@ -2390,19 +2801,29 @@ export class DataManagementComponent implements OnInit, OnDestroy {
   resumeDhanBackfill() {
     const outstanding = this.dhanBatches.filter(b => b.status !== 'completed');
     if (!outstanding.length) {
-      this.activeActivity = { ...this.activeActivity, status: 'idle',
+      // Shown, not just recorded. Pressing Resume and getting no response at all reads as a
+      // broken button; "there is nothing left to resume" is a perfectly good answer.
+      this.activeActivity = {
+        ...this.activeActivity, status: 'idle', showModal: true,
+        activityName: 'Dhan historical OHLCV backfill (resume)',
         message: 'Every month in this range is already complete - nothing to resume.' };
       return;
     }
     const from = outstanding.map(b => b.fromDate).filter(Boolean).sort()[0];
     const to = outstanding.map(b => b.toDate).filter(Boolean).sort().slice(-1)[0];
     const job = this.dhanBackfillJob || {};
-    this.activeActivity = {
+    // Assigning activeActivity by hand skipped showModal, so a resumed backfill ran with no
+    // progress window at all - and because normalizeActivity carries showModal forward from the
+    // current activity, every later poll kept it shut too, so it could never appear on its own.
+    // beginActivity is what Start uses; it also stamps startedAt/startedAtMs, which the modal
+    // needs to show elapsed time.
+    this.beginActivity({
       activityName: 'Dhan historical OHLCV backfill (resume)',
-      dataType: 'Dhan Historical Candles', source: 'DHAN',
-      targetTable: 'broker_market_candles', status: 'running',
+      dataType: 'Dhan Historical Candles',
+      source: 'DHAN',
+      targetTable: 'broker_market_candles',
       message: `Resuming ${from} to ${to} (${outstanding.length} month(s) outstanding).`
-    };
+    });
     this.api.post<any>('/data/dhan/historical-backfill', {
       ...this.dhanBackfill,
       mode: job.mode || this.dhanBackfill.mode,
@@ -2419,14 +2840,20 @@ export class DataManagementComponent implements OnInit, OnDestroy {
         this.loadDhanBatches();
       },
       error: e => this.activeActivity = { ...this.activeActivity, status: 'failed',
+        showModal: true,
         message: this.errorMessage(e, 'Could not resume the backfill.') }
     });
   }
 
+  /** Set when a single batch is asked to run - see isDhanBackfillActive(). */
+  private dhanRetryRequestedAt = 0;
+
   retryDhanBatch(batchId: number) {
     this.api.post<any>(`/data/dhan/historical-backfill/batches/${batchId}/retry`, {}).subscribe({
       next: r => {
+        this.dhanRetryRequestedAt = Date.now();
         this.activeActivity = { ...this.activeActivity, status: 'running', message: r.message || 'Batch retry started.' };
+        this.startDhanBackfillPolling();
         this.loadDhanBackfillJob();
       },
       error: e => this.activeActivity = { ...this.activeActivity, status: 'failed', message: this.errorMessage(e, 'Batch retry failed.') }

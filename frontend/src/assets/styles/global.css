@@ -91,3 +91,132 @@
   .section-title { @apply text-2xl font-bold text-white mb-1; }
   .section-sub   { @apply text-sm text-slate-400 mb-6; }
 }
+
+/* ============================================================================
+   Small-screen support
+   ----------------------------------------------------------------------------
+   Deliberately placed after @tailwind utilities so these rules win on equal
+   specificity without !important, except against inline styles, which can only
+   be overridden that way.
+
+   The approach is global rather than per-screen on purpose. The layout problems
+   were systemic - a fixed-width sidebar, flex children that would not shrink,
+   and ~185 grid declarations with a hardcoded column count - so they are fixed
+   once here instead of in 47 components, where they would drift back apart.
+   ========================================================================== */
+
+/* iOS Safari zooms the whole page when a focused field's text is under 16px,
+   and does not zoom back out, which strands the user at 1.3x with the layout
+   off-screen. Raising the field text is the only thing that prevents it. */
+@media (max-width: 767.98px) {
+  input, select, textarea { font-size: 16px; }
+}
+
+/* On touch screens there is no cursor to aim with, so give the hit areas a
+   floor. Keyed to pointer type, not width: a touch laptop deserves this too. */
+@media (hover: none) and (pointer: coarse) {
+  .nav-link { min-height: 40px; }
+  button, [role="button"] { min-height: 36px; }
+}
+
+/* Momentum scrolling for the horizontal wrappers the data tables already sit
+   in. Those wrappers were present all along but could never scroll, because the
+   main column had no min-width:0 and simply widened the page instead. */
+.overflow-x-auto,
+[style*="overflow-x:auto"],
+[style*="overflow-x: auto"] { -webkit-overflow-scrolling: touch; }
+
+/* Reclaim the padding a phone cannot spare. */
+@media (max-width: 639.98px) {
+  .card { padding: 0.75rem; border-radius: 0.5rem; }
+  .section-title { font-size: 1.25rem; line-height: 1.75rem; }
+  .section-sub { margin-bottom: 1rem; }
+}
+
+/* --------------------------------------------------------------------------
+   Grid collapse.
+
+   Grids built with auto-fit/auto-fill + minmax() are already fluid and are
+   deliberately not matched below - they collapse on their own, and overriding
+   them would make the layout worse, not better. Only grids with a hardcoded
+   column count are stepped down, in two stages, so a four-up stat strip
+   becomes two-up on a large phone rather than jumping straight to a column of
+   four tall tiles.
+   -------------------------------------------------------------------------- */
+
+/* Tablet and large phone: anything three-up or wider becomes two-up. */
+@media (max-width: 639.98px) {
+  .grid-cols-3, .grid-cols-4, .grid-cols-5, .grid-cols-6,
+  .grid-cols-7, .grid-cols-8, .grid-cols-9, .grid-cols-10,
+  .grid-cols-11, .grid-cols-12 {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  [style*="grid-template-columns:repeat(3"],
+  [style*="grid-template-columns: repeat(3"],
+  [style*="grid-template-columns:repeat(4"],
+  [style*="grid-template-columns: repeat(4"],
+  [style*="grid-template-columns:repeat(5"],
+  [style*="grid-template-columns: repeat(5"],
+  [style*="grid-template-columns:repeat(6"],
+  [style*="grid-template-columns: repeat(6"] {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  /* Two fixed 320px tracks need 640px before any gap, so this one cannot even
+     fit the viewport it is being asked to render in. */
+  [style*="grid-template-columns:minmax(320px"],
+  [style*="grid-template-columns: minmax(320px"] {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+/* Ordinary phone: a single column throughout. */
+@media (max-width: 429.98px) {
+  .grid-cols-2, .grid-cols-3, .grid-cols-4, .grid-cols-5, .grid-cols-6,
+  .grid-cols-7, .grid-cols-8, .grid-cols-9, .grid-cols-10,
+  .grid-cols-11, .grid-cols-12 {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Matches "1fr 1fr" and "1fr 1fr 1fr" alike - both want collapsing here. */
+  [style*="grid-template-columns:1fr 1fr"],
+  [style*="grid-template-columns: 1fr 1fr"],
+  [style*="grid-template-columns:repeat(2"],
+  [style*="grid-template-columns: repeat(2"],
+  [style*="grid-template-columns:repeat(3"],
+  [style*="grid-template-columns: repeat(3"],
+  [style*="grid-template-columns:repeat(4"],
+  [style*="grid-template-columns: repeat(4"],
+  [style*="grid-template-columns:repeat(5"],
+  [style*="grid-template-columns: repeat(5"],
+  [style*="grid-template-columns:repeat(6"],
+  [style*="grid-template-columns: repeat(6"] {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+}
+
+/* --------------------------------------------------------------------------
+   Make every data table scroll inside its own container.
+
+   Most tables already sit in a div with overflow-x:auto and a min-width that
+   keeps the columns readable - that is the right design and it is left alone.
+   But the wrapper is missing in several places, and three components set
+   table{min-width:820px..1100px} in a component style block with no wrapper at
+   all, so on a phone those tables widened the page itself and every screen
+   scrolled sideways as a whole.
+
+   :has(> table) gives the table's own parent the scroll instead, whatever that
+   parent happens to be, so the fix lands wherever a table actually is rather
+   than only where someone remembered a wrapper. Tables that are already
+   wrapped simply get a property their wrapper already had.
+
+   Preferred over the display:block trick, which makes a table a block box and
+   quietly changes how its columns are sized.
+   -------------------------------------------------------------------------- */
+@media (max-width: 1023.98px) {
+  :has(> table) {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}

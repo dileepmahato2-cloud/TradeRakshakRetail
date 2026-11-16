@@ -721,10 +721,10 @@ public class DataFetchEngine {
             stats.put("totalRows", singleLong("SELECT COALESCE(SUM(rows_imported),0) FROM data_fetch_logs WHERE status = 'completed'"));
             stats.put("lastSync", singleStr("SELECT MAX(created_at) FROM data_fetch_logs WHERE status = 'completed'"));
 
-            stats.put("technicalTables", singleLong("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('market_data','broker_market_candles','broker_delivery_volumes','option_chain','fii_dii_data')"));
+            stats.put("technicalTables", singleLong("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('broker_market_candles','broker_market_candles','broker_delivery_volumes','option_chain','fii_dii_data')"));
             stats.put("fundamentalTables", singleLong("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('broker_fundamentals','broker_corporate_actions')"));
 
-            stats.put("marketDataCount", singleLong("SELECT COUNT(*) FROM market_data"));
+            stats.put("marketDataCount", singleLong("SELECT COUNT(*) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'"));
             stats.put("deliveryCount", singleLong("SELECT COUNT(*) FROM broker_delivery_volumes"));
 
             stats.put("databaseSize", singleStr("SELECT pg_size_pretty(pg_database_size(current_database()))"));
@@ -859,7 +859,7 @@ public class DataFetchEngine {
         try {
             String table = type.contains("delivery") ? "broker_delivery_volumes" :
                            type.contains("f&o") || type.contains("derivative") ? "broker_market_candles" :
-                           "market_data";
+                           "broker_market_candles";
             String dateCol = "trade_date";
             long count = singleLong("SELECT COUNT(*) FROM " + table + " WHERE " + dateCol + " = ?", day.toString());
             return count > 0;

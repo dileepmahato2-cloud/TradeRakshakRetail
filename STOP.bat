@@ -25,7 +25,37 @@ if not defined FOUND (
     exit /b 0
 )
 
-for %%p in (%PIDS%) do taskkill /PID %%p /F >nul 2>&1
+:: Ask the JVM to close before forcing it.
+::
+:: Why this step exists: LiveCandleAggregator keeps the bar it is currently building in memory and
+:: only writes it when the bucket closes. Bars used to be 5 minutes wide, so a taskkill /F cost at
+:: most five minutes of ticks. They are now 60 minutes wide (livecandle.interval.minutes), so a
+:: forced kill at 14:50 throws away the entire 14:15 bar for every tracked symbol. taskkill WITHOUT
+:: /F sends a close request the JVM turns into an orderly shutdown, which runs the @PreDestroy
+:: flush in LiveCandleAggregator and writes the open bars out first.
+::
+:: /F still follows, because a graceful request is a request: a wedged JVM would otherwise leave the
+:: port held and the next build unable to delete the JAR.
+echo Asking TradeRakshak to close and save open candles...
+for %%p in (%PIDS%) do taskkill /PID %%p >nul 2>&1
+
+:: Give the shutdown hook time to finish its write. 15 seconds covers the flush of a full session's
+:: open bars; past that, assume it is not coming back.
+set "CLOSED="
+for /l %%i in (1,1,15) do (
+    if not defined CLOSED (
+        ping -n 2 127.0.0.1 >nul 2>&1
+        call :checkgone
+        if defined GONE set "CLOSED=1"
+    )
+)
+
+if defined CLOSED (
+    echo Closed cleanly - open candles were saved.
+) else (
+    echo  [!] Still running after 15s - forcing it. An in-progress candle may be lost.
+    for %%p in (%PIDS%) do taskkill /PID %%p /F >nul 2>&1
+)
 
 :: Wait for the PROCESS to exit, not just for the port to close. Windows releases
 :: the listening socket before the JVM has finished shutting down, so the old

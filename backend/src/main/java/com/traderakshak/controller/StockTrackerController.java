@@ -58,6 +58,8 @@ public class StockTrackerController {
     private final StockTrackerService trackerService;
     /** Owns the upload pipeline (stage-by-stage progress) that the upload screen polls. */
     private final com.traderakshak.service.StockProcessingService processingService;
+    /** Append-only upload log: Mode A (latest per symbol) and Mode B (as-of / exact date). */
+    private final com.traderakshak.service.StockUploadHistoryService uploadHistory;
 
     @PersistenceContext
     private EntityManager em;
@@ -299,6 +301,32 @@ public class StockTrackerController {
             trackerService.getLatestRankingFull(user.getId(), user.getInstitutionId())));
     }
 
+    @GetMapping("/export/prev-top10")
+    @Operation(summary = "Previous Top 10 as CSV - the on-screen columns, for any past date")
+    public ResponseEntity<byte[]> exportPrevTop10(
+            @RequestParam(required = false) String runDate,
+            @AuthenticationPrincipal User user) {
+        byte[] csv = trackerService.exportPrevTop10Csv(
+            user.getId(), user.getInstitutionId(), runDate);
+        return buildCsvResponse(csv, "TradeRakshak_Previous_Top10_"
+            + (runDate == null || runDate.isBlank() ? today() : runDate) + ".csv");
+    }
+
+    @GetMapping("/export/rsi45-section")
+    @Operation(summary = "The RSI 45 section's stocks, laid out like the ATR Base Price Crossover file")
+    public ResponseEntity<byte[]> exportRsi45Section(
+            @RequestParam(required = false) Double maxPrice,
+            @RequestParam(defaultValue = "true")  boolean requireCrossing,
+            @RequestParam(defaultValue = "false") boolean requireVolume,
+            @RequestParam(defaultValue = "false") boolean applyRanking,
+            @AuthenticationPrincipal User user) {
+        byte[] csv = trackerService.exportRsi45SectionCsv(
+            user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
+            applyRanking);
+        return buildCsvResponse(csv,
+            "TradeRakshak_RSI45_Previous_Close_Less_Base_Price_" + today() + ".csv");
+    }
+
     @GetMapping("/export/chart-trades")
     @Operation(summary = "Every trade behind the chart bars, one row per stock per day, as CSV for Excel")
     public ResponseEntity<byte[]> exportChartTrades(
@@ -327,9 +355,10 @@ public class StockTrackerController {
                        + "and ranking, run against live prices")
     public ResponseEntity<ApiResponse<Map<String, Object>>> provisionalTop10(
             @RequestParam(defaultValue = "true") boolean requireCrossing,
+            @RequestParam(defaultValue = "true") boolean applyRanking,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getProvisionalTop10(
-            user.getId(), user.getInstitutionId(), requireCrossing)));
+            user.getId(), user.getInstitutionId(), requireCrossing, applyRanking)));
     }
 
     @GetMapping("/ranking/below-price-top10")
@@ -340,23 +369,30 @@ public class StockTrackerController {
             // stopped sending one, so removing the control from the UI changed nothing.
             @RequestParam(required = false) Double maxPrice,
             @RequestParam(defaultValue = "true") boolean requireCrossing,
+            @RequestParam(defaultValue = "true") boolean requireVolume,
+            @RequestParam(defaultValue = "true") boolean applyRanking,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getBelowPriceTop10(
-            user.getId(), user.getInstitutionId(), maxPrice, requireCrossing)));
+            user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
+            applyRanking)));
     }
 
     @GetMapping("/ranking/reconstruct-trend")
     @Operation(summary = "Per-day returns for any past range, rebuilt from stored candles "
                        + "(no saved ranking required)")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getReconstructedTrend(
-            @RequestParam String from,
-            @RequestParam String to,
+            // Optional: omitted means "as far back as the stored data supports". The panels used
+            // to hardcode a 30-day window while the database held 301 sessions and an upload
+            // history reaching to January, so most of the chart simply was not being drawn.
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
             @RequestParam(required = false) Double maxPrice,
             @RequestParam(required = false) String buyTime,
             @RequestParam(required = false) String sellTime,
             @RequestParam(required = false) Boolean applyReturnBand,
             @RequestParam(required = false) Boolean requireCrossing,
             @RequestParam(required = false) Boolean capPerSector,
+            @RequestParam(required = false) Boolean applyRanking,
             @AuthenticationPrincipal User user) {
         // All three default OFF, which is the main trend's entry test: Current Price >= Base Price
         // and Current Volume > 20-Day Average Volume, ten picked straight by score. The crossing
@@ -365,9 +401,12 @@ public class StockTrackerController {
         boolean band = applyReturnBand != null ? applyReturnBand : false;
         boolean cross = requireCrossing != null ? requireCrossing : false;
         boolean cap = capPerSector != null ? capPerSector : false;
+        // Defaults to true: every existing caller expects ranked days, and a silent change of
+        // population under an unchanged chart would be the worst kind of quiet.
+        boolean rank = applyRanking != null ? applyRanking : true;
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getReconstructedTrend(
             user.getId(), user.getInstitutionId(), from, to, maxPrice, buyTime, sellTime,
-            band, cross, cap)));
+            band, cross, cap, rank)));
     }
 
     @GetMapping("/ranking/reconstruct-day")
@@ -473,9 +512,31 @@ public class StockTrackerController {
     // ── Eligible Stocks CSV ────────────────────────────────────────────────────
     @GetMapping("/export/eligible")
     @Operation(summary = "Export eligible stocks (price crossing above base, return 0-5%, vol > 20D avg) as CSV")
-    public ResponseEntity<byte[]> exportEligible(@AuthenticationPrincipal User user) {
-        byte[] csv = trackerService.exportEligibleStocksCsv(user.getId(), user.getInstitutionId());
+    public ResponseEntity<byte[]> exportEligible(
+            @RequestParam(defaultValue = "false") boolean requireVolume,
+            @AuthenticationPrincipal User user) {
+        // Volume defaults to reported-not-filtered: with it on, the three price rules selected
+        // nine stocks and volume removed all nine.
+        byte[] csv = trackerService.exportEligibleStocksCsv(
+            user.getId(), user.getInstitutionId(), requireVolume);
         return buildCsvResponse(csv, "TradeRakshak_Eligible_Stocks_" + today() + ".csv");
+    }
+
+    // ── ATR Base Price Crossover CSV ──────────────────────────────────────────
+    @GetMapping("/export/atr-base-crossover")
+    @Operation(summary = "Export first-trigger base price crossovers with ATR% >= threshold, "
+                       + "including the validated stop, target and maximum holding period")
+    public ResponseEntity<byte[]> exportAtrBaseCrossover(
+            @RequestParam(defaultValue = "3.0") double minAtrPct,
+            @RequestParam(defaultValue = "true") boolean requireVolume,
+            @RequestParam(defaultValue = "false") boolean firstTriggerOnly,
+            @AuthenticationPrincipal User user) {
+        // Defaults are the four rules as specified. firstTriggerOnly is available for the
+        // stricter "never tested this level before" variant, but is not the default: it removed
+        // every candidate on the day it was tried.
+        byte[] csv = trackerService.exportAtrBaseCrossoverCsv(
+            user.getId(), user.getInstitutionId(), minAtrPct, requireVolume, firstTriggerOnly);
+        return buildCsvResponse(csv, "TradeRakshak_ATR_Base_Price_Crossover_" + today() + ".csv");
     }
 
     // ── Current Top-10 Ranking CSV ────────────────────────────────────────────
@@ -759,8 +820,8 @@ public class StockTrackerController {
     @GetMapping("/backtest-trend")
     @Operation(summary = "Configurable trend: backtest Top 10 buy@buyTime / sell next day@sellTime using stored intraday prices")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> backtestTrend(
-            @RequestParam(defaultValue = "15:20") String buyTime,
-            @RequestParam(defaultValue = "10:00") String sellTime,
+            @RequestParam(defaultValue = "15:15") String buyTime,
+            @RequestParam(defaultValue = "10:15") String sellTime,
             @RequestParam(defaultValue = "30") int days,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(
@@ -836,6 +897,110 @@ public class StockTrackerController {
             Object r = query.getSingleResult();
             return r != null ? ((Number) r).longValue() : 0;
         } catch (Exception e) { return 0; }
+    }
+
+    // ==========================================================================
+    //  UPLOAD HISTORY — the two data-resolution modes, addressable directly
+    //
+    //  Mode A (/history/latest) is what the current-state screens already get via
+    //  tracked_stocks; it is exposed so a screen can ask for it explicitly.
+    //  Mode B (/history/by-date, /history/as-of) is date-driven and must never be
+    //  substituted for Mode A on a "today" screen, or vice versa.
+    // ==========================================================================
+
+    /** MODE A — each symbol's most recent appearance, whatever date is on screen. */
+    @GetMapping("/history/latest")
+    @Operation(summary = "Latest upload record per symbol (Mode A — current-state screens)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyLatest(
+            @AuthenticationPrincipal User user) {
+        List<Map<String, Object>> rows =
+            uploadHistory.getLatestPerSymbol(user.getId(), user.getInstitutionId());
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "mode", "LATEST", "stocks", rows, "count", rows.size())));
+    }
+
+    /** MODE B — exactly the stocks flagged on one date. */
+    @GetMapping("/history/by-date")
+    @Operation(summary = "Stocks flagged on an exact date (Mode B — Previous Chart by date)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyByDate(
+            @RequestParam String date,
+            @AuthenticationPrincipal User user) {
+        List<Map<String, Object>> rows =
+            uploadHistory.getByDate(date, user.getId(), user.getInstitutionId());
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "mode", "EXACT_DATE", "date", date, "stocks", rows, "count", rows.size())));
+    }
+
+    /** MODE B — the book as it stood on a date: each symbol's latest flag on or before it. */
+    @GetMapping("/history/as-of")
+    @Operation(summary = "Stocks as of a date, latest flag on or before it (Mode B — backtest)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyAsOf(
+            @RequestParam String date,
+            @AuthenticationPrincipal User user) {
+        List<Map<String, Object>> rows =
+            uploadHistory.getAsOfDate(date, user.getId(), user.getInstitutionId());
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "mode", "AS_OF_DATE", "date", date, "stocks", rows, "count", rows.size())));
+    }
+
+    /**
+     * Base price on the flagged date against the latest stored close.
+     * {@code asOf=false} prices only the stocks flagged on that exact date;
+     * {@code asOf=true} prices the whole book as it stood that day.
+     */
+    @GetMapping("/history/backtest")
+    @Operation(summary = "Backtest returns from the flagged date's base price (Mode B)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyBacktest(
+            @RequestParam String date,
+            @RequestParam(defaultValue = "true") boolean asOf,
+            @AuthenticationPrincipal User user) {
+        List<Map<String, Object>> rows = uploadHistory.getBacktestReturns(
+            date, asOf, user.getId(), user.getInstitutionId());
+        double avg = rows.stream().mapToDouble(r -> ((Number) r.get("return_pct")).doubleValue())
+            .average().orElse(0);
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "mode", asOf ? "AS_OF_DATE" : "EXACT_DATE",
+            "date", date, "stocks", rows, "count", rows.size(),
+            "avg_return_pct", Math.round(avg * 100.0) / 100.0)));
+    }
+
+    /** Every appearance of one symbol — the audit view that shows both modes are right. */
+    @GetMapping("/history/symbol/{symbol}")
+    @Operation(summary = "All historical appearances of a symbol, newest first")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyForSymbol(
+            @PathVariable String symbol,
+            @AuthenticationPrincipal User user) {
+        List<Map<String, Object>> rows =
+            uploadHistory.getSymbolHistory(symbol, user.getId(), user.getInstitutionId());
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "symbol", symbol.trim().toUpperCase(),
+            "appearances", rows, "count", rows.size(),
+            "latest_entry_date", rows.isEmpty() ? "" : rows.get(0).get("entry_date"))));
+    }
+
+    /** Signal dates present in the log — populates the historical date picker. */
+    @GetMapping("/history/dates")
+    @Operation(summary = "Distinct signal dates in the upload history, newest first")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyDates(
+            @RequestParam(defaultValue = "365") int limit,
+            @AuthenticationPrincipal User user) {
+        List<String> dates =
+            uploadHistory.getAvailableDates(user.getId(), user.getInstitutionId(), limit);
+        return ResponseEntity.ok(ApiResponse.ok(Map.of("dates", dates, "count", dates.size())));
+    }
+
+    /** Re-derives missing base prices from stored candles, per row's own entry_date. */
+    @PostMapping("/history/backfill-base-prices")
+    @PreAuthorize("hasAnyRole('ADMIN','SUPER_ADMIN')")
+    @Operation(summary = "Backfill upload-history base prices from stored daily candles")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> historyBackfillBasePrices(
+            @AuthenticationPrincipal User user) {
+        int filled = uploadHistory.backfillBasePrices(user.getInstitutionId());
+        return ResponseEntity.ok(ApiResponse.ok(Map.of(
+            "filled", filled,
+            "message", filled > 0
+                ? filled + " history row(s) priced from stored candles."
+                : "No history row needed a base price, or no matching candles are stored yet.")));
     }
 
     // ── Background Job Tracking ─────────────────────────────────────────────

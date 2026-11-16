@@ -243,6 +243,13 @@ public class DhanLivePriceService {
         }
         if (batch.isEmpty()) return;
 
+        // Same lock order as the refresh path's batch upsert in StockTrackerService. pendingQuotes
+        // is a ConcurrentHashMap, so its iteration order varies from flush to flush - which is
+        // precisely how this thread and an HTTP refresh thread ended up taking the same two row
+        // locks in opposite orders and deadlocking on live_price_quotes.
+        batch.sort((a, b2) -> (String.valueOf(a.exchangeSegment()) + '|' + String.valueOf(a.securityId()))
+            .compareTo(String.valueOf(b2.exchangeSegment()) + '|' + String.valueOf(b2.securityId())));
+
         try {
             int changed = withLockRetry("quote flush (" + batch.size() + ")", () -> {
                 TransactionTemplate tx = new TransactionTemplate(transactionManager);

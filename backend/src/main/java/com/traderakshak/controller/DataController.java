@@ -5,6 +5,8 @@ import com.traderakshak.service.DataImportService;
 import com.traderakshak.service.DhanBrokerService;
 import com.traderakshak.service.DhanHistoricalBackfillService;
 import com.traderakshak.service.NseExchangeFetchService;
+import com.traderakshak.service.IndexMembershipService;
+import com.traderakshak.service.IndexHistoryFetchService;
 import com.traderakshak.service.DataFetchEngine;
 import com.traderakshak.util.DateUtil;
 import com.traderakshak.util.UserMessage;
@@ -46,6 +48,8 @@ public class DataController {
     private final DhanBrokerService dhanBrokerService;
     private final DhanHistoricalBackfillService dhanHistoricalBackfillService;
     private final NseExchangeFetchService nseExchangeFetchService;
+    private final IndexMembershipService indexMembershipService;
+    private final IndexHistoryFetchService indexHistoryFetchService;
     private final DataFetchEngine dataFetchEngine;
     private final PlatformTransactionManager transactionManager;
     @PersistenceContext private EntityManager em;
@@ -336,7 +340,23 @@ public class DataController {
             userActivities.put(u.getId(), activity);
             return ResponseEntity.ok(ApiResponse.ok("Dhan historical backfill started.", result));
         } catch (Exception e) {
-            return ResponseEntity.badRequest().body(ApiResponse.error("DHAN-HISTORY", UserMessage.of(e)));
+            // Two faults were hiding here. Nothing was logged, so a failed start left no trace at
+            // all and the cause had to be guessed. And startHistoricalBackfill throws
+            // IllegalStateException with messages written for the user - "Fetch Stock List from
+            // Data Warehouse first", "Nothing to fetch: <date> is not a completed trading day yet",
+            // "No Dhan instruments match exchange ..." - none of which UserMessage recognises, so
+            // every one of them reached the screen as "The action could not be completed." The
+            // reader was told nothing and the log knew nothing.
+            // IllegalStateException here is a refusal written for the reader - "a backfill is
+            // already running", "nothing to fetch for that date", "fetch the Stock List first".
+            // Those are expected answers, not faults, and logging a full stack trace for each one
+            // buries the real failures in 150 lines of Spring filter chain.
+            boolean expected = e instanceof IllegalStateException
+                && e.getMessage() != null && !e.getMessage().isBlank();
+            if (expected) log.warn("Dhan historical backfill not started: {}", e.getMessage());
+            else log.error("Dhan historical backfill start failed", e);
+            String detail = expected ? e.getMessage() : UserMessage.of(e);
+            return ResponseEntity.badRequest().body(ApiResponse.error("DHAN-HISTORY", detail));
         }
     }
 
@@ -366,6 +386,32 @@ public class DataController {
         activity.put("details", job);
         userActivities.put(u.getId(), activity);
         return ResponseEntity.ok(ApiResponse.ok("Dhan historical backfill stopped.", job));
+    }
+
+    /**
+     * Clear a backfill that can no longer be started, deleting nothing.
+     *
+     * <p>Stop needs a live job to act on. The gate below it does not: userActivities is held in
+     * memory, and a start that failed after the activity was marked running leaves it reading
+     * "running" with no job row behind it. Every later fetch is then refused with "Finish or
+     * stop the current activity" before it reaches any backfill code, and only a restart cleared
+     * it. Removing the entry here is the whole point of this endpoint - the database side is
+     * tidy-up around it.
+     */
+    @PostMapping("/dhan/historical-backfill/clean")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> cleanDhanHistoricalBackfill(
+            @AuthenticationPrincipal User u) {
+        Map<String, Object> result = dhanHistoricalBackfillService.cleanBackfillState(u);
+        userActivities.remove(u.getId());
+        result.put("activityCleared", true);
+        int clearedJobs = result.get("clearedJobs") instanceof Number n ? n.intValue() : 0;
+        int dismissed = result.get("dismissedJobs") instanceof Number d ? d.intValue() : 0;
+        String message = "Existing fetch request removed"
+            + (clearedJobs > 0 ? ", " + clearedJobs + " unfinished job(s) stopped" : "")
+            + (dismissed > 0 ? ", " + dismissed + " request(s) cleared from the panel" : "")
+            + ". Nothing was deleted - error logs and skipped symbols are still in the database."
+            + " You can start a new fetch now.";
+        return ResponseEntity.ok(ApiResponse.ok(message, result));
     }
 
     @GetMapping("/dhan/historical-backfill/errors/download")
@@ -650,6 +696,56 @@ public class DataController {
         } catch (Exception e) {
             return ResponseEntity.badRequest().body(ApiResponse.error("DHAN-SKIPPED-RETRY", UserMessage.of(e)));
         }
+    }
+
+    // ---- Index membership: which stocks come under which index ----
+
+    /** Daily index OHLC + P/E + P/B from NSE's all-index close file, one request per day. */
+    @PostMapping("/index-history/fetch")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> fetchIndexHistory(
+            @RequestParam String from, @RequestParam String to) {
+        try {
+            Map<String, Object> r = indexHistoryFetchService.fetchRange(from, to);
+            return ResponseEntity.ok(ApiResponse.ok(String.valueOf(r.get("message")), r));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(
+                ApiResponse.error("INDEX-HISTORY", UserMessage.of(e)));
+        }
+    }
+
+    /** What index history is stored right now. */
+    @GetMapping("/index-history/coverage")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> indexHistoryCoverage() {
+        return ResponseEntity.ok(ApiResponse.ok(indexHistoryFetchService.coverage()));
+    }
+
+    /** Load NSE index constituents into the master data. Pass indexKey to refresh just one. */
+    @PostMapping("/index-membership/refresh")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> refreshIndexMembership(
+            @RequestParam(required = false) String indexKey) {
+        try {
+            Map<String, Object> r = indexMembershipService.refresh(indexKey);
+            return ResponseEntity.ok(ApiResponse.ok(String.valueOf(r.get("message")), r));
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(
+                ApiResponse.error("INDEX-MEMBERSHIP", UserMessage.of(e)));
+        }
+    }
+
+    /** What is loaded per index, plus the full list this loader knows how to fetch. */
+    @GetMapping("/index-membership")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> indexMembership() {
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("loaded", indexMembershipService.summary());
+        out.put("available", indexMembershipService.knownIndices());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /** Which indices one stock belongs to. */
+    @GetMapping("/index-membership/symbol")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> indicesForSymbol(
+            @RequestParam String symbol) {
+        return ResponseEntity.ok(ApiResponse.ok(indexMembershipService.indicesForSymbol(symbol)));
     }
 
     @GetMapping("/dhan/historical-backfill/batches")
@@ -1235,9 +1331,9 @@ public class DataController {
                 "(SELECT COUNT(*) FROM stock_master WHERE UPPER(COALESCE(segment,'Equity'))='EQUITY'), " +
                 "(SELECT COUNT(*) FROM stock_master WHERE exchange='NSE'), " +
                 "(SELECT COUNT(*) FROM stock_master WHERE exchange='BSE'), " +
-                "(SELECT COALESCE(n_live_tup,0) FROM pg_stat_user_tables WHERE relname='market_data'), " +
-                "(SELECT COUNT(DISTINCT symbol) FROM market_data), " +
-                "(SELECT MAX(trade_date) FROM market_data)")
+                "(SELECT COUNT(*) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'), " +
+                "(SELECT COUNT(DISTINCT symbol) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'), " +
+                "(SELECT MAX(trade_date) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY')")
                 .getSingleResult();
             return ResponseEntity.ok(ApiResponse.ok(Map.of(
                 "stocks",    num(r[0]),
@@ -1378,7 +1474,7 @@ public class DataController {
         if (type.contains("option")) return "option_chain";
         if (type.contains("stock list")) return "dhan_instruments / broker_instruments";
         if (type.contains("fundamental")) return "fundamentals";
-        if (type.contains("delivery")) return "market_data / broker_delivery_volumes";
+        if (type.contains("delivery")) return "broker_market_candles / broker_delivery_volumes";
         if (type.contains("corporate")) return "broker_corporate_actions";
         if (type.contains("52w") || type.contains("ath") || type.contains("snapshot")) return "stock_snapshot";
         if (type.contains("daily") || type.contains("bhavcopy") || type.contains("ohlcv") || type.contains("f&o")) return "market_data / broker_market_candles";
@@ -1450,7 +1546,7 @@ public class DataController {
         } catch (Exception e) {
             return List.of(
                 table("stock_master", "Stock Master Table", "stock_master", "Stock symbol master and exchange metadata"),
-                table("market_data", "Market Data Table", "market_data", "Daily OHLCV and market history")
+                table("broker_market_candles", "Market Candles Table", "broker_market_candles", "Daily and intraday OHLCV history")
             );
         }
     }
@@ -1662,7 +1758,7 @@ public class DataController {
             Object[] r = (Object[]) em.createNativeQuery(
                 "SELECT " +
                 "(SELECT COALESCE(n_live_tup,0) FROM pg_stat_user_tables WHERE relname='stock_master'), " +
-                "(SELECT COALESCE(n_live_tup,0) FROM pg_stat_user_tables WHERE relname='market_data'), " +
+                "(SELECT COUNT(*) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'), " +
                 "(SELECT COUNT(*) FROM stock_master WHERE COALESCE(TRIM(symbol),'')=''), " +
                 "(SELECT COALESCE(SUM(cnt-1),0) FROM (SELECT COUNT(*) cnt FROM stock_master GROUP BY UPPER(COALESCE(exchange,'')),UPPER(COALESCE(symbol,'')) HAVING COUNT(*)>1) d), " +
                 "(SELECT COALESCE(n_live_tup,0) FROM pg_stat_user_tables WHERE relname='upload_history'), " +
@@ -1688,7 +1784,7 @@ public class DataController {
             summary.put("lastBackup", r[11] != null ? r[11].toString() : "");
         } catch (Exception e) {
             summary.put("stockMasterRows", q("SELECT COUNT(*) FROM stock_master"));
-            summary.put("marketDataRows", q("SELECT COUNT(*) FROM market_data"));
+            summary.put("marketDataRows", q("SELECT COUNT(*) FROM broker_market_candles WHERE UPPER(COALESCE(candle_mode,''))='DAILY'"));
             summary.put("blankStockSymbols", 0);
             summary.put("duplicateStockMasterRows", 0);
             summary.put("uploadHistoryRows", 0);
@@ -1707,11 +1803,11 @@ public class DataController {
     private List<Map<String, Object>> dependentSections() {
         return List.of(
             dependency("Dashboard", "/dashboard", "market_data, stock_master", "Market mood, stock count, latest market date"),
-            dependency("Backtesting", "/backtesting", "market_data", "Historical close series for strategy testing"),
-            dependency("Stock Ranking", "/ranking", "stock_master, market_data, sector_data", "Universe selection and ranking inputs"),
+            dependency("Backtesting", "/backtesting", "broker_market_candles", "Historical close series for strategy testing"),
+            dependency("Stock Ranking", "/ranking", "stock_master, broker_market_candles, sector_data", "Universe selection and ranking inputs"),
             dependency("Strategy Builder", "/strategy-builder", "stock_master, market_data", "Symbols and latest OHLCV conditions"),
             dependency("Stock Tracker", "/tracker", "stock_master, market_data, tracked_stocks", "CMP fallback, 52W/ATH and ranking support"),
-            dependency("Support / Resistance", "/sr/indices", "market_data, index_data", "Index levels and trend calculations"),
+            dependency("Support / Resistance", "/sr/indices", "broker_market_candles", "Index levels and trend calculations"),
             dependency("Broker / Trading", "/broker, /trading", "broker_credentials, broker_market_candles, broker_portfolio_snapshots", "Broker API data and real-trade readiness")
         );
     }
