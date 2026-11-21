@@ -151,7 +151,16 @@ if not errorlevel 1 (
     start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Process 'http://localhost:%APP_PORT%'" >nul 2>&1
     echo    Opening it in your browser...
     echo.
-    pause
+    :: Wait, but never indefinitely.
+    ::
+    :: This was a bare "pause". Double-clicked that is right - the message needs reading - but
+    :: started from a script or a scheduler, with a console attached and nothing to type into it,
+    :: pause blocks forever: the window sits holding the message while nothing runs, which looks
+    :: exactly like a start that hung. timeout returns on its own, so an unattended start always
+    :: finishes. When stdin is redirected timeout refuses to run at all, and the fallback pause
+    :: reads EOF and returns immediately, which is the behaviour wanted there too.
+    timeout /t 15 /nobreak >nul 2>&1
+    if errorlevel 1 pause
     exit /b 0
 )
 
