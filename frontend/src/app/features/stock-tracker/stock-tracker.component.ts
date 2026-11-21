@@ -2421,6 +2421,344 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
         </div>
       </div>
 
+      <!-- Chart 4: the crossing, with the volume test applied as well. -->
+      <div class="card" style="padding:12px; grid-column:1 / -1;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:8px;">
+          <div style="flex:1 1 420px;">
+            <span style="font-size:13px; font-weight:800; color:#60a5fa;">
+              RSI 45 Previous Close Less the Base Price with Volume
+            </span>
+            <div style="font-size:10px; color:#94a3b8; margin-top:3px;">
+              Entry test: Previous Close &lt; Base Price <strong>and</strong> Current Price &ge; Base Price
+              (the crossing), <strong>and</strong> Current Volume &gt; the average volume of the last
+              20 working days. <strong>No ranking</strong> &mdash; every stock that qualifies is listed,
+              strongest move first. Bought at the closing price and sold at the next trading day's
+              close; when that day is not a working day, the next working day's close.
+            </div>
+          </div>
+
+          <!-- The two headline figures sit on the title line, where they are read first, rather
+               than in a band below the controls. Both are baseline-aligned and use the same
+               label / value / caption shape so the eye can compare them at a glance. -->
+          @if (volTop?.top10?.length) {
+            <div style="display:flex; gap:10px; align-items:stretch; flex-wrap:wrap;">
+              <div style="background:#0f172a; border-radius:6px; padding:6px 14px; min-width:170px;
+                          display:flex; flex-direction:column; justify-content:space-between;">
+                <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px;">Avg Return %</div>
+                <div style="font-size:17px; font-weight:800; line-height:1.2;"
+                     [class]="(volTop.avg_return_current || 0) >= 0 ? 'pos' : 'neg'">
+                  {{ volTop.avg_return_current | number:'1.2-2' }}%
+                </div>
+                <div style="font-size:9px; color:#64748b;">
+                  {{ volTop.count }} stock(s) &middot;
+                  <span style="color:#cbd5e1;" [title]="'Frozen at the ' + volTop.frozen_time + ' cut-off on ' + volTop.frozen_date + '. The list does not change during the current session - only its prices move.'">
+                    frozen {{ volTop.frozen_date }} {{ volTop.frozen_time }}
+                  </span>
+                  @if (volTop.live && volTop.live_priced) {
+                    <span style="color:#22c55e; font-weight:700;">&middot; LIVE</span>
+                  }
+                </div>
+              </div>
+
+              <div style="background:#0f172a; border-radius:6px; padding:6px 14px; min-width:180px;
+                          display:flex; flex-direction:column; justify-content:space-between;">
+                <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px;"
+                     title="Average move of these stocks from the first run of the day to now. Outside market hours 'now' is the last completed close, so the figure settles rather than drifting.">Today Avg Return</div>
+                @if (volTop.avg_return_from_first_run == null) {
+                  <div style="font-size:17px; font-weight:800; color:#94a3b8; line-height:1.2;">&mdash;</div>
+                  <div style="font-size:9px; color:#64748b;">No first-run price stored for today yet</div>
+                } @else {
+                  <div style="font-size:17px; font-weight:800; line-height:1.2;"
+                       [class]="volTop.avg_return_from_first_run >= 0 ? 'pos' : 'neg'">
+                    {{ volTop.avg_return_from_first_run > 0 ? '+' : '' }}{{ volTop.avg_return_from_first_run | number:'1.2-2' }}%
+                  </div>
+                  <div style="font-size:9px; color:#64748b;">
+                    first run &rarr; now &middot; {{ volTop.first_run_priced }} of {{ volTop.count }} priced
+                  </div>
+                }
+              </div>
+
+              <div style="background:#0f172a; border-radius:6px; padding:6px 14px; min-width:200px;
+                          display:flex; flex-direction:column; justify-content:space-between;">
+                <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px;">Trend %</div>
+                @if (volTop.trend_direction === 'NEW') {
+                  <div style="font-size:17px; font-weight:800; color:#94a3b8; line-height:1.2;">&mdash;</div>
+                  <div style="font-size:9px; color:#64748b;">No previous run to compare</div>
+                } @else {
+                  <div style="font-size:17px; font-weight:800; line-height:1.2;"
+                       [style.color]="volTop.trend_direction === 'UP' ? '#22c55e' : volTop.trend_direction === 'DOWN' ? '#ef4444' : '#94a3b8'">
+                    {{ volTop.trend_direction === 'UP' ? '&#8593;' : volTop.trend_direction === 'DOWN' ? '&#8595;' : '&#8594;' }}
+                    {{ volTop.trend_pct > 0 ? '+' : '' }}{{ volTop.trend_pct | number:'1.2-2' }}%
+                    <span style="font-size:11px; font-weight:600;">
+                      {{ volTop.trend_direction === 'UP' ? 'Improving' : volTop.trend_direction === 'DOWN' ? 'Declining' : 'Unchanged' }}
+                    </span>
+                  </div>
+                  <div style="font-size:9px; color:#64748b;">
+                    vs {{ volTop.avg_return_previous | number:'1.2-2' }}% frozen {{ volTop.previous_day }}
+                  </div>
+                }
+              </div>
+            </div>
+          }
+          <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+            <span style="font-size:10px; color:#64748b;">From</span>
+            <input type="date" class="select-sm" [(ngModel)]="volFrom">
+            <span style="font-size:10px; color:#64748b;">To</span>
+            <input type="date" class="select-sm" [(ngModel)]="volTo">
+            <button class="btn-outline" style="font-size:9px; padding:3px 10px;"
+                    (click)="runVolumeTrend()" [disabled]="volRefreshing">
+              @if (volRefreshing) { <span class="spin"></span> Running... } @else { Run }
+            </button>
+            <button class="btn-outline" style="font-size:9px; padding:3px 10px;"
+                    (click)="loadVolumeTop10()" [disabled]="volTopLoading"
+                    title="Re-identify, re-rank and re-signal at the latest available prices">
+              @if (volTopLoading) { <span class="spin"></span> } @else { Refresh Top 10 }
+            </button>
+            <button class="btn-outline" style="font-size:9px; padding:3px 10px;"
+                    (click)="downloadRsi45VolumeSection()"
+                    title="Excel/CSV of exactly the stocks listed below, laid out like the ATR Base Price Crossover file">
+              Download stocks
+            </button>
+          </div>
+        </div>
+
+        <!-- Identify -> Rank -> Buy/Sell, in that order. The list below is the Top 10 that
+             survived identification, scored by the existing engine, with the existing signal. -->
+        @if (volTop?.top10?.length) {
+          <div style="overflow-x:auto; margin-bottom:10px;">
+            <table style="width:100%; border-collapse:collapse; min-width:900px;">
+              <thead>
+                <tr>
+                  <th class="sb-hdr" style="text-align:center;">Rank</th>
+                  <th class="sb-hdr">Symbol</th>
+                  <th class="sb-hdr">Sector</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Price on the day before - must be below the base price">Prev Close</th>
+                  <th class="sb-hdr" style="text-align:right;">Base Price</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Traded price at the cut-off on the day this list was frozen - the price the position was opened at">Entry &#64; {{ volTop?.top10?.[0]?.entry_time || '15:15' }}</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Must be at or above the base price - together with the previous close below it, that is the crossing">Current</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Move since the entry price, not since the base price">Return %</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Traded volume, which had to beat the 20-day average to qualify">Volume</th>
+                  <th class="sb-hdr" style="text-align:right;">20D Avg Vol</th>
+                  <th class="sb-hdr" style="text-align:right;" title="Average True Range over the 14 sessions ending at the previous close">ATR14</th>
+                  <th class="sb-hdr" style="text-align:right;" title="ATR14 as a percentage of the previous close - the same measure the ATR Base Price Crossover screen filters on">ATR %</th>
+                  <th class="sb-hdr" style="text-align:center;" title="From the existing Buy/Sell logic, applied after ranking">Signal</th>
+                  <th class="sb-hdr">Trend</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (r of volTop.top10; track r.symbol) {
+                  <tr>
+                    <td class="sb-cell" style="text-align:center; font-weight:700;"
+                        [style.color]="r.rank === 1 ? '#facc15' : r.rank <= 3 ? '#94a3b8' : '#64748b'">{{ r.rank }}</td>
+                    <td class="sb-cell" style="color:#fff; font-weight:700;">{{ r.symbol }}</td>
+                    <td class="sb-cell" style="color:#cbd5e1;">{{ r.sector || '-' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ r.previous_close | number:'1.2-2' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#cbd5e1;">{{ r.base_price | number:'1.2-2' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#cbd5e1;">{{ r.entry_price | number:'1.2-2' }}</td>
+                    <td class="sb-cell" style="text-align:right; font-weight:600;"
+                        [style.color]="r.is_live ? '#22c55e' : '#fff'"
+                        [title]="r.is_live ? ('Live price. Close on ' + volTop.as_of + ' was ' + (r.close_price | number:'1.2-2')) : 'Closing price'">
+                      {{ r.current_price | number:'1.2-2' }}
+                    </td>
+                    <td class="sb-cell" style="text-align:right;" [class]="(r.return_pct || 0) >= 0 ? 'pos' : 'neg'">{{ r.return_pct | number:'1.2-2' }}%</td>
+                    <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ r.volume | number:'1.0-0' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#64748b;">{{ r.avg_20d_volume | number:'1.0-0' }}</td>
+                    <td class="sb-cell" style="text-align:right; color:#cbd5e1;">{{ r.atr14 ? (r.atr14 | number:'1.2-2') : '-' }}</td>
+                    <td class="sb-cell" style="text-align:right; font-weight:600;"
+                        [style.color]="(r.atr_pct || 0) >= atrHighlightPct ? '#22c55e' : '#94a3b8'"
+                        [title]="(r.atr_pct || 0) >= atrHighlightPct ? 'At or above the ' + atrHighlightPct + '% mark' : 'Below the ' + atrHighlightPct + '% mark'">{{ r.atr_pct ? (r.atr_pct | number:'1.2-2') + '%' : '-' }}</td>
+                    <td class="sb-cell" style="text-align:center;">
+                      <span style="font-weight:800; padding:2px 8px; border-radius:4px;"
+                            [style.color]="r.signal === 'BUY' ? '#22c55e' : r.signal === 'SELL' ? '#ef4444' : '#94a3b8'"
+                            [style.background]="r.signal === 'BUY' ? '#0d2818' : r.signal === 'SELL' ? '#2a0f0f' : '#16202e'"
+                            [title]="r.signal_message || ''">{{ r.signal }}</span>
+                    </td>
+                    <td class="sb-cell"
+                        [style.color]="r.trend === 'Bullish' ? '#22c55e' : r.trend === 'Bearish' ? '#ef4444' : '#94a3b8'">{{ r.trend || '-' }}</td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+          <!-- Heading into tomorrow. Deliberately below the frozen list: the first question is
+               what is currently held, the second is what replaces it. -->
+          @if (volProvisional) {
+            <div style="border:1px dashed #3a4a5f; border-radius:6px; padding:9px 12px; margin-bottom:10px;">
+              <div style="display:flex; align-items:baseline; justify-content:space-between; gap:10px; flex-wrap:wrap; margin-bottom:6px;">
+                <span style="font-size:11px; font-weight:800; color:#facc15;">
+                  Heading into tomorrow &mdash; volProvisional
+                </span>
+                <span style="font-size:9.5px; color:#94a3b8;">
+                  {{ volProvisional.note }}
+                  @if (volProvisional.pool_size) {
+                    <span style="color:#64748b;">&middot; {{ volProvisional.pool_size }} passed the entry test</span>
+                  }
+                </span>
+              </div>
+              @if (volProvisional.stocks?.length) {
+                <div style="overflow-x:auto;">
+                  <table style="width:100%; border-collapse:collapse; min-width:720px;">
+                    <thead>
+                      <tr>
+                        <th class="sb-hdr" style="text-align:center;">Rank</th>
+                        <th class="sb-hdr">Symbol</th>
+                        <th class="sb-hdr">Sector</th>
+                        <th class="sb-hdr" style="text-align:right;">Prev Close</th>
+                        <th class="sb-hdr" style="text-align:right;">Base Price</th>
+                        <th class="sb-hdr" style="text-align:right;">Current</th>
+                        <th class="sb-hdr" style="text-align:right;">Return %</th>
+                        <th class="sb-hdr" style="text-align:right;">Score</th>
+                        <th class="sb-hdr" style="text-align:right;">Weight Used</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      @for (p of volProvisional.stocks; track p.symbol) {
+                        <tr>
+                          <td class="sb-cell" style="text-align:center; font-weight:700; color:#facc15;">{{ p.rank }}</td>
+                          <td class="sb-cell" style="color:#fff; font-weight:700;">{{ p.symbol }}</td>
+                          <td class="sb-cell" style="color:#cbd5e1;">{{ p.sector || '-' }}</td>
+                          <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ p.previous_close | number:'1.2-2' }}</td>
+                          <td class="sb-cell" style="text-align:right; color:#cbd5e1;">{{ p.base_price | number:'1.2-2' }}</td>
+                          <td class="sb-cell" style="text-align:right; color:#fff; font-weight:600;">{{ p.current_price | number:'1.2-2' }}</td>
+                          <td class="sb-cell" style="text-align:right;" [class]="(p.return_pct || 0) >= 0 ? 'pos' : 'neg'">{{ p.return_pct | number:'1.2-2' }}%</td>
+                          <td class="sb-cell" style="text-align:right; color:#60a5fa; font-weight:800;">{{ p.score | number:'1.2-2' }}</td>
+                          <td class="sb-cell" style="text-align:right; color:#e2e8f0;">{{ p.weight_used | number:'1.0-0' }}</td>
+                        </tr>
+                      }
+                    </tbody>
+                  </table>
+                </div>
+              } @else {
+                <div style="font-size:10.5px; color:#94a3b8;">{{ volProvisional.message || 'Nothing meets the entry test right now.' }}</div>
+              }
+            </div>
+          }
+
+          <div style="font-size:9.5px; color:#64748b; margin-bottom:10px;">
+            {{ volTop.pipeline }}
+            @if (volTop.price_basis) { <span style="margin-left:8px;">&middot; {{ volTop.price_basis }}</span> }
+          </div>
+        } @else if (volTopLoading) {
+          <div style="font-size:11px; color:#94a3b8; padding:10px 0;">Identifying and ranking&hellip;</div>
+        } @else if (volTop && !volTop.top10?.length) {
+          <div style="font-size:11px; color:#94a3b8; padding:10px 0;">
+            {{ volTop.message || 'No stock met the entry rules.' }}
+          </div>
+        }
+
+        @if (volResult && volTrend.length) {
+          <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; padding:6px 10px;
+                      margin-bottom:8px; background:#0f172a; border-radius:6px; font-size:11px;">
+            <span style="color:#94a3b8;">{{ volResult.from_date }} &rarr; {{ volResult.to_date }}</span>
+            <span style="color:#94a3b8;">Avg
+              <strong [style.color]="volResult.avg_return >= 0 ? '#22c55e' : '#ef4444'">{{ volResult.avg_return | number:'1.2-2' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;">Days <strong style="color:#e2e8f0;">{{ volResult.days_with_data }}</strong></span>
+            <span style="color:#22c55e;">Up {{ volResult.winning_days }}</span>
+            <span style="color:#ef4444;">Down {{ volResult.losing_days }}</span>
+            @if (volResult.days_skipped) {
+              <span style="color:#f59e0b;" title="Trading days that could not be settled - no next-day close stored yet, or no stock under the price met the entry rules.">Unsettled {{ volResult.days_skipped }}</span>
+            }
+          </div>
+        }
+
+        @if (volTrend.length) {
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Holding period</span>
+            @for (dnum of holdingDayChoices; track dnum) {
+              <button class="btn-outline" style="font-size:10px; padding:4px 11px;"
+                      [style.background]="volHoldingDay === dnum ? '#1d6adb' : 'transparent'"
+                      [style.color]="volHoldingDay === dnum ? '#fff' : '#cbd5e1'"
+                      [style.borderColor]="volHoldingDay === dnum ? '#1d6adb' : '#334155'"
+                      (click)="setVolHoldingDay(dnum)"
+                      [title]="'Return ' + dnum + ' trading day(s) after entry, measured from the entry price'">
+                Day {{ dnum }}
+              </button>
+            }
+          </div>
+
+          <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; padding:6px 10px;
+                      margin-bottom:8px; background:#0f172a; border-radius:6px; font-size:11px;">
+            <span style="color:#94a3b8;">Holding <strong style="color:#e2e8f0;">Day {{ volHoldingDay }}</strong></span>
+            <span style="color:#94a3b8;">Trades <strong style="color:#e2e8f0;">{{ volHoldingStats.trades }}</strong></span>
+            <span style="color:#22c55e;">Win {{ volHoldingStats.wins }}</span>
+            <span style="color:#ef4444;">Loss {{ volHoldingStats.losses }}</span>
+            <span style="color:#94a3b8;">Win Rate
+              <strong [style.color]="volHoldingStats.winRate >= 60 ? '#22c55e' : '#e2e8f0'">{{ volHoldingStats.winRate | number:'1.1-1' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;">Avg
+              <strong [style.color]="volHoldingStats.avg >= 0 ? '#22c55e' : '#ef4444'">{{ volHoldingStats.avg | number:'1.2-2' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;">Median
+              <strong [style.color]="volHoldingStats.median >= 0 ? '#22c55e' : '#ef4444'">{{ volHoldingStats.median | number:'1.2-2' }}%</strong>
+            </span>
+            <span style="color:#94a3b8;" title="Gross profit divided by gross loss across every trade at this holding day">Profit Factor
+              <strong style="color:#e2e8f0;">{{ volHoldingStats.profitFactor == null ? 'no losses' : (volHoldingStats.profitFactor | number:'1.2-2') }}</strong>
+            </span>
+          </div>
+        }
+
+        <div style="display:flex; align-items:flex-end; gap:4px; height:200px; overflow-x:auto; padding-bottom:26px; position:relative;">
+          <div style="position:absolute; bottom:24px; left:0; right:0; height:1px; background:#1e2a3b;"></div>
+          @for (d of volHoldingBars; track d.batch_id) {
+            <div style="display:flex; flex-direction:column; align-items:center; gap:2px; min-width:38px;"
+                 [title]="d.no_stock ? (d.trade_date + ' - no stock met the entry rules' + (d.note ? ': ' + d.note : ''))
+                          : d.is_open ? (d.trade_date + ' - OPEN position, ' + d.open_priced + ' stock(s) valued live. ' + (d.note || ''))
+                          : batchBarTooltip(d)">
+              @if (d.no_stock) {
+                <div style="font-size:7px; font-weight:700; color:#f59e0b; writing-mode:vertical-rl;
+                            text-orientation:mixed; height:64px; display:flex; align-items:flex-end;
+                            justify-content:center; letter-spacing:.3px;">No Stock</div>
+                <div style="width:16px; height:2px; background:#3a4a5f; border-radius:1px;"></div>
+              } @else if (d.is_open) {
+                <div style="font-size:8px; font-weight:700;"
+                     [style.color]="(d.open_return || 0) >= 0 ? '#22c55e' : '#ef4444'">
+                  {{ d.open_return != null ? (d.open_return | number:'1.1-1') : '' }}
+                </div>
+                <!-- Hollow, because it is not a result yet: the position is still running and this
+                     number will keep moving until it settles. -->
+                <div [style.height]="barH(d.open_return || 0, volTrendMax)+'px'"
+                     [style.border]="'1.5px dashed ' + ((d.open_return || 0) >= 0 ? '#22c55e' : '#ef4444')"
+                     style="width:22px; border-radius:2px; background:transparent;"></div>
+                <div style="font-size:6.5px; font-weight:700; color:#facc15; letter-spacing:.2px;">OPEN</div>
+              } @else if (d.day_return == null) {
+                <!-- The trades exist but this holding day has not traded yet. Shown as absent
+                     rather than as 0%, which would read as a flat day that never happened. -->
+                <div style="font-size:7px; font-weight:700; color:#64748b; writing-mode:vertical-rl;
+                            text-orientation:mixed; height:56px; display:flex; align-items:flex-end;
+                            justify-content:center;">Day {{ volHoldingDay }} pending</div>
+                <div style="width:16px; height:2px; background:#3a4a5f; border-radius:1px;"></div>
+              } @else {
+                <div style="font-size:8px; font-weight:700;"
+                     [style.color]="d.day_return >= 0 ? '#22c55e' : '#ef4444'">
+                  {{ d.day_return | number:'1.1-1' }}
+                </div>
+                <div class="bar-chart-bar"
+                     [style.height]="barH(d.day_return, volHoldingMax)+'px'"
+                     [style.background]="d.day_return >= 0 ? '#1d6adb' : '#dc2626'"
+                     [title]="d.trade_date + ' - Day ' + volHoldingDay + ': average of ' + d.day_trades + ' trade(s)'"></div>
+              }
+              <div style="font-size:8.5px; color:#94a3b8; white-space:nowrap; margin-top:7px; width:100%; text-align:center; letter-spacing:-.1px;">
+                {{ formatChartDate(d.trade_date) }}
+              </div>
+            </div>
+          }
+          @if (!volTrend.length && !volRefreshing) {
+            <div style="color:#94a3b8; font-size:11px; padding:18px 20px; width:100%; line-height:1.65;">
+              <div style="font-weight:700; color:#e2e8f0; margin-bottom:6px;">Nothing to show for this basket yet.</div>
+              <div>Pick a date range and press <strong style="color:#cbd5e1;">Run</strong>. Each day is
+              rebuilt from stored prices, keeping the stocks that met the entry rules that day,
+              then measured at the next trading day&rsquo;s sell time.</div>
+            </div>
+          }
+          @if (volRefreshing) {
+            <div style="color:#94a3b8; font-size:11px; padding:20px; width:100%; text-align:center;">
+              Rebuilding each trading day&hellip;
+            </div>
+          }
+        </div>
+      </div>
+
       <!-- Performance Distribution section removed -->
 
       <!-- Download / Export Section -->
@@ -2679,6 +3017,19 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   provisional: any = null;
   lowResult: any = null;
   lowRefreshing = false;
+
+  // "RSI 45 ... with Volume": the same crossing, with the 20-day volume test applied as well.
+  // Separate state rather than a flag on the section above, because both are on screen at once
+  // and each keeps its own window, holding day and results.
+  volFrom = '';
+  volTo = '';
+  volTrend: any[] = [];
+  volTop: any = null;
+  volTopLoading = false;
+  volProvisional: any = null;
+  volResult: any = null;
+  volRefreshing = false;
+  volHoldingDay = 1;
   // Historical Trade Analysis (BUYER / SELLER)
   htaDirection: 'BUY' | 'SELL' = 'BUY';
   htaPrimaryDate = '';
@@ -2864,6 +3215,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       // Keep the crossing-entry panel current too, but only once it has been loaded - refreshing a
       // section the user has never opened would run the whole identify/rank/signal pass for nothing.
       if (this.lowTop && this.dash.market_status === 'OPEN') this.loadBelowPriceTop10();
+      if (this.volTop && this.dash.market_status === 'OPEN') this.loadVolumeTop10();
       if (this.mainTop && this.dash.market_status === 'OPEN') this.loadMainTop10();
     }, 2 * 60 * 1000);
     this.livePrices.connect();
@@ -3045,6 +3397,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     if (!this.lowFrom) this.lowFrom = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
     this.loadBelowPriceTop10();   // crossing panel table
     this.runLowPriceTrend();      // crossing panel bars
+    this.loadVolumeTop10();       // crossing + volume panel table
+    this.runVolumeTrend();        // crossing + volume panel bars
     this.loadMainTop10();         // main trend table + provisional
   }
 
@@ -3481,6 +3835,128 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   readonly holdingDayChoices = [1, 2, 3, 4, 5];
 
   setHoldingDay(d: number): void { this.lowHoldingDay = d; }
+  setVolHoldingDay(d: number): void { this.volHoldingDay = d; }
+
+  get volHoldingBars(): any[] {
+    return (this.volTrend || []).map(d => {
+      const rs = (d.trades || [])
+        .map((t: any) => this.tradeDayReturn(t, this.volHoldingDay))
+        .filter((v: number | null) => v != null) as number[];
+      const avg = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+      return { ...d, day_return: avg, day_trades: rs.length };
+    });
+  }
+
+  get volHoldingMax(): number {
+    const vals = this.volHoldingBars.map(b => Math.abs(b.day_return || 0));
+    return Math.max(0.1, ...vals);
+  }
+
+  get volHoldingStats(): any {
+    const rs: number[] = [];
+    for (const d of this.volTrend || []) {
+      for (const t of (d.trades || [])) {
+        const v = this.tradeDayReturn(t, this.volHoldingDay);
+        if (v != null) rs.push(v);
+      }
+    }
+    if (!rs.length) {
+      return { trades: 0, wins: 0, losses: 0, winRate: 0, avg: 0, median: 0, profitFactor: 0 };
+    }
+    const wins = rs.filter(v => v > 0), losses = rs.filter(v => v <= 0);
+    const gain = wins.reduce((a, b) => a + b, 0);
+    const pain = Math.abs(losses.reduce((a, b) => a + b, 0));
+    const sorted = [...rs].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return {
+      trades: rs.length,
+      wins: wins.length,
+      losses: losses.length,
+      winRate: (wins.length / rs.length) * 100,
+      avg: rs.reduce((a, b) => a + b, 0) / rs.length,
+      median: sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2,
+      profitFactor: pain === 0 ? null : gain / pain
+    };
+  }
+
+  get volTrendMax(): number {
+    const measured = this.volTrend.filter(d => !d.no_stock);
+    return Math.max(0.1, ...measured.map(d => Math.abs(Number(d.avg_return_pct) || 0)));
+  }
+
+  /** Export for the volume-filtered section; same shape as the section above it. */
+  downloadRsi45VolumeSection(): void { this.downloadRsi45Section(); }
+
+  /**
+   * The crossing plus the volume test, priced close-to-close.
+   *
+   * <p>Identical to {@link loadBelowPriceTop10} but with requireVolume=true, so the only
+   * difference between the two sections on screen is the one condition their headings name.
+   */
+  loadVolumeTop10() {
+    if (this.volTopLoading) return;
+    this.volTopLoading = true;
+    this.api.get<any>('/tracker/ranking/provisional-top10',
+                      { requireCrossing: 'true', applyRanking: 'false' }).subscribe({
+      next: r => { this.volProvisional = r?.data || null; },
+      error: () => { this.volProvisional = null; }
+    });
+    this.api.get<any>('/tracker/ranking/below-price-top10',
+                      { requireVolume: 'true', applyRanking: 'false',
+                        priceAtClose: 'true' }).subscribe({
+      next: r => { this.volTop = r?.data || null; this.volTopLoading = false; },
+      error: () => {
+        this.volTop = { top10: [], message: 'Could not build the list. Check that prices are loaded.' };
+        this.volTopLoading = false;
+      }
+    });
+  }
+
+  /** Bars for the volume-filtered section - same population as its table, same pricing. */
+  runVolumeTrend() {
+    if (!this.volTopLoading) this.loadVolumeTop10();
+    if (!this.volTo) this.volTo = new Date().toISOString().slice(0, 10);
+    this.volRefreshing = true;
+    this.api.get<any>('/tracker/ranking/reconstruct-trend', {
+      ...(this.volFrom ? { from: this.volFrom } : {}),
+      to: this.volTo, applyReturnBand: 'false', requireCrossing: 'true',
+      applyRanking: 'false', requireVolume: 'true', priceAtClose: 'true'
+    }).subscribe({
+      next: r => {
+        const d = r?.data || {};
+        if (!this.volFrom && d.coverage_from) this.volFrom = d.coverage_from;
+        this.volTrend = (d.days || [])
+          .map((x: any) => ({
+            no_stock:       x.trade_avg_return == null && x.trade_source !== 'open',
+            is_open:        x.trade_source === 'open',
+            open_return:    x.open_return_pct,
+            open_priced:    x.open_priced,
+            note:           x.note,
+            batch_id:       'VOL-' + x.date,
+            trade_date:     x.date,
+            avg_return_pct: Number(x.trade_avg_return) || 0,
+            winning_stocks: x.trade_winners ?? 0,
+            losing_stocks:  x.trade_losers ?? 0,
+            total_stocks:   x.trade_symbol_count ?? 0,
+            symbols:        x.symbols || [],
+            sell_date:      x.sell_date,
+            trades:         x.priced || [],
+            strategy:       'Top 10'
+          }));
+        this.volResult = {
+          from_date:      this.volFrom,
+          to_date:        this.volTo,
+          avg_return:     d.average_return_pct ?? 0,
+          days_with_data: d.measured_days ?? 0,
+          winning_days:   d.positive_days ?? 0,
+          losing_days:    Math.max(0, (d.measured_days ?? 0) - (d.positive_days ?? 0)),
+          days_skipped:   Math.max(0, (d.trading_days ?? 0) - (d.measured_days ?? 0))
+        };
+        this.volRefreshing = false;
+      },
+      error: () => { this.volTrend = []; this.volResult = null; this.volRefreshing = false; }
+    });
+  }
 
   /** The selected day's return for one trade, or null when that day has not traded yet. */
   private tradeDayReturn(t: any, day: number): number | null {
@@ -3573,7 +4049,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
    * test differs, and it differs in exactly one parameter.
    */
   loadMainTop10() {
-    this.api.get<any>('/tracker/ranking/below-price-top10', { requireCrossing: 'false' }).subscribe({
+    // priceAtClose: bought at the session's closing price and sold at the next trading day's
+    // close, which is what this section states on screen.
+    this.api.get<any>('/tracker/ranking/below-price-top10',
+                      { requireCrossing: 'false', priceAtClose: 'true' }).subscribe({
       next: r => { this.mainTop = r?.data || null; },
       error: () => { this.mainTop = null; }
     });
@@ -3605,7 +4084,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     // applyRanking=false: it is a screen, not a Top 10. Scoring would cut qualifying stocks out
     // of a list whose whole purpose is to show which ones qualify.
     this.api.get<any>('/tracker/ranking/below-price-top10',
-                      { requireVolume: 'false', applyRanking: 'false' }).subscribe({
+                      { requireVolume: 'false', applyRanking: 'false',
+                        priceAtClose: 'true' }).subscribe({
       next: r => { this.lowTop = r?.data || null; this.lowTopLoading = false; },
       error: () => {
         this.lowTop = { top10: [], message: 'Could not build the list. Check that prices are loaded.' };
@@ -3633,8 +4113,12 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       // applyRanking=false so the bars average the same population the table lists. With
       // ranking on, each bar was the average of a ranked ten while the table showed every match.
       ...(this.lowFrom ? { from: this.lowFrom } : {}),
+      // requireVolume=false so the bars average the population this table lists. The endpoint
+      // applied the volume test unconditionally, so these bars were drawn from a filtered basket
+      // under a heading whose table shows every crossing - the same mismatch applyRanking=false
+      // was added to prevent.
       to: this.lowTo, applyReturnBand: 'false', requireCrossing: 'true',
-      applyRanking: 'false'
+      applyRanking: 'false', requireVolume: 'false', priceAtClose: 'true'
     }).subscribe({
       next: r => {
         const d = r?.data || {};
@@ -3694,7 +4178,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
    */
   private loadReconstructedTrend(from: string, to: string) {
     this.trendRefreshing = true;
-    this.api.get<any>('/tracker/ranking/reconstruct-trend', { from, to }).subscribe({
+    this.api.get<any>('/tracker/ranking/reconstruct-trend',
+                      { from, to, priceAtClose: 'true' }).subscribe({
       next: r => {
         const d = r?.data || {};
         const days = (d.days || []).filter((x: any) => x.trade_avg_return != null);

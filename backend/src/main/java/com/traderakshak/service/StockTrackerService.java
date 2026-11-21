@@ -982,6 +982,20 @@ public class StockTrackerService {
                     "AND COALESCE(t.is_deleted,0)=0 " +
                     "AND (t.current_price_date IS NULL OR t.current_price_date='' " +
                     "     OR t.current_price_date < s.trade_date " +
+                    // The daily closing candle is the default stored value, so it also replaces a
+                    // price recorded for its OWN session from any other source.
+                    //
+                    // Without this, an intraday tick permanently outranked the close it should
+                    // have been settled into, because the guard above only fired on a strictly
+                    // newer session. Observed 2026-11-21: 1,255 rows still held a DHAN_WEBSOCKET
+                    // tick taken at 10:12 on 2026-11-16 - mid-session, five days stale, and
+                    // stamped with that date, so no close could ever displace it. 3MINDIA read
+                    // 27,900 from that tick against a 28,070 close. A tick is what the price was
+                    // at one arbitrary moment the feed happened to be running; the close is the
+                    // session's settled figure, and it is what every base price, return and
+                    // ranking in this system is computed from.
+                    "     OR (t.current_price_date = s.trade_date " +
+                    "         AND COALESCE(t.current_price_source,'') <> 'BROKER_DAILY_CLOSE') " +
                     "     OR t.current_price IS NULL OR t.current_price<=0)")
                     .setParameter(1, now)
                     .setParameter(2, now)
@@ -3802,6 +3816,20 @@ public class StockTrackerService {
     public Map<String, Object> getBelowPriceTop10(Long userId, Long institutionId, Double maxPrice,
                                                   boolean requireCrossing, boolean requireVolume,
                                                   boolean applyRanking) {
+        return getBelowPriceTop10(userId, institutionId, maxPrice, requireCrossing, requireVolume,
+                                  applyRanking, false);
+    }
+
+    /**
+     * @param priceAtClose buy at the selection day's closing price and sell at the next trading
+     *        day's closing price, instead of entering at the cut-off and marking to market. The
+     *        exit day is the next session that actually traded, so a weekend or holiday is
+     *        skipped; until that session's close exists the position is still open and is valued
+     *        at the live price, which the row reports as such.
+     */
+    public Map<String, Object> getBelowPriceTop10(Long userId, Long institutionId, Double maxPrice,
+                                                  boolean requireCrossing, boolean requireVolume,
+                                                  boolean applyRanking, boolean priceAtClose) {
         Map<String, Object> out = new LinkedHashMap<>();
         try {
             // As-of date: the newest day that actually has prices. During a session that is today;
@@ -3862,8 +3890,18 @@ public class StockTrackerService {
             // +342%, a number describing the stock's whole history rather than the trade. Measured
             // from the cut-off price it answers the question actually being asked: since this list
             // was frozen and bought, what has it done?
-            Map<String, Double> entryPrices =
-                intradayPricesAt(topSyms, asOf, getTop10LockTime());
+            // Entry: the closing price of the selection day when the section is priced
+            // close-to-close, otherwise the traded price at the cut-off.
+            Map<String, Double> entryPrices = priceAtClose
+                ? closesOn(topSyms, asOf)
+                : intradayPricesAt(topSyms, asOf, getTop10LockTime());
+
+            // Exit: the next trading day's close. provisionalDay is the session after asOf in a
+            // list built from stored sessions, so it is already the next day the market traded.
+            // Empty until that session's close is published, and the position then stays marked
+            // to market rather than being reported as settled at a price that does not exist yet.
+            Map<String, Double> exitCloses = priceAtClose
+                ? closesOn(topSyms, provisionalDay) : Map.of();
 
             // ---- BUY/SELL, applied after ranking, never before ----
             List<Map<String, Object>> rows = new ArrayList<>();
@@ -3874,8 +3912,14 @@ public class StockTrackerService {
                 String symbol = String.valueOf(s.get("symbol"));
                 double price = getD(s, "current_price");
                 double closePrice = price;
+                // A settled exit wins over the live price: once the next session has closed, the
+                // trade is finished and its result stops moving. Only while that close is still
+                // missing is the position marked to market.
+                Double exit = exitCloses.get(normalizeSymbol(symbol));
                 Double lp = livePrices.get(normalizeSymbol(symbol));
-                if (lp != null && lp > 0) { price = lp; livePriced++; }
+                boolean settled = exit != null && exit > 0;
+                if (settled) price = exit;
+                else if (lp != null && lp > 0) { price = lp; livePriced++; }
 
                 Map<String, Object> row = new LinkedHashMap<>();
                 row.put("rank", rank);
@@ -3885,14 +3929,22 @@ public class StockTrackerService {
                 row.put("previous_close", s.get("previous_close"));
                 row.put("current_price", price);
                 row.put("close_price", closePrice);
-                row.put("is_live", lp != null && lp > 0);
+                row.put("is_live", !settled && lp != null && lp > 0);
 
                 // Entry: the cut-off price on the frozen day. Falling back to that day's close keeps
                 // a stock that simply did not print at 15:20 in the list, rather than dropping it.
                 Double entry = entryPrices.get(normalizeSymbol(symbol));
                 if (entry == null || entry <= 0) entry = closePrice;
                 row.put("entry_price", entry > 0 ? Math.round(entry * 100.0) / 100.0 : null);
-                row.put("entry_time", getTop10LockTime());
+                row.put("entry_time", priceAtClose ? "close" : getTop10LockTime());
+                if (priceAtClose) {
+                    // Say which two prints the return was measured between, so a row can be
+                    // checked rather than taken on trust.
+                    row.put("buy_date", asOf);
+                    row.put("sell_date", settled ? provisionalDay : null);
+                    row.put("sell_price", settled ? Math.round(price * 100.0) / 100.0 : null);
+                    row.put("settled", settled);
+                }
 
                 // Return since entry, computed from whatever price is actually displayed so the two
                 // can never disagree on screen.
@@ -4444,8 +4496,37 @@ public class StockTrackerService {
                                                      boolean requireCrossing,
                                                      boolean capPerSector,
                                                      boolean applyRanking) {
-        final String bt = (buyTime  == null || buyTime.isBlank())  ? getTradeBuyTime()  : buyTime;
-        final String st = (sellTime == null || sellTime.isBlank()) ? getTradeSellTime() : sellTime;
+        // The volume test was hardcoded true here while the table that this chart sits under
+        // passes it through. The RSI 45 section asks for requireVolume=false, so its bars were
+        // the average of a volume-filtered basket under a heading whose table listed every
+        // crossing - the same two-populations-one-heading problem applyRanking was added to stop.
+        return getReconstructedTrend(userId, institutionId, from, to, maxPrice, buyTime, sellTime,
+                                     applyReturnBand, requireCrossing, capPerSector, applyRanking,
+                                     true, false);
+    }
+
+    /**
+     * @param requireVolume keep "Current Volume &gt; 20-Day Average Volume" in the entry test, so
+     *        the bars average the same population the section's table lists.
+     * @param priceAtClose  price the trade close-to-close instead of at the configured intraday
+     *        times: bought at the ranking day's closing price and sold at the closing price of the
+     *        next trading day. "The next day" is the next day the market actually traded - the day
+     *        list this walks is built from sessions with stored data, so a weekend or a holiday is
+     *        skipped without any special case.
+     */
+    public Map<String, Object> getReconstructedTrend(Long userId, Long institutionId,
+                                                     String from, String to, Double maxPrice,
+                                                     String buyTime, String sellTime,
+                                                     boolean applyReturnBand,
+                                                     boolean requireCrossing,
+                                                     boolean capPerSector,
+                                                     boolean applyRanking,
+                                                     boolean requireVolume,
+                                                     boolean priceAtClose) {
+        final String bt = priceAtClose ? "close"
+            : (buyTime  == null || buyTime.isBlank())  ? getTradeBuyTime()  : buyTime;
+        final String st = priceAtClose ? "close"
+            : (sellTime == null || sellTime.isBlank()) ? getTradeSellTime() : sellTime;
         Map<String, Object> out = new LinkedHashMap<>();
         List<Map<String, Object>> bars = new ArrayList<>();
         // No range given means the whole of what can honestly be rebuilt.
@@ -4518,15 +4599,17 @@ public class StockTrackerService {
             //
             // Only settled days are stored. The newest day is an open position valued at the
             // live price and must be recomputed every time, so it never enters this map.
+            // requireVolume and priceAtClose belong in the key: both change the number this
+            // computes, and a settled day cached under one would otherwise be served to the other.
             String dayKey = userId + "|" + institutionId + "|" + day + "|" + next + "|" + bt + "|"
                 + st + "|" + maxPrice + "|" + applyReturnBand + "|" + requireCrossing + "|"
-                + capPerSector + "|" + applyRanking;
+                + capPerSector + "|" + applyRanking + "|" + requireVolume + "|" + priceAtClose;
             Map<String, Object> cached = settledDayCache.get(dayKey);
             if (cached != null) { bars.add(cached); reused++; continue; }
 
             List<Map<String, Object>> top = reconstructTop10AsOf(
                 userId, institutionId, day, maxPrice, applyReturnBand, requireCrossing,
-                capPerSector, true, applyRanking);
+                capPerSector, requireVolume, applyRanking);
             Map<String, Object> bar = new LinkedHashMap<>();
             bar.put("date", day);
             bar.put("stocks_ranked", top.size());
@@ -4563,7 +4646,8 @@ public class StockTrackerService {
                 // it indistinguishable from a day on which nothing qualified - the two could not be
                 // further apart. Value it at the market instead, so the bar moves with the position.
                 Map<String, Double> nowPrices = resolveCurrentPricesBatch(syms, institutionId);
-                Map<String, Double> openBuys = intradayPricesAt(syms, day, bt);
+                Map<String, Double> openBuys = priceAtClose
+                    ? closesOn(syms, day) : intradayPricesAt(syms, day, bt);
                 double s2 = 0;
                 int m = 0, up = 0, down = 0;
                 for (Map<String, Object> s : top) {
@@ -4591,11 +4675,21 @@ public class StockTrackerService {
                 continue;
             }
 
-            // Trade at the configured times, not at closes: the position is opened at the 15:20
-            // lock on the ranking day and closed at 15:15 the next trading day. Falling back to a
-            // close would quietly measure a different trade from the one the strategy makes.
-            Map<String, Double> buyPrices  = intradayPricesAt(syms, day,  bt);
-            Map<String, Double> sellPrices = intradayPricesAt(syms, next, st);
+            // Two pricing bases, chosen by the caller, never mixed within one chart.
+            //
+            // priceAtClose: bought at the ranking day's closing price, sold at the next trading
+            // day's closing price. `next` already is the next day the market traded, because the
+            // loop walks sessions with stored data rather than calendar days - a weekend or a
+            // holiday is skipped with no special case for it.
+            //
+            // Otherwise the configured intraday times, which is what the Ranking Chart Bar
+            // measures: opened at the lock on the ranking day and closed the next trading day.
+            // Falling back between the two would quietly measure a different trade from the one
+            // the section says it is showing.
+            Map<String, Double> buyPrices  = priceAtClose
+                ? closesOn(syms, day)  : intradayPricesAt(syms, day,  bt);
+            Map<String, Double> sellPrices = priceAtClose
+                ? closesOn(syms, next) : intradayPricesAt(syms, next, st);
             double sum = 0;
             int n = 0, win = 0, loss = 0;
             // Per-stock detail, so a day's number can be taken apart rather than trusted. Each row

@@ -371,10 +371,13 @@ public class StockTrackerController {
             @RequestParam(defaultValue = "true") boolean requireCrossing,
             @RequestParam(defaultValue = "true") boolean requireVolume,
             @RequestParam(defaultValue = "true") boolean applyRanking,
+            // Default OFF so nothing that already calls this changes basis underneath it. The
+            // sections that state a close-to-close rule on screen pass it explicitly.
+            @RequestParam(defaultValue = "false") boolean priceAtClose,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getBelowPriceTop10(
             user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
-            applyRanking)));
+            applyRanking, priceAtClose)));
     }
 
     @GetMapping("/ranking/reconstruct-trend")
@@ -393,6 +396,8 @@ public class StockTrackerController {
             @RequestParam(required = false) Boolean requireCrossing,
             @RequestParam(required = false) Boolean capPerSector,
             @RequestParam(required = false) Boolean applyRanking,
+            @RequestParam(required = false) Boolean requireVolume,
+            @RequestParam(required = false) Boolean priceAtClose,
             @AuthenticationPrincipal User user) {
         // All three default OFF, which is the main trend's entry test: Current Price >= Base Price
         // and Current Volume > 20-Day Average Volume, ten picked straight by score. The crossing
@@ -404,9 +409,15 @@ public class StockTrackerController {
         // Defaults to true: every existing caller expects ranked days, and a silent change of
         // population under an unchanged chart would be the worst kind of quiet.
         boolean rank = applyRanking != null ? applyRanking : true;
+        // Volume defaults to true, which is what this endpoint has always applied. It is now
+        // selectable so a section whose table does not filter on volume can have bars drawn from
+        // the same population its table lists.
+        boolean vol = requireVolume != null ? requireVolume : true;
+        // Close-to-close pricing, off unless asked for, so existing charts keep their basis.
+        boolean atClose = priceAtClose != null ? priceAtClose : false;
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getReconstructedTrend(
             user.getId(), user.getInstitutionId(), from, to, maxPrice, buyTime, sellTime,
-            band, cross, cap, rank)));
+            band, cross, cap, rank, vol, atClose)));
     }
 
     @GetMapping("/ranking/reconstruct-day")
