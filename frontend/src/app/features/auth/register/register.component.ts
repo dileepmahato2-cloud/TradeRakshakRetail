@@ -94,7 +94,7 @@ export class RegisterComponent {
     this.auth.register({ ...this.form, pan: this.form.pan.toUpperCase() }).subscribe({
       next: res => {
         this.success.set('Registration successful! Redirecting…');
-        setTimeout(() => this.router.navigate(['/dashboard']), 1500);
+        setTimeout(() => this.router.navigate(['/stock-tracker']), 1500);
       },
       error: err => { this.error.set(err.error?.message || 'Registration failed.'); this.loading.set(false); }
     });

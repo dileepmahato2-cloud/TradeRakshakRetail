@@ -287,8 +287,45 @@ export class MarketBreadthComponent implements OnInit, OnDestroy {
     this.destroyCharts();
   }
 
+  /** Market Trend Identification Engine - the regime banner at the top of this page. */
+  health: any = null;
+  healthLoading = false;
+
+  loadHealth() {
+    this.healthLoading = true;
+    this.api.get<any>('/tracker/market-health').subscribe({
+      next: r => { this.health = r.data || null; this.healthLoading = false; },
+      error: () => { this.health = null; this.healthLoading = false; }
+    });
+  }
+
+  /** Width of a score-breakdown bar, as a percentage of that component's own maximum. */
+  barPct(row: any): number {
+    if (!row || !row.max) return 0;
+    return Math.max(0, Math.min(100, (Number(row.earned) || 0) / Number(row.max) * 100));
+  }
+
+  /** The seven weighted components, in the order the specification lists them. */
+  get breakdownRows(): any[] {
+    const b = this.health?.score_breakdown;
+    if (!b) return [];
+    const labels: Record<string, string> = {
+      above_20dma: 'Above 20 DMA',
+      above_50dma: 'Above 50 DMA',
+      above_200dma: 'Above 200 DMA',
+      advance_decline: 'Advance / Decline',
+      volume_participation: 'Volume Participation',
+      composite_trend: 'Composite Trend',
+      composite_rsi: 'Composite RSI'
+    };
+    return Object.keys(labels)
+      .filter(k => b[k])
+      .map(k => ({ key: k, label: labels[k], ...b[k] }));
+  }
+
   loadData() {
     this.loading = true;
+    this.loadHealth();
     this.api.get<any>('/tracker/breadth').subscribe({
       next: r => {
         this.data = r.data || {};

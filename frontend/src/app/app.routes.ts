@@ -3,14 +3,16 @@ import { authGuard } from './core/guards/auth.guard';
 import { adminGuard } from './core/guards/admin.guard';
 
 export const routes: Routes = [
-  { path: '', redirectTo: '/dashboard', pathMatch: 'full' },
+  // Landing page. The Dashboard section was removed, so both this redirect and the
+  // wildcard below point at Stock Upload - leaving them aimed at a route that no longer
+  // exists would have sent every bare URL into the wildcard and straight back out again.
+  { path: '', redirectTo: '/stock-tracker', pathMatch: 'full' },
   { path: 'login',    loadComponent: () => import('./features/auth/login/login.component').then(m => m.LoginComponent) },
   { path: 'register', loadComponent: () => import('./features/auth/register/register.component').then(m => m.RegisterComponent) },
   {
     path: '',
     canActivate: [authGuard],
     children: [
-      { path: 'dashboard',           loadComponent: () => import('./features/dashboard/dashboard.component').then(m => m.DashboardComponent) },
       { path: 'sector-intelligence', loadComponent: () => import('./features/sector-intelligence/sector-intelligence.component').then(m => m.SectorIntelligenceComponent) },
       { path: 'screener',            loadComponent: () => import('./features/screener/screener.component').then(m => m.ScreenerComponent) },
       { path: 'strategy',            loadComponent: () => import('./features/strategy/strategy.component').then(m => m.StrategyComponent) },
@@ -88,5 +90,5 @@ export const routes: Routes = [
       { path: 'project-health',      canActivate: [adminGuard], loadComponent: () => import('./features/project-health/project-health.component').then(m => m.ProjectHealthComponent) },
     ]
   },
-  { path: '**', redirectTo: '/dashboard' }
+  { path: '**', redirectTo: '/stock-tracker' }
 ];

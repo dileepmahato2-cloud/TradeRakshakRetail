@@ -50,7 +50,6 @@ import { SyncBannerComponent } from './shared/sync-banner.component';
       </div>
       <!-- Tapping any link closes the drawer; the click bubbles up to here. -->
       <nav class="flex-1 px-2 py-3 space-y-0.5 text-sm" (click)="onNavClick($event)">
-        <a routerLink="/dashboard" routerLinkActive="active" class="nav-link">Dashboard</a>
 
         <div class="pt-2 pb-1 px-3 text-xs text-slate-600 uppercase tracking-wider">Market Analytics</div>
         <a routerLink="/market-breadth" routerLinkActive="active" class="nav-link">Stock Tracker Dashboard</a>

@@ -88,17 +88,38 @@ if defined PGRESTORE_EXE (
 :: a 100 KB floor and pg_restore could list its tables perfectly well. A backup that looks
 :: healthy but restores a gutted database is the most dangerous kind.
 ::
-:: So compare against the best dump already held. A real database does not lose half its
-:: size between two runs; if it has, something went wrong during the dump and the file must
-:: not be trusted just because it exists.
+:: So compare against what the database has been dumping RECENTLY - not against the largest
+:: dump ever taken.
+::
+:: Comparing against the all-time maximum cannot tell a truncated dump from a database that
+:: legitimately got smaller, and the difference matters because one is a disaster and the
+:: other is routine. On 2026-11-21 this blocked every start: the live database held 3,257,452
+:: candle rows and dumped to 83 MB, against a 904 MB dump taken on 2026-09-07 when the same
+:: table held 53,307,859 rows. The history had been deliberately trimmed in between, so every
+:: backup from then on was ~6% of that maximum and failed the check - permanently, because the
+:: maximum never moves. The advice it printed made it worse: deleting good backups to satisfy
+:: a backup check is exactly backwards.
+::
+:: The median of the last three dumps is the right baseline. A real database does not halve
+:: between consecutive runs, so the September incident is still caught (the three dumps before
+:: it were 884, 884 and 271 MB, median 884, against a 56 MB dump), while a gradual legitimate
+:: shrink moves the baseline down with it. The median rather than the latest, so one bad dump
+:: cannot poison the baseline and wave the next one through.
 set "SIZECHECK=OK"
-for /f %%Z in ('powershell -NoProfile -Command "$new=[long]!OUTSIZE!; $prev=(Get-ChildItem '%BACKUP_ROOT%\%DB_NAME%-*.dump' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -ne '%OUTFILE%' } | Measure-Object -Property Length -Maximum).Maximum; if(-not $prev){'OK'}elseif($new -lt ($prev/2)){'SHRUNK'}else{'OK'}"') do set "SIZECHECK=%%Z"
+for /f %%Z in ('powershell -NoProfile -Command "$new=[long]!OUTSIZE!; $r=@(Get-ChildItem '%BACKUP_ROOT%\%DB_NAME%-*.dump' -ErrorAction SilentlyContinue ^| Where-Object { $_.FullName -ne '%OUTFILE%' } ^| Sort-Object LastWriteTime -Descending ^| Select-Object -First 3 ^| ForEach-Object { $_.Length } ^| Sort-Object); if($r.Count -eq 0){'OK'}else{$base=$r[[int][math]::Floor($r.Count/2)]; if($new -lt ($base/2)){'SHRUNK'}else{'OK'}}"') do set "SIZECHECK=%%Z"
 if /i "!SIZECHECK!"=="SHRUNK" (
-    echo  [!] This backup is less than half the size of the largest one already held.
+    echo  [!] This backup is less than half the size of the last few already held.
     echo      That normally means pg_dump stopped early and the dump is incomplete.
     echo      Treating this as a FAILURE. The file is kept for inspection, and the
     echo      earlier backups have NOT been rotated away.
-    echo      If the database really did shrink, delete the older dumps by hand and re-run.
+    echo.
+    echo      Check it before doing anything else - a dump that lists its contents
+    echo      cleanly is complete, whatever its size:
+    echo          pg_restore --list "%OUTFILE%"
+    echo.
+    echo      If that succeeds and the database really has got smaller, start with:
+    echo          set SKIP_MIGRATION_BACKUP=1
+    echo      Do NOT delete good backups to make this check pass.
     exit /b 1
 )
 

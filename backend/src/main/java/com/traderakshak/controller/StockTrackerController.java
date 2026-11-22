@@ -60,6 +60,7 @@ public class StockTrackerController {
     private final com.traderakshak.service.StockProcessingService processingService;
     /** Append-only upload log: Mode A (latest per symbol) and Mode B (as-of / exact date). */
     private final com.traderakshak.service.StockUploadHistoryService uploadHistory;
+    private final com.traderakshak.service.MarketRegimeService marketRegime;
 
     @PersistenceContext
     private EntityManager em;
@@ -356,9 +357,12 @@ public class StockTrackerController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> provisionalTop10(
             @RequestParam(defaultValue = "true") boolean requireCrossing,
             @RequestParam(defaultValue = "true") boolean applyRanking,
+            // Must match the cap of the section this preview is shown inside. 0 = no cap.
+            @RequestParam(defaultValue = "0") int limit,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getProvisionalTop10(
-            user.getId(), user.getInstitutionId(), requireCrossing, applyRanking)));
+            user.getId(), user.getInstitutionId(), requireCrossing, applyRanking,
+            Math.max(0, limit))));
     }
 
     @GetMapping("/ranking/below-price-top10")
@@ -374,10 +378,14 @@ public class StockTrackerController {
             // Default OFF so nothing that already calls this changes basis underneath it. The
             // sections that state a close-to-close rule on screen pass it explicitly.
             @RequestParam(defaultValue = "false") boolean priceAtClose,
+            // 0 = list every qualifying stock. The two RSI 45 sections run the same entry test
+            // but are read differently - one as a shortlist to trade, one as the full list of
+            // what qualified - so the cap is the caller's to state, not something to infer here.
+            @RequestParam(defaultValue = "0") int limit,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getBelowPriceTop10(
             user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
-            applyRanking, priceAtClose)));
+            applyRanking, priceAtClose, Math.max(0, limit))));
     }
 
     @GetMapping("/ranking/reconstruct-trend")
@@ -398,6 +406,9 @@ public class StockTrackerController {
             @RequestParam(required = false) Boolean applyRanking,
             @RequestParam(required = false) Boolean requireVolume,
             @RequestParam(required = false) Boolean priceAtClose,
+            // The section's own stock cap, so the bars average exactly the rows its table lists.
+            // 0 averages every qualifying stock.
+            @RequestParam(defaultValue = "0") int limit,
             @AuthenticationPrincipal User user) {
         // All three default OFF, which is the main trend's entry test: Current Price >= Base Price
         // and Current Volume > 20-Day Average Volume, ten picked straight by score. The crossing
@@ -417,7 +428,7 @@ public class StockTrackerController {
         boolean atClose = priceAtClose != null ? priceAtClose : false;
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getReconstructedTrend(
             user.getId(), user.getInstitutionId(), from, to, maxPrice, buyTime, sellTime,
-            band, cross, cap, rank, vol, atClose)));
+            band, cross, cap, rank, vol, atClose, Math.max(0, limit))));
     }
 
     @GetMapping("/ranking/reconstruct-day")
@@ -533,21 +544,30 @@ public class StockTrackerController {
         return buildCsvResponse(csv, "TradeRakshak_Eligible_Stocks_" + today() + ".csv");
     }
 
-    // ── ATR Base Price Crossover CSV ──────────────────────────────────────────
-    @GetMapping("/export/atr-base-crossover")
-    @Operation(summary = "Export first-trigger base price crossovers with ATR% >= threshold, "
-                       + "including the validated stop, target and maximum holding period")
-    public ResponseEntity<byte[]> exportAtrBaseCrossover(
-            @RequestParam(defaultValue = "3.0") double minAtrPct,
+    // ── Stochastic Crossover CSV ──────────────────────────────────────────
+    // Was /export/atr-base-crossover. The screen now confirms a base-price crossover with a
+    // Stochastic %K/%D bullish cross and a volume test instead of an ATR floor; ATR is still
+    // computed and reported so the filter that did survive testing stays visible.
+    @GetMapping("/export/stochastic-crossover")
+    @Operation(summary = "Base price breakout confirmed by volume and a Stochastic %K/%D bullish "
+                       + "crossover, with stop, target, holding period and per-trade outcome")
+    public ResponseEntity<byte[]> exportStochasticCrossover(
+            // 0 = ATR does not filter; it is still reported on every row.
+            @RequestParam(defaultValue = "0.0") double minAtrPct,
             @RequestParam(defaultValue = "true") boolean requireVolume,
             @RequestParam(defaultValue = "false") boolean firstTriggerOnly,
+            @RequestParam(defaultValue = "true") boolean requireStochastic,
+            @RequestParam(defaultValue = "100000") double minAvgVolume,
+            // Close confirmation. OFF by default - the original entry mechanic: a resting
+            // buy-stop at the base price, taken whether or not the breakout holds into the
+            // close. Pass true to require Close(D) >= Base Price, which also moves the fill to
+            // that close, since the trade is then not decided until the session ends.
+            @RequestParam(defaultValue = "false") boolean requireCloseAboveBase,
             @AuthenticationPrincipal User user) {
-        // Defaults are the four rules as specified. firstTriggerOnly is available for the
-        // stricter "never tested this level before" variant, but is not the default: it removed
-        // every candidate on the day it was tried.
-        byte[] csv = trackerService.exportAtrBaseCrossoverCsv(
-            user.getId(), user.getInstitutionId(), minAtrPct, requireVolume, firstTriggerOnly);
-        return buildCsvResponse(csv, "TradeRakshak_ATR_Base_Price_Crossover_" + today() + ".csv");
+        byte[] csv = trackerService.exportStochasticCrossoverCsv(
+            user.getId(), user.getInstitutionId(), minAtrPct, requireVolume, firstTriggerOnly,
+            requireStochastic, minAvgVolume, requireCloseAboveBase);
+        return buildCsvResponse(csv, "TradeRakshak_Stochastic_Crossover_" + today() + ".csv");
     }
 
     // ── Current Top-10 Ranking CSV ────────────────────────────────────────────
@@ -658,6 +678,17 @@ public class StockTrackerController {
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(
             trackerService.getMarketBreadthData(user.getId(), user.getInstitutionId())));
+    }
+
+    // ── Market Trend Identification Engine ───────────────────────────────────
+    @GetMapping("/market-health")
+    @Operation(summary = "Market Health Score 0-100 and the Strong Buy / Buy / No Trade / Sell / "
+                       + "Strong Sell state, from Nifty 500 breadth")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMarketHealth() {
+        // No user scoping: market breadth is a property of the market, not of one account's
+        // watchlist. Scoping it to uploaded stocks would make two users disagree about whether
+        // it is a buy market.
+        return ResponseEntity.ok(ApiResponse.ok(marketRegime.computeMarketHealth()));
     }
 
     // ── Sectors List ─────────────────────────────────────────────────────────────

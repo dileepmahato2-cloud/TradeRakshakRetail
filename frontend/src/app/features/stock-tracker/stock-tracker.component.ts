@@ -158,9 +158,9 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
       <button class="btn-blue" (click)="downloadEligible()">
         Eligible Stocks 0 to 5%
       </button>
-      <button class="btn-blue" (click)="downloadAtrBaseCrossover()"
-        title="First crossover up through the base price since it was set, with ATR14(D-1)/Close(D-1) at or above 3%. The export carries the entry, stop (-7%), target (+15%) and 15-session time exit.">
-        ATR_Base_Price_Crossover
+      <button class="btn-blue" (click)="downloadStochasticCrossover()"
+        title="Base price crossover confirmed by volume above the 20-day average and a Stochastic %K/%D bullish cross, on stocks averaging over 100,000 shares a day. Entry is a buy-stop at the base price. The export carries the entry, stop (-5%), target (+15%) and 22-session time exit.">
+        Stochastic_Crossover
       </button>
       <button class="btn-outline" (click)="showProgressDashboard.set(true); loadJobHistory()" style="font-size:11px;">
         Processing Jobs
@@ -907,797 +907,6 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
     <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• CENTRE COL â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
     <div style="display:flex; flex-direction:column; gap:12px;">
 
-      @if (rd?.ranking_warning) {
-        <div class="card" style="padding:10px 14px;" [style.border-color]="rd?.partial_ranking || rd?.fallback_ranking ? '#d97706' : '#16a34a'">
-          <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; flex-wrap:wrap;">
-            <div>
-              <div style="font-size:12px; font-weight:800;" [style.color]="rd?.partial_ranking || rd?.fallback_ranking ? '#fbbf24' : '#4ade80'">
-                {{ rd?.fallback_ranking ? 'Fallback Top 10 Active' : (rd?.partial_ranking ? 'Partial Ranking Active' : 'Ranking Components Ready') }}
-              </div>
-              <div style="color:#cbd5e1; font-size:11px; margin-top:4px;">{{ rd?.message || rd?.ranking_warning }}</div>
-            </div>
-            @if (rd?.considered_components?.length) {
-              <div style="color:#94a3b8; font-size:11px;">Considering: {{ rd.considered_components.join(', ') }}</div>
-            }
-          </div>
-          @if (rd?.skipped_components?.length) {
-            <div style="display:flex; gap:6px; flex-wrap:wrap; margin-top:8px;">
-              @for (c of rd.skipped_components; track c.key) {
-                <span style="border:1px solid #d97706; color:#fde68a; background:#3a2608; border-radius:6px; padding:4px 7px; font-size:10px;">
-                  {{ c.label }} skipped for {{ c.affected_stocks }} stocks: {{ c.reason }}
-                </span>
-              }
-            </div>
-          }
-        </div>
-      }
-
-      <!-- CURRENT TOP 10 TABLE -->
-      <div class="card" style="overflow:hidden;">
-        <!-- Header row with metrics -->
-        <div style="background:#1a3a5c; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-          <div style="display:flex; align-items:center; gap:8px;">
-            <span class="section-title" style="font-size:14px;">Today top 10 Ranking Stocks</span>
-            <button class="btn-green" style="padding:4px 12px; font-size:10.5px;"
-                    (click)="runRanking()" [disabled]="ranking()"
-                    title="Score every uploaded stock now and rebuild this Top 10">
-              @if (ranking()) { <span class="spin"></span> Running... } @else { Run Ranking Now }
-            </button>
-            @if (top10Refreshing) { <span class="spin"></span> }
-          </div>
-          @if (top10RefreshError) {
-            <div style="color:#fca5a5; font-size:10px; background:#450a0a; border:1px solid #dc2626; border-radius:4px; padding:3px 8px;">
-              Unable to refresh latest Top 10 Stocks. Showing last available data.
-            </div>
-          }
-          <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-            <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="toggleAutomationPanel()"
-              [style.borderColor]="automation.prevtop10_auto_cycle_enabled ? '#22c55e' : '#334155'"
-              title="Auto refresh + auto buy/sell settings">
-              Automation {{ automation.prevtop10_auto_cycle_enabled ? 'ON' : 'OFF' }}
-            </button>
-            <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="refreshTop10()" [disabled]="top10Refreshing">
-              @if (top10Refreshing) { Refreshing... } @else { Refresh Top 10 }
-            </button>
-            <select class="select-sm" [(ngModel)]="bulkOrderMode" style="min-width:92px;" [disabled]="true" title="Testing mode: Paper trade only">
-              <option value="PAPER">Paper</option>
-            </select>
-            <button class="btn-green" style="padding:6px 12px; font-size:11px;" (click)="bulkTop10Order('BUY')" [disabled]="bulkTrading() || !(rd?.current_top10?.length)">
-              @if (bulkTrading()) { <span class="spin"></span> } @else { Buy All 10 }
-            </button>
-            <button class="trade-mini sell" style="padding:7px 12px; font-size:11px;" (click)="bulkTop10Order('SELL')" [disabled]="bulkTrading() || !(rd?.current_top10?.length)">
-              Sell All 10
-            </button>
-            <!-- Average Return, measured against the PREVIOUS CLOSE.
-                 It used to show curr_avg_return, the average move from each stock's base price -
-                 the price it was uploaded at, sometimes months and hundreds of percent ago. That
-                 describes the stock's history rather than today, and it disagreed with the Change
-                 Today column beneath it, which was already prev-close based. Same basis now, so
-                 the headline and the column can no longer contradict each other. -->
-            <div style="background:#0f172a; border-radius:6px; padding:6px 14px; text-align:center; min-width:104px;"
-                 [title]="'Average of Change Today across the ' + filteredTop10().length + ' stocks shown: (Current - Previous Close) / Previous Close.'">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Average Return</div>
-              <div style="font-size:16px; font-weight:800;" [class]="top10AvgChange >= 0 ? 'pos' : 'neg'">{{ top10AvgChange | number:'1.2-2' }}%</div>
-              <div style="font-size:8px; color:#64748b;">vs previous close</div>
-            </div>
-          </div>
-        </div>
-
-        <!-- The entry test as this section actually applies it. It differs from the crossing-entry
-             panel below on purpose, so the wording must differ too - text that does not match the
-             code is worse than no text, because it is believed. -->
-        <div style="background:#16304d; border-bottom:1px solid #28415f; padding:6px 14px;
-                    font-size:10px; color:#94a3b8; line-height:1.55;">
-          <span style="color:#cbd5e1; font-weight:700;">Entry test:</span>
-          Current Price &ge; Base Price <strong>and</strong> Current Volume &gt; 20-Day Average Volume.
-          Then Rank, then Buy/Sell &mdash; in that order.
-          <span style="color:#64748b;">(No crossing requirement here &mdash; that is the panel below.)</span>
-        </div>
-
-        <!-- Run meta: kept on its own narrow strip so the title row stays readable. Each value
-             is a fixed-width labelled cell, so they line up instead of running together. -->
-        <div style="background:#16304d; border-bottom:1px solid #28415f; padding:5px 14px;
-                    display:flex; align-items:center; gap:18px; flex-wrap:wrap; font-size:10px;">
-          @if (rd?.run_date) {
-            <span style="display:inline-flex; align-items:baseline; gap:5px;">
-              <span style="color:#7d92ab; min-width:52px;">Ranking</span>
-              <span style="color:#cbd5e1; font-weight:600;">{{ rd.run_date }}</span>
-            </span>
-          }
-          <!-- The time the price TRADED, not the time the page fetched it. This showed
-               dash.last_refreshed - the server's last sync - or, failing that, the moment the
-               browser received the response. Both move when nothing has traded, so after the
-               close the header ticked forward against prices that had stopped changing. The
-               server already returns the traded time; the screen simply was not reading it. -->
-          <span style="display:inline-flex; align-items:baseline; gap:5px;"
-                [title]="rd?.market_open
-                  ? 'Live price, updating while the market is open.'
-                  : 'The market is closed. This is when the last price actually traded, taken from the newest stored candle - not when the page was refreshed.'">
-            <span style="color:#7d92ab; min-width:74px;">{{ rd?.market_open ? 'Last traded' : 'Last traded' }}</span>
-            <span style="color:#cbd5e1; font-weight:600;">{{ formatTimestamp(rd?.last_updated || rd?.last_traded_at || dash.last_refreshed || currentTop10LastUpdated) }}</span>
-          </span>
-          @if (rd && rd.market_open === false) {
-            <span style="color:#f59e0b; font-weight:600;">Market closed</span>
-          } @else if (rd?.market_open) {
-            <span style="color:#22c55e; font-weight:600;">Market open</span>
-          }
-        </div>
-
-        <!-- Automation panel (auto refresh + auto buy/sell) -->
-        @if (showAutomationPanel) {
-          <div style="background:#0d1a2b; border-bottom:1px solid #28415f; padding:12px 14px; display:flex; flex-direction:column; gap:10px;">
-            <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
-                <input type="checkbox" [(ngModel)]="automation.top10_auto_refresh_enabled">
-                Auto-refresh Current Top 10
-              </label>
-              <span style="font-size:11px; color:#94a3b8;">Run
-                <select class="select-sm" [(ngModel)]="automation.top10_auto_refresh_mode" style="font-size:11px; margin-left:4px;"
-                        title="Every N minutes while the market is open, or at clock times you choose.">
-                  <option value="INTERVAL">every</option>
-                  <option value="FIXED">at set times</option>
-                </select>
-              </span>
-              @if (automation.top10_auto_refresh_mode !== 'FIXED') {
-                <select class="select-sm" [(ngModel)]="automation.top10_auto_refresh_interval_sec" style="font-size:11px;"
-                        title="How often the Top 10 is re-ranked and written to the database.">
-                  @for (o of top10IntervalOptions; track o.sec) {
-                    <option [ngValue]="o.sec">{{ o.label }}</option>
-                  }
-                </select>
-                <span style="font-size:10px; color:#64748b;">while the market is open</span>
-              } @else {
-                <input class="select-sm" type="text" [(ngModel)]="automation.top10_auto_refresh_times"
-                       placeholder="09:20,12:00,15:20" style="width:190px; font-size:11px;"
-                       title="Comma-separated 24-hour times. Invalid entries are dropped when saved.">
-                <span style="font-size:10px; color:#64748b;">on trading days</span>
-              }
-            </div>
-            <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;"
-                     title="Lock one run a day as that day's official Top 10. That locked list is what appears as Previous Top 10 tomorrow.">
-                <input type="checkbox" [(ngModel)]="automation.top10_lock_enabled">
-                Lock Current Top 10 at
-              </label>
-              <select class="select-sm" [(ngModel)]="automation.top10_lock_time" style="font-size:11px;"
-                      [disabled]="!automation.top10_lock_enabled"
-                      title="The Top 10 priced at this time becomes the locked list for the day.">
-                @for (t of buyTimeOptions; track t) {
-                  <option [value]="t">{{ t }}</option>
-                }
-              </select>
-              <span style="font-size:10px; color:#64748b;">becomes tomorrow&rsquo;s Previous Top 10</span>
-            </div>
-            <div style="height:1px; background:#1e2f45;"></div>
-            <div style="font-size:10px; color:#64748b; text-transform:uppercase; letter-spacing:.5px;">Previous Top 10 — Daily Auto Cycle</div>
-            <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
-                <input type="checkbox" [(ngModel)]="automation.prevtop10_auto_cycle_enabled">
-                Enable daily cycle
-              </label>
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
-                <input type="checkbox" [(ngModel)]="automation.prevtop10_auto_buy_enabled" [disabled]="!automation.prevtop10_auto_cycle_enabled">
-                Auto Buy
-              </label>
-              <span style="font-size:11px; color:#94a3b8;">at
-                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_buy_time" placeholder="15:15" style="width:66px;">
-              </span>
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
-                <input type="checkbox" [(ngModel)]="automation.prevtop10_auto_sell_enabled" [disabled]="!automation.prevtop10_auto_cycle_enabled">
-                Auto Sell
-              </label>
-              <span style="font-size:11px; color:#94a3b8;">at
-                <input class="select-sm" type="text" [(ngModel)]="automation.prevtop10_sell_time" placeholder="10:15" style="width:66px;">
-              </span>
-            </div>
-            <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
-              <span style="font-size:11px; color:#94a3b8;">Execution mode:
-                <select class="select-sm" [(ngModel)]="automation.prevtop10_execution_mode" (ngModelChange)="onLiveModeChange()" style="min-width:90px;">
-                  <option value="PAPER">Paper</option>
-                  <option value="LIVE">Live (real)</option>
-                </select>
-              </span>
-              @if (automation.prevtop10_execution_mode==='LIVE') {
-                <span style="font-size:10px; color:#fca5a5; background:#450a0a; border:1px solid #dc2626; border-radius:4px; padding:3px 8px;">
-                  LIVE mode can place REAL orders automatically.
-                </span>
-              }
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;">
-                <input type="checkbox" [(ngModel)]="automation.prevtop10_use_real_price_if_executed">
-                Use real executed price when available
-              </label>
-            </div>
-            <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
-              <span style="font-size:11px; color:#94a3b8;">Market holidays (yyyy-MM-dd, comma separated):</span>
-              <input class="select-sm" type="text" [(ngModel)]="automation.market_holidays" placeholder="2026-08-15, 2026-10-02" style="min-width:260px; flex:1;">
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button class="btn-green" style="font-size:11px; padding:6px 14px;" (click)="saveAutomationConfig()" [disabled]="automationSaving">
-                @if (automationSaving) { <span class="spin"></span> Saving... } @else { Save Automation }
-              </button>
-              <button class="btn-outline" style="font-size:11px; padding:6px 14px;" (click)="toggleAutomationPanel()">Close</button>
-            </div>
-          </div>
-        }
-
-        <!-- Total Trading Amount allocation -->
-        <div style="background:#132237; border-bottom:1px solid #28415f; padding:8px 14px; display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-          <div style="display:flex; align-items:center; gap:6px;">
-            <span style="font-size:11px; color:#94a3b8;">Total Trading Amount (&#8377;):</span>
-            <input class="select-sm" type="number" [(ngModel)]="totalTradingAmount" (ngModelChange)="recalcAllocation()" min="1" max="100000000" step="1000"
-              style="width:130px; text-align:right;" placeholder="100000">
-          </div>
-          @if (totalTradingAmount <= 0) {
-            <span style="font-size:10px; color:#fca5a5;">Amount must be greater than zero</span>
-          }
-          <div style="font-size:10px; color:#64748b;">
-            Per Stock: <strong style="color:#60a5fa;">&#8377;{{ perStockAllocation | number:'1.0-0' }}</strong>
-          </div>
-          <div style="font-size:10px; color:#64748b;">
-            Remaining: <strong style="color:#94a3b8;">&#8377;{{ remainingBalance | number:'1.0-0' }}</strong>
-          </div>
-          @if (!isMarketHours()) {
-            <span style="font-size:10px; color:#fbbf24; background:#3a2608; border:1px solid #d97706; border-radius:4px; padding:3px 8px;">
-              Market Closed — Paper trade only
-            </span>
-          }
-          <!-- Buyer/Seller Availability Toggle -->
-          <div style="display:flex; align-items:center; gap:6px; margin-left:auto;">
-            <label style="font-size:10px; color:#94a3b8; cursor:pointer; display:flex; align-items:center; gap:4px;">
-              <input type="checkbox" [(ngModel)]="filterBuyerSeller" (ngModelChange)="applyBuyerSellerFilter()">
-              Buyer/Seller Available Only
-            </label>
-            @if (filterBuyerSeller && excludedCount > 0) {
-              <span style="font-size:10px; color:#f59e0b;">{{ excludedCount }} excluded</span>
-            }
-          </div>
-        </div>
-
-        <!-- Ranking warnings / missing data messages -->
-        @if (rd?.partial_ranking) {
-          <div style="background:#3a2608; border-bottom:1px solid #d97706; padding:6px 14px; font-size:10px; color:#fde68a;">
-            {{ rd.ranking_warning }}
-            @if (rd.skipped_components?.length) {
-              <span style="color:#94a3b8;"> Skipped:
-                @for (sc of rd.skipped_components; track sc.key) {
-                  {{ sc.label }} ({{ sc.reason }}){{ $last ? '' : ', ' }}
-                }
-              </span>
-            }
-          </div>
-        }
-
-        <div style="overflow-x:auto;">
-          <table style="width:100%; border-collapse:collapse; min-width:900px;">
-            <thead>
-              <tr>
-                <th class="tbl-hdr" style="width:36px; text-align:center;" title="Position in today's ranking. 1 is the highest-scoring stock.">Rank</th>
-                <th class="tbl-hdr" title="Stock symbol. The smaller line below is the broker's trading symbol where it differs.">Symbol</th>
-                <th class="tbl-hdr" style="text-align:right;" title="The price recorded when this stock was uploaded. All gain and loss figures are measured from here.">Base Price</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Closing price of the previous trading day.">Prev Close</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Latest traded price. Updates live while the market is open.">Current Price</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Move since the previous close: (Current - Prev Close) / Prev Close.">Change Today</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Ranking score out of 100, combining relative strength, volume growth, trend, RSI, moving-average position, momentum, 52-week position, breakout, institutional interest, liquidity and market-cap quality. Higher is better.">Score /100</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Today's traded volume against its recent average. A high positive figure means unusually heavy trading.">Volume Change</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Money allocated to each stock — your Total Trading Amount divided by 10.">Amount / Stock</th>
-                <th class="tbl-hdr" style="text-align:right;" title="Whole shares that amount buys at the current price.">Qty</th>
-                <th class="tbl-hdr" title="How long ago this row's price was last refreshed. Hover a value for the exact time.">Last Updated</th>
-              </tr>
-            </thead>
-            <tbody>
-              @for (s of filteredTop10(); track s.symbol) {
-                <tr class="tbl-row" [class.row-flash]="rowFlash(s.symbol)">
-                  <td style="font-size:12px; padding:7px 10px; text-align:center; font-weight:700;"
-                    [style.color]="s.rank===1?'#facc15':s.rank<=3?'#94a3b8':'#64748b'">
-                    {{ s.rank }}
-                  </td>
-                  <td style="font-size:12px; padding:7px 10px; font-weight:700; color:#fff;">
-                    {{ s.symbol }}
-                    @if (s.trading_symbol && s.trading_symbol !== s.symbol) {
-                      <div style="font-size:9px; color:#64748b;">{{ s.trading_symbol }}</div>
-                    }
-                  </td>
-                  <td class="tbl-cell-num">
-                    @if (s.base_price > 0) { {{ s.base_price | number:'1.2-2' }} }
-                    @else { <span style="color:#f59e0b; font-size:9px;" title="No base price recorded for this stock yet, so its gain cannot be measured.">Not set</span> }
-                  </td>
-                  <td class="tbl-cell-num">{{ s.previous_close != null ? (s.previous_close | number:'1.2-2') : '-' }}</td>
-                  <td class="tbl-cell-num" style="font-weight:600; color:#fff;">
-                    @if (s.current_price != null && s.current_price > 0) {
-                      {{ s.current_price | number:'1.2-2' }}
-                    } @else {
-                      <span style="color:#f59e0b; font-size:9px;" title="No live or stored price available for this stock right now.">No price</span>
-                    }
-                  </td>
-                  <td style="font-size:11px; padding:7px 10px; text-align:right; font-weight:700;"
-                    [class]="(s.today_return_pct || 0) >= 0 ? 'pos' : 'neg'">
-                    @if (s.previous_close) { {{ s.today_return_pct | number:'1.2-2' }}% } @else { - }
-                  </td>
-                  <td style="font-size:11px; padding:7px 10px; text-align:right; font-weight:700;">
-                    <button type="button" class="score-btn"
-                      [class.score-btn-open]="expandedFactors.has(s.symbol)"
-                      (click)="toggleFactors(s.symbol)"
-                      [title]="factorRows(s).length ? 'Show how this score was built' : 'No factor detail stored for this stock'">
-                      {{ s.score | number:'1.2-2' }}
-                      @if (factorRows(s).length) {
-                        <span class="score-caret">{{ expandedFactors.has(s.symbol) ? '&#9650;' : '&#9660;' }}</span>
-                      }
-                    </button>
-                  </td>
-                  <td class="tbl-cell-num" [class]="(s.today_volume_change_pct || 0) >= 0 ? 'pos' : 'neg'">
-                    {{ s.today_volume_change_pct != null ? ((s.today_volume_change_pct | number:'1.1-1') + '%') : '-' }}
-                  </td>
-                  <td class="tbl-cell-num" style="color:#60a5fa;">{{ perStockAllocation | number:'1.0-0' }}</td>
-                  <td class="tbl-cell-num" style="color:#fff; font-weight:600;">{{ calcQty(s.current_price) }}</td>
-                  <td class="tbl-cell" style="font-size:10px; white-space:nowrap;" [title]="s.last_updated || 'Never refreshed'">{{ formatLastUpdated(s.last_updated) }}</td>
-                </tr>
-                @if (expandedFactors.has(s.symbol)) {
-                  <tr>
-                    <td colspan="11" style="padding:0; background:#0d1520; border-bottom:1px solid #1e2a3b;">
-                      <div style="padding:10px 14px;">
-                        <div style="font-size:11px; font-weight:800; color:#e2e8f0; margin-bottom:7px;">
-                          Score breakdown &mdash; {{ s.symbol }}
-                          <span style="font-weight:500; color:#94a3b8; margin-left:8px;">
-                            each component scores 0&ndash;10; the total is weighted by the points beside it,
-                            divided by the weight that had data
-                          </span>
-                        </div>
-                        <!-- Many columns, so the panel scrolls sideways rather than wrapping. -->
-                        <div style="overflow-x:auto;">
-                          <table style="border-collapse:collapse; white-space:nowrap;">
-                            <thead>
-                              <tr>
-                                <th class="sb-hdr" title="Stock symbol">Symbol</th>
-                                <th class="sb-hdr" title="Sector as uploaded">Sector</th>
-                                <th class="sb-hdr" style="text-align:right;" title="Final weighted score out of 100">Score</th>
-                                <th class="sb-hdr" style="text-align:right;" title="Last traded price">LTP</th>
-                                <th class="sb-hdr" style="text-align:right;" title="Gain since the base price">Return %</th>
-                                <th class="sb-hdr" style="text-align:right;" title="Best buy price on the book">Bid</th>
-                                <th class="sb-hdr" style="text-align:right;" title="Best sell price on the book">Ask</th>
-                                @for (c of components(s); track c.key) {
-                                  <th class="sb-hdr" style="text-align:right;" [title]="componentHint(c)">
-                                    {{ c.short_label }}
-                                    <span style="color:#64748b; font-weight:500;">w{{ c.weight | number:'1.0-0' }}</span>
-                                  </th>
-                                }
-                                <th class="sb-hdr" style="text-align:right;"
-                                    title="Total weight of the components that had data. Skipped ones are removed from the divisor rather than counted as zero.">
-                                  Weight Used
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              <tr>
-                                <td class="sb-cell" style="color:#fff; font-weight:700;">{{ s.symbol }}</td>
-                                <td class="sb-cell" style="color:#cbd5e1;">{{ s.sector || '-' }}</td>
-                                <td class="sb-cell" style="text-align:right; color:#60a5fa; font-weight:800;">{{ s.score | number:'1.2-2' }}</td>
-                                <td class="sb-cell" style="text-align:right; color:#fff;">{{ s.current_price | number:'1.2-2' }}</td>
-                                <td class="sb-cell" style="text-align:right;" [class]="(s.return_pct || 0) >= 0 ? 'pos' : 'neg'">{{ s.return_pct | number:'1.2-2' }}%</td>
-                                <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ s.bid ? (s.bid | number:'1.2-2') : '-' }}</td>
-                                <td class="sb-cell" style="text-align:right; color:#94a3b8;">{{ s.ask ? (s.ask | number:'1.2-2') : '-' }}</td>
-                                @for (c of components(s); track c.key) {
-                                  <td class="sb-cell" style="text-align:right; font-weight:700;"
-                                      [style.color]="scoreColour(c.score)"
-                                      [title]="c.available ? c.label : (c.label + ' - ' + (c.reason || 'no data'))">
-                                    {{ c.available ? (c.score | number:'1.1-1') : 'n/a' }}
-                                  </td>
-                                }
-                                <td class="sb-cell" style="text-align:right; color:#e2e8f0; font-weight:800;">
-                                  {{ weightUsed(s) | number:'1.0-0' }}
-                                </td>
-                              </tr>
-                            </tbody>
-                          </table>
-                        </div>
-                        @if (skippedFactors(s).length) {
-                          <div style="margin-top:8px; font-size:10px; color:#94a3b8; line-height:1.6;">
-                            <span style="color:#f59e0b; font-weight:700;">Not counted:</span>
-                            @for (sk of skippedFactors(s); track sk.key) {
-                              <span style="margin-left:6px;"><span style="color:#cbd5e1;">{{ sk.label }}</span> &mdash; {{ sk.reason }}</span>
-                            }
-                          </div>
-                        }
-                      </div>
-                    </td>
-                  </tr>
-                }
-              }
-              @if (!rd?.current_top10?.length) {
-                <tr><td colspan="11" style="text-align:center; padding:24px; color:#94a3b8; font-size:12px; line-height:1.7;">
-                  <div style="font-weight:700; color:#e2e8f0;">No ranking yet.</div>
-                  <div>Upload your stock list, then press <strong style="color:#cbd5e1;">Run Ranking Now</strong> in this
-                  section's header to score every stock and pick today's Top 10.</div>
-                </td></tr>
-              }
-            </tbody>
-            @if (filteredTop10().length) {
-              <tfoot>
-                <tr style="background:#16202e; border-top:2px solid #2d3f55;">
-                  <td colspan="5" style="font-size:10px; padding:8px 10px; color:#94a3b8;">
-                    Totals across {{ filteredTop10().length }} stock{{ filteredTop10().length === 1 ? '' : 's' }}
-                    @if (filterBuyerSeller && excludedCount) {
-                      <span style="color:#f59e0b;"> · {{ excludedCount }} hidden by the buyer/seller filter</span>
-                    }
-                  </td>
-                  <td style="font-size:11px; padding:8px 10px; text-align:right; font-weight:800;"
-                      [class]="top10AvgChange >= 0 ? 'pos' : 'neg'"
-                      title="Average change today across the stocks shown.">
-                    {{ top10AvgChange | number:'1.2-2' }}%
-                  </td>
-                  <td style="font-size:11px; padding:8px 10px; text-align:right; font-weight:800; color:#60a5fa;"
-                      title="Average ranking score across the stocks shown.">
-                    {{ top10AvgScore | number:'1.2-2' }}
-                  </td>
-                  <td></td>
-                  <td style="font-size:11px; padding:8px 10px; text-align:right; font-weight:800; color:#60a5fa;"
-                      title="Total money committed if you bought every stock shown.">
-                    {{ top10TotalAlloc | number:'1.0-0' }}
-                  </td>
-                  <td style="font-size:11px; padding:8px 10px; text-align:right; font-weight:800; color:#fff;"
-                      title="Total shares across the stocks shown.">
-                    {{ top10TotalQty | number }}
-                  </td>
-                  <td></td>
-                </tr>
-              </tfoot>
-            }
-          </table>
-        </div>
-      </div>
-
-      <!-- PREVIOUS TOP 10 — TRADE BATCHES -->
-      <div class="card" style="overflow:hidden;">
-        <div style="background:#1e2a3b; padding:10px 14px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid #2d3f55; flex-wrap:wrap; gap:8px;">
-          <div style="display:flex; align-items:center; gap:8px;">
-            <span class="section-title">Previous top 10 Ranking Stocks</span>
-            <span style="color:#64748b; font-size:10px;">Trade Batches</span>
-          </div>
-          <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
-            <!-- Day, Time and Sell Day removed. This section has one rule, not a set of
-                 choices: bought at 15:20 on the previous trading day, sold at 11:00 on the next
-                 one. Offering pickers implied the rule was negotiable and let the screen be put
-                 into states the automation would never produce. -->
-            <span style="font-size:10px; color:#64748b;"
-                  title="Fixed for this section: bought at 15:20 on the previous trading day, sold at 11:00 on the next trading day. Weekends and market holidays are skipped - a Friday buy sells on Monday.">
-              Buy {{ PREV_BUY_TIME }} previous session &middot; Sell {{ PREV_SELL_TIME }} next session
-            </span>
-            <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="loadPeriodPreview(); loadTradeBatches()" [disabled]="tradeBatchLoading || previewLoading">
-              @if (tradeBatchLoading || previewLoading) { <span class="spin"></span> } @else { Refresh }
-            </button>
-            <!-- Back-dated download. Empty replays the section's current view; a date replays
-                 that session instead, rebuilt from stored candles at this section's own times. -->
-            <input type="date" class="select-sm" [(ngModel)]="prevExportDate" [max]="todayIso"
-                   style="font-size:10px;" title="Optional: download a past session instead of the current view">
-            <button class="btn-outline" style="font-size:10px; padding:4px 10px;"
-                    (click)="downloadPrevTop10()"
-                    title="Excel/CSV of exactly these rows - the same columns, buy and sell dates, times, prices and returns">
-              Download stocks
-            </button>
-            <button class="btn-outline" style="font-size:10px; padding:4px 10px;" (click)="togglePrevAutomationPanel()"
-              [style.borderColor]="automation.prevtop10_auto_refresh_enabled ? '#22c55e' : '#334155'"
-              title="Auto-refresh settings for Previous Top 10 and its average-return bars">
-              Automation {{ automation.prevtop10_auto_refresh_enabled ? 'ON' : 'OFF' }}
-            </button>
-            <!-- Disabled only while its own request is in flight. It used to grey out whenever
-                 the Top 10 was empty, which through a whole stretch of this month was every
-                 evening - a permanently dead button with nothing on screen explaining why. It
-                 now stays live and says what is missing when pressed. -->
-            <button class="btn-green" style="padding:6px 12px; font-size:11px;" (click)="createTradeBatch()" [disabled]="tradeBatchCreating">
-              @if (tradeBatchCreating) { <span class="spin"></span> Creating... } @else { Buy All 10 }
-            </button>
-            <button class="trade-mini sell" style="padding:6px 12px; font-size:11px;" (click)="sellAllOpenBatch()" [disabled]="!!tradeBatchSelling"
-              title="Close the active Previous Top 10 batch — records sell price, P/L, and updates history">
-              @if (tradeBatchSelling) { <span class="spin"></span> Selling... } @else { Sell All 10 }
-            </button>
-            <select class="select-sm" [(ngModel)]="tradeBatchFilter" (ngModelChange)="loadTradeBatches()" style="min-width:80px; font-size:10px;">
-              <option value="ALL">All</option>
-              <option value="OPEN">Open</option>
-              <option value="CLOSED">Closed</option>
-            </select>
-          </div>
-        </div>
-        @if (showPrevAutomationPanel) {
-          <div style="background:#0d1a2b; border-bottom:1px solid #28415f; padding:12px 14px; display:flex; flex-direction:column; gap:10px;">
-            <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-              <label style="font-size:11px; color:#e2e8f0; display:flex; align-items:center; gap:6px; cursor:pointer;"
-                     title="Re-price Previous Top 10 and redraw the average-return bars on a timer.">
-                <input type="checkbox" [(ngModel)]="automation.prevtop10_auto_refresh_enabled" (ngModelChange)="restartPrevAutoRefresh()">
-                Auto-refresh Previous Top 10
-              </label>
-              <span style="font-size:11px; color:#94a3b8;">every
-                <select class="select-sm" [(ngModel)]="automation.prevtop10_auto_refresh_interval_sec" (ngModelChange)="restartPrevAutoRefresh()"
-                        [disabled]="!automation.prevtop10_auto_refresh_enabled" style="font-size:11px; margin-left:4px;">
-                  @for (o of prevRefreshOptions; track o.sec) {
-                    <option [ngValue]="o.sec">{{ o.label }}</option>
-                  }
-                </select>
-              </span>
-              <span style="font-size:10px; color:#64748b;">the average-return bars refresh with it</span>
-            </div>
-            <div style="height:1px; background:#1e2f45;"></div>
-            <div style="font-size:10px; color:#64748b;">
-              Buy and sell automation for this list lives in the Current Top 10 automation panel, under
-              &ldquo;Previous Top 10 &mdash; Daily Auto Cycle&rdquo;.
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button class="btn-green" style="font-size:11px; padding:6px 14px;" (click)="saveAutomation()" [disabled]="automationSaving">
-                @if (automationSaving) { <span class="spin"></span> Saving... } @else { Save }
-              </button>
-              <button class="btn-outline" style="font-size:11px; padding:6px 14px;" (click)="togglePrevAutomationPanel()">Close</button>
-            </div>
-          </div>
-        }
-        <!-- Period preview (spec §2/§3) — actual buy vs current price, no ranking average -->
-        @if (periodPreview?.stocks?.length) {
-          <div style="padding:8px 14px; border-bottom:1px solid #2d3f55; display:flex; gap:14px; align-items:center; flex-wrap:wrap; font-size:11px;">
-            <span style="color:#94a3b8;">
-              {{ periodPreview.historical
-                   ? 'Buy @ ' + periodPreview.buy_date + ' ' + (periodPreview.buy_time || '')
-                   : 'Buy @ current price' }}
-            </span>
-            @if (periodPreview.run_date) {
-              <span style="color:#64748b;" [title]="periodPreview.selection_basis || 'The ranking run that was current at the selected day and time'">
-                Top 10 as of <strong style="color:#94a3b8;">{{ periodPreview.run_date }}</strong>
-                @if (periodPreview.run_created_at) {
-                  <span style="color:#475569;">({{ periodPreview.run_created_at }})</span>
-                } @else {
-                  <span style="color:#475569;">(current rules)</span>
-                }
-              </span>
-            }
-            <span style="display:none;">
-            </span>
-            <span style="color:#64748b;">Avg Return
-              <strong [style.color]="(periodPreview.avg_return || 0) >= 0 ? '#22c55e' : '#ef4444'">{{ periodPreview.avg_return | number:'1.2-2' }}%</strong>
-            </span>
-            <span style="color:#64748b;">Win <strong style="color:#22c55e;">{{ periodPreview.winners }}</strong> / Lose <strong style="color:#ef4444;">{{ periodPreview.losers }}</strong></span>
-            @if (periodPreview.missing_prices > 0) {
-              <span style="color:#f59e0b;">{{ periodPreview.missing_prices }} stock(s) have no stored price on that date — excluded from the average.</span>
-            }
-          </div>
-        }
-        <!-- Previous Top 10 AT THE SELECTED TIME (spec §2/§3).
-             The Time selector above re-prices the Current Top 10 as they would have been
-             bought at the chosen date, so the result belongs in THIS section — it used to
-             only update the one-line summary strip above. -->
-        @if (periodPreview?.stocks?.length) {
-          <div class="prev-top10-preview" style="overflow-x:auto;">
-            <table style="width:100%; border-collapse:collapse; min-width:640px;">
-              <thead>
-                <tr style="background:#16202e;">
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:left;" title="Ranking position on the selected day.">Rank</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:left;" title="Stock symbol.">Symbol</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:left;" title="Industry the stock belongs to.">Sector</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:left;" title="The exact moment this row was bought at. With no day selected this is the last working day's close.">Buy Date &amp; Time</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:right;" [title]="'Traded price at ' + hhmmLabel(prevBuyTime) + ' on the selected day - the price you would have bought at.'">Buy Price</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:left;" title="The exact moment this row was sold at. With no sell day selected this is the live price, or the last working day's close when the market is shut.">Sell Date &amp; Time</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:right;"
-                      [title]="periodPreview?.sell_historical ? ('Traded price at ' + hhmmLabel(prevSellTime) + ' on ' + periodPreview?.sell_date + ' - the price you would have sold at.') : 'Live price - the sell leg is marked to market.'">Sell Price</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:right;" title="Latest traded price now.">Current</th>
-                  <th style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; padding:7px 10px; text-align:right;" title="Gain or loss between the buy price and the sell price, as a percentage.">Return %</th>
-                </tr>
-              </thead>
-              <tbody>
-                @for (s of periodPreview.stocks; track s.symbol) {
-                  <tr style="border-bottom:1px solid #22304a;">
-                    <td style="font-size:11px; padding:7px 10px; color:#60a5fa; font-weight:700;">{{ s.rank }}</td>
-                    <td style="font-size:11px; padding:7px 10px; color:#fff; font-weight:600;">{{ s.symbol }}</td>
-                    <td style="font-size:10px; padding:7px 10px; color:#94a3b8;">{{ s.sector || '-' }}</td>
-                    <td style="font-size:10px; padding:7px 10px; color:#94a3b8; white-space:nowrap;">{{ stampLabel(s.buy_date, s.buy_time) }}</td>
-                    <td style="font-size:11px; padding:7px 10px; text-align:right; color:#e2e8f0;">
-                      @if (s.buy_price != null) { {{ s.buy_price | number:'1.2-2' }} } @else { <span style="color:#f59e0b; font-size:9px;" title="No traded price is stored for this stock at that date and time, so its return cannot be worked out.">No price</span> }
-                    </td>
-                    <td style="font-size:10px; padding:7px 10px; color:#94a3b8; white-space:nowrap;">{{ stampLabel(s.sell_date, s.sell_time) }}</td>
-                    <td style="font-size:11px; padding:7px 10px; text-align:right; color:#e2e8f0;">
-                      @if (s.sell_price != null) { {{ s.sell_price | number:'1.2-2' }} } @else { <span style="color:#f59e0b; font-size:9px;" title="No traded price is stored for this stock at the chosen sell date and time.">No price</span> }
-                    </td>
-                    <td style="font-size:11px; padding:7px 10px; text-align:right; color:#e2e8f0;">{{ s.current_price | number:'1.2-2' }}</td>
-                    <td style="font-size:11px; padding:7px 10px; text-align:right; font-weight:700;"
-                        [style.color]="s.return_pct == null ? '#64748b' : (s.return_pct >= 0 ? '#22c55e' : '#ef4444')">
-                      @if (s.return_pct != null) { {{ s.return_pct | number:'1.2-2' }}% } @else { - }
-                    </td>
-                  </tr>
-                }
-              </tbody>
-            </table>
-          </div>
-        }
-
-        <!-- RANKING CHART BAR - one bar per trading day, each the average of that day's ten.
-             Every day is rebuilt by the same reconstruction the table above uses - same entry
-             test, same buy and sell times - and the window ENDS on the day the table is showing,
-             so the last bar is that table reduced to a single number. -->
-        @if (periodPreview?.stocks?.length) {
-          <div style="border-top:1px solid #2d3f55;">
-            <div style="background:#16202e; padding:8px 14px; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
-              <div style="display:flex; align-items:center; gap:8px;">
-                <span style="font-size:12px; font-weight:800; color:#60a5fa;">Ranking Chart Bar</span>
-                <span style="color:#64748b; font-size:9.5px;">One bar per day &mdash; average return of that day&rsquo;s 10 stocks</span>
-              </div>
-              <div style="display:flex; align-items:center; gap:12px; font-size:10px; flex-wrap:wrap;">
-                <span style="color:#64748b;">Days</span>
-                <select class="select-sm" [(ngModel)]="rankingTrendDays" (ngModelChange)="loadRankingChartBar()"
-                        style="min-width:66px; font-size:10px;" title="How far back the chart runs. It always ends on the day the table above is showing.">
-                  @for (n of rankingTrendDayOptions; track n) { <option [ngValue]="n">{{ n }}D</option> }
-                </select>
-                @if (rankingTrendLoading) {
-                  <span style="color:#64748b;">Loading&hellip;</span>
-                } @else if (rankingTrend.length) {
-                  <span style="color:#64748b;">Avg
-                    <strong [style.color]="rankingTrendAvg >= 0 ? '#22c55e' : '#ef4444'">{{ rankingTrendAvg | number:'1.2-2' }}%</strong>
-                  </span>
-                  <span style="color:#22c55e;">Up {{ rankingChartUp }}</span>
-                  <span style="color:#ef4444;">Down {{ rankingChartDown }}</span>
-                  @if (rankingChartUnsettled) {
-                    <span style="color:#f59e0b;" title="Days with no next-day exit price stored yet, or where nothing met the entry test. They keep their slot but draw no bar.">Unsettled {{ rankingChartUnsettled }}</span>
-                  }
-                }
-              </div>
-            </div>
-
-            <!-- Bars grow from a shared zero line so a losing day hangs below it, the way the
-                 numbers read. An unsettled day keeps its slot and its date but draws no bar: a
-                 gap says "not known yet", where a zero-height bar would say "flat" - a different
-                 claim, and an untrue one. -->
-            <div style="display:flex; align-items:center; gap:5px; height:210px; overflow-x:auto; padding:10px 14px 4px;">
-              @for (d of rankingTrend; track d.date) {
-                <div style="display:flex; flex-direction:column; align-items:center; min-width:40px; height:100%; justify-content:center;"
-                     [title]="rankingBarTooltip(d)">
-                  <div style="display:flex; flex-direction:column; align-items:center; justify-content:flex-end; flex:1; width:100%;">
-                    @if (d.trade_avg_return != null && d.trade_avg_return >= 0) {
-                      <div style="font-size:8px; font-weight:700; color:#22c55e; margin-bottom:2px;">{{ d.trade_avg_return | number:'1.1-1' }}</div>
-                      <div class="bar-chart-bar" style="background:#1d6adb;"
-                           [style.height]="barH(d.trade_avg_return, rankingChartMax)+'px'"></div>
-                    }
-                  </div>
-                  <div style="height:1px; width:100%; background:#1e2a3b;"></div>
-                  <div style="display:flex; flex-direction:column; align-items:center; justify-content:flex-start; flex:1; width:100%;">
-                    @if (d.trade_avg_return != null && d.trade_avg_return < 0) {
-                      <div class="bar-chart-bar" style="background:#dc2626; border-radius:0 0 3px 3px;"
-                           [style.height]="barH(d.trade_avg_return, rankingChartMax)+'px'"></div>
-                      <div style="font-size:8px; font-weight:700; color:#ef4444; margin-top:2px;">{{ d.trade_avg_return | number:'1.1-1' }}</div>
-                    } @else if (d.trade_avg_return == null) {
-                      <div style="font-size:8px; color:#f59e0b; margin-top:2px;">&mdash;</div>
-                    }
-                  </div>
-                  <div style="font-size:8.5px; white-space:nowrap; text-align:center; letter-spacing:-.1px; margin-top:4px;"
-                       [style.font-weight]="d.date === rankingTrendEndDate ? '700' : '400'"
-                       [style.color]="d.date === rankingTrendEndDate ? '#e2e8f0' : '#94a3b8'">
-                    {{ formatChartDate(d.date) }}
-                  </div>
-                </div>
-              }
-              @if (!rankingTrend.length && !rankingTrendLoading) {
-                <div style="color:#94a3b8; font-size:11px; padding:16px 4px; line-height:1.6;">
-                  No settled trading day in this window yet. Every bar needs a next trading day to
-                  sell into, so a day only charts once that following session has prices stored.
-                </div>
-              }
-            </div>
-            <div style="font-size:9.5px; color:#64748b; padding:0 14px 10px;">
-              {{ rankingTrendRule }}
-              @if (rankingTrendEndDate) {
-                <span style="margin-left:6px;">Last bar ({{ formatChartDate(rankingTrendEndDate) }}) is the table above, averaged.</span>
-                @if (rankingTrendStale) {
-                  <span style="margin-left:6px; color:#f59e0b;"
-                        title="The chart ends on the newest session that has stored data. Later sessions will appear once market data for them is fetched.">
-                    No market data after {{ formatChartDate(rankingTrendEndDate) }}.
-                  </span>
-                }
-              }
-            </div>
-          </div>
-        }
-
-        <!-- Summary Cards -->
-        @if (tradeBatchSummary?.total_batches > 0) {
-          <div style="display:flex; gap:8px; padding:10px 14px; flex-wrap:wrap; border-bottom:1px solid #2d3f55;">
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Total Batches</div>
-              <div style="font-size:16px; font-weight:800; color:#60a5fa;">{{ tradeBatchSummary.total_batches }}</div>
-            </div>
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Winning</div>
-              <div style="font-size:16px; font-weight:800; color:#22c55e;">{{ tradeBatchSummary.winning_batches }}</div>
-            </div>
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Losing</div>
-              <div style="font-size:16px; font-weight:800; color:#ef4444;">{{ tradeBatchSummary.losing_batches }}</div>
-            </div>
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Avg Return</div>
-              <div style="font-size:16px; font-weight:800;" [style.color]="tradeBatchSummary.avg_return >= 0 ? '#22c55e' : '#ef4444'">{{ tradeBatchSummary.avg_return | number:'1.2-2' }}%</div>
-            </div>
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Best</div>
-              <div style="font-size:16px; font-weight:800; color:#22c55e;">{{ tradeBatchSummary.highest_return | number:'1.2-2' }}%</div>
-            </div>
-            <div style="background:#0f172a; border-radius:6px; padding:6px 12px; text-align:center; min-width:80px;">
-              <div style="font-size:9px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:2px;">Worst</div>
-              <div style="font-size:16px; font-weight:800; color:#ef4444;">{{ tradeBatchSummary.lowest_return | number:'1.2-2' }}%</div>
-            </div>
-          </div>
-        }
-        <!-- Batch List -->
-        <div style="overflow-x:auto;">
-          @for (b of tradeBatches; track b.batch_id) {
-            <div style="border-bottom:1px solid #2d3f55;">
-              <div style="display:flex; align-items:center; gap:10px; padding:8px 14px; cursor:pointer;"
-                [style.background]="expandedBatchId === b.batch_id ? '#162032' : 'transparent'"
-                (click)="expandedBatchId = expandedBatchId === b.batch_id ? '' : b.batch_id">
-                <span style="font-size:10px; color:#64748b; min-width:20px;">{{ expandedBatchId === b.batch_id ? '▼' : '▶' }}</span>
-                <span style="font-size:11px; font-weight:700; color:#60a5fa; min-width:180px;">{{ b.batch_id }}</span>
-                <span style="font-size:10px; color:#94a3b8; min-width:90px;">{{ formatDateDMY(b.trade_date) }}</span>
-                <span style="font-size:10px; color:#94a3b8; min-width:70px;">Buy: {{ b.buy_time }}</span>
-                <span style="font-size:10px; color:#94a3b8; min-width:70px;">Sell: {{ b.sell_time || '-' }}</span>
-                <span style="font-size:10px; padding:2px 8px; border-radius:4px; font-weight:700; min-width:55px; text-align:center;"
-                  [style.background]="b.status === 'OPEN' ? '#1d4ed820' : '#16a34a20'"
-                  [style.color]="b.status === 'OPEN' ? '#60a5fa' : '#22c55e'">{{ b.status }}</span>
-                <span style="font-size:12px; font-weight:700; min-width:70px; text-align:right;"
-                  [style.color]="b.avg_return_pct >= 0 ? '#22c55e' : '#ef4444'"
-                  [title]="b.status === 'OPEN' ? 'Live unrealized average (current price vs buy price)' : 'Realized average at sell'">
-                  {{ b.avg_return_pct | number:'1.2-2' }}%@if (b.status === 'OPEN') { <span style="color:#60a5fa; font-size:9px;">&nbsp;live</span> }
-                </span>
-                <span style="font-size:10px; color:#94a3b8; min-width:40px;">{{ b.trade_type }}</span>
-                <div style="margin-left:auto; display:flex; gap:6px;">
-                  @if (b.status === 'OPEN') {
-                    <button class="trade-mini sell" style="padding:3px 10px; font-size:10px;" (click)="sellTradeBatch(b.batch_id); $event.stopPropagation()" [disabled]="tradeBatchSelling === b.batch_id">
-                      @if (tradeBatchSelling === b.batch_id) { <span class="spin"></span> } @else { Sell All }
-                    </button>
-                  }
-                  <button class="btn-outline" style="padding:3px 8px; font-size:9px; color:#ef4444; border-color:#ef444440;" (click)="deleteTradeBatch(b.batch_id); $event.stopPropagation()">Del</button>
-                </div>
-              </div>
-              @if (expandedBatchId === b.batch_id) {
-                <div style="padding:0 14px 10px 44px;">
-                  <table style="width:100%; border-collapse:collapse; min-width:500px;">
-                    <thead>
-                      <tr>
-                        <th class="tbl-hdr" style="width:36px; text-align:center;">Rank</th>
-                        <th class="tbl-hdr">Symbol</th>
-                        <th class="tbl-hdr">Sector</th>
-                        <th class="tbl-hdr" style="text-align:right;">Buy Price</th>
-                        <th class="tbl-hdr" style="text-align:right;">Sell Price</th>
-                        <th class="tbl-hdr" style="text-align:right;">Return %</th>
-                        <th class="tbl-hdr" style="width:60px; text-align:center;">Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      @for (s of b.stocks || []; track s.symbol) {
-                        <tr class="tbl-row">
-                          <td style="font-size:11px; padding:5px 10px; text-align:center; color:#64748b;">{{ s.rank }}</td>
-                          <td style="font-size:11px; padding:5px 10px; font-weight:700; color:#e2e8f0;">{{ s.symbol }}</td>
-                          <td class="tbl-cell" style="font-size:11px;">{{ s.sector }}</td>
-                          <td class="tbl-cell-num" style="font-size:11px;">{{ s.buy_price | number:'1.2-2' }}</td>
-                          <td class="tbl-cell-num" style="font-size:11px;">
-                            @if (s.sell_price != null) { {{ s.sell_price | number:'1.2-2' }} }
-                            @else if (s.live && s.current_price != null) { <span [title]="'Current price (held)'">{{ s.current_price | number:'1.2-2' }}</span> }
-                            @else { - }
-                          </td>
-                          <td style="font-size:11px; padding:5px 10px; text-align:right; font-weight:600;"
-                            [style.color]="s.return_pct >= 0 ? '#22c55e' : '#ef4444'">
-                            @if (s.status === 'CLOSED') { {{ s.return_pct | number:'1.2-2' }}% }
-                            @else if (s.live && s.current_price != null) { {{ s.return_pct | number:'1.2-2' }}% }
-                            @else { - }
-                          </td>
-                          <td style="font-size:10px; padding:5px 10px; text-align:center;"
-                            [style.color]="s.status === 'OPEN' ? '#60a5fa' : '#22c55e'">{{ s.status }}</td>
-                        </tr>
-                      }
-                    </tbody>
-                  </table>
-                </div>
-              }
-            </div>
-          }
-          @if (!tradeBatches.length) {
-            <div style="text-align:center; padding:24px; color:#64748b; font-size:12px;">
-              No trade batches yet. Click "Buy All 10" to create your first trade batch from Current Top 10.
-            </div>
-          }
-        </div>
-      </div>
-
     </div>
 
     <!-- â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• RIGHT COL â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â• -->
@@ -2018,10 +1227,43 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
           </div>
         }
 
+          <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:8px;">
+            @if (batchHoldingAvailable) {
+              <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Holding period</span>
+              @for (dnum of holdingDayChoices; track dnum) {
+                <button class="btn-outline" style="font-size:10px; padding:4px 9px;"
+                        [style.background]="batchHoldingDay === dnum ? '#1d6adb' : 'transparent'"
+                        [style.color]="batchHoldingDay === dnum ? '#fff' : '#cbd5e1'"
+                        [style.borderColor]="batchHoldingDay === dnum ? '#1d6adb' : '#334155'"
+                        (click)="setBatchHoldingDay(dnum)"
+                        [title]="'Return ' + dnum + ' trading day(s) after entry, measured from the entry price'">
+                  Day {{ dnum }}
+                </button>
+              }
+            } @else if (trendMode === 'closed') {
+              <span style="font-size:10px; color:#64748b;"
+                    title="Closed days are stored as one settled next-day figure per ranking run, so there is nothing per-stock left to re-value at a longer hold. Use Backtest or a date range to choose a holding period.">
+                Holding period: next close only &mdash; run a backtest or range to choose one
+              </span>
+            }
+            <span style="width:1px; height:16px; background:#334155; margin:0 4px;"></span>
+            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Bars on screen</span>
+            @for (n of barsOnScreenChoices; track n) {
+              <button class="btn-outline" style="font-size:10px; padding:4px 11px;"
+                      [style.background]="barsOnScreen === n ? '#1d6adb' : 'transparent'"
+                      [style.color]="barsOnScreen === n ? '#fff' : '#cbd5e1'"
+                      [style.borderColor]="barsOnScreen === n ? '#1d6adb' : '#334155'"
+                      (click)="setBarsOnScreen(n)"
+                      [title]="n === 0 ? 'Draw every bar in the loaded range' : 'Draw the most recent ' + n + ' bars. The figures below follow the same window.'">
+                {{ barsLabel(n) }}
+              </button>
+            }
+          </div>
+
         <!-- Bar chart -->
         <div style="display:flex; align-items:flex-end; gap:4px; height:220px; overflow-x:auto; padding-bottom:26px; position:relative;">
           <div style="position:absolute; bottom:24px; left:0; right:0; height:1px; background:#1e2a3b;"></div>
-          @for (d of tradeBatchTrend; track d.batch_id) {
+          @for (d of batchHoldingBars; track d.batch_id) {
             <div style="display:flex; flex-direction:column; align-items:center; gap:2px; min-width:38px; cursor:pointer;"
               [title]="batchBarTooltip(d)">
               <div style="font-size:8px; font-weight:700;"
@@ -2094,8 +1336,12 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
             </span>
             <div style="font-size:10px; color:#94a3b8; margin-top:3px;">
               Entry test: Previous Close &lt; Base Price <strong>and</strong> Current Price &ge; Base Price
-              (the crossing). <strong>No ranking</strong> &mdash; every stock that qualifies is listed,
-              strongest move first. Volume and ATR are shown on each row; neither excludes a stock.
+              (the crossing). <strong>No ranking</strong> &mdash; of the stocks that qualify, the
+              <strong>{{ LOW_SECTION_STOCKS }} most heavily traded</strong> are kept, since this is the
+              shortlist to actually hold and a position has to be openable. Volume and ATR are shown
+              on each row; neither excludes a stock from qualifying. The bars below average these
+              same {{ LOW_SECTION_STOCKS }}. To see every crossing instead, use the
+              &ldquo;with Volume&rdquo; section beneath.
             </div>
           </div>
 
@@ -2337,6 +1583,18 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
                 Day {{ dnum }}
               </button>
             }
+            <span style="width:1px; height:16px; background:#334155; margin:0 4px;"></span>
+            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Bars on screen</span>
+            @for (n of barsOnScreenChoices; track n) {
+              <button class="btn-outline" style="font-size:10px; padding:4px 11px;"
+                      [style.background]="barsOnScreen === n ? '#1d6adb' : 'transparent'"
+                      [style.color]="barsOnScreen === n ? '#fff' : '#cbd5e1'"
+                      [style.borderColor]="barsOnScreen === n ? '#1d6adb' : '#334155'"
+                      (click)="setBarsOnScreen(n)"
+                      [title]="n === 0 ? 'Draw every bar in the loaded range' : 'Draw the most recent ' + n + ' bars. The figures below follow the same window.'">
+                {{ barsLabel(n) }}
+              </button>
+            }
           </div>
 
           <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; padding:6px 10px;
@@ -2377,6 +1635,7 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
                      [style.color]="(d.open_return || 0) >= 0 ? '#22c55e' : '#ef4444'">
                   {{ d.open_return != null ? (d.open_return | number:'1.1-1') : '' }}
                 </div>
+
                 <!-- Hollow, because it is not a result yet: the position is still running and this
                      number will keep moving until it settles. -->
                 <div [style.height]="barH(d.open_return || 0, lowTrendMax)+'px'"
@@ -2675,6 +1934,18 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
                 Day {{ dnum }}
               </button>
             }
+            <span style="width:1px; height:16px; background:#334155; margin:0 4px;"></span>
+            <span style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.4px;">Bars on screen</span>
+            @for (n of barsOnScreenChoices; track n) {
+              <button class="btn-outline" style="font-size:10px; padding:4px 11px;"
+                      [style.background]="barsOnScreen === n ? '#1d6adb' : 'transparent'"
+                      [style.color]="barsOnScreen === n ? '#fff' : '#cbd5e1'"
+                      [style.borderColor]="barsOnScreen === n ? '#1d6adb' : '#334155'"
+                      (click)="setBarsOnScreen(n)"
+                      [title]="n === 0 ? 'Draw every bar in the loaded range' : 'Draw the most recent ' + n + ' bars. The figures below follow the same window.'">
+                {{ barsLabel(n) }}
+              </button>
+            }
           </div>
 
           <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center; padding:6px 10px;
@@ -2715,6 +1986,7 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
                      [style.color]="(d.open_return || 0) >= 0 ? '#22c55e' : '#ef4444'">
                   {{ d.open_return != null ? (d.open_return | number:'1.1-1') : '' }}
                 </div>
+
                 <!-- Hollow, because it is not a result yet: the position is still running and this
                      number will keep moving until it settles. -->
                 <div [style.height]="barH(d.open_return || 0, volTrendMax)+'px'"
@@ -2760,42 +2032,6 @@ const SESSION_CLOSE_MINUTES = 15 * 60 + 30;
       </div>
 
       <!-- Performance Distribution section removed -->
-
-      <!-- Download / Export Section -->
-      <div class="card" style="padding:12px; grid-column:1 / -1;">
-        <div class="section-title" style="margin-bottom:10px;">Download / Export</div>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:7px;">
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px;"
-            (click)="downloadRankingCurrent()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Download Top 10 (Current)</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px;"
-            (click)="downloadChartTrades(null)"
-            title="Last 30 days, one row per stock per chart bar: buy and sell date, time, price and return">
-            <span style="font-size:10.5px; color:#cbd5e1;">Download Chart Bar Stocks (30 days)</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px;"
-            (click)="downloadHistorical()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Download Historical Ranking</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px;"
-            (click)="downloadRankingPrevious()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Download Top 10 (Previous)</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px;"
-            (click)="exportCsv()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Export to CSV</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px; grid-column:1/-1;"
-            (click)="exportPdf()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Download Performance Report</span>
-          </button>
-          <button class="btn-outline" style="display:flex; align-items:center; gap:6px; padding:7px 10px; grid-column:1/-1;"
-            (click)="exportPdf()">
-            <span style="font-size:10.5px; color:#cbd5e1;">Export to PDF</span>
-          </button>
-        </div>
-      </div>
 
       @if (isAdmin()) {
         <button class="btn-outline" style="padding:8px; text-align:center; font-size:11px; display:block; width:100%; grid-column:1 / -1;"
@@ -2870,7 +2106,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   ranking         = signal(false);
   showTradeModal  = signal(false);
   tradeSubmitting = signal(false);
-  bulkTrading     = signal(false);
   tradeError      = signal('');
   showProgressDashboard = signal(false);
   top10Refreshing = false;
@@ -2906,28 +2141,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   changedTop10Symbols = new Set<string>();   // rows to flash on next change
   private flashTimer: any;
 
-  // ── Automation config panel (spec §1, §4, §12) ───────────────────────────
-  showAutomationPanel = false;
-  showPrevAutomationPanel = false;
   private prevAutoTimer: any = null;
-  prevRefreshOptions = [
-    { sec: 30,   label: '30 seconds' },
-    { sec: 60,   label: '1 minute' },
-    { sec: 300,  label: '5 minutes' },
-    { sec: 600,  label: '10 minutes' },
-    { sec: 900,  label: '15 minutes' },
-    { sec: 1800, label: '30 minutes' },
-  ];
-  automationSaving = false;
-  /** Cadences offered for the Current Top 10 run. 60s is the floor: the scheduler ticks once a minute. */
-  top10IntervalOptions = [
-    { sec: 60,   label: '1 minute' },
-    { sec: 300,  label: '5 minutes' },
-    { sec: 600,  label: '10 minutes' },
-    { sec: 900,  label: '15 minutes' },
-    { sec: 1800, label: '30 minutes' },
-    { sec: 3600, label: '1 hour' },
-  ];
   automation: any = {
     top10_auto_refresh_enabled: true,
     top10_auto_refresh_interval_sec: 300,
@@ -2954,13 +2168,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   jobHistory: any[] = [];
   private jobPollTimer: any = null;
 
-  // Pipeline state
-  pipelineJobId = '';
   pipelineStages: any[] = [];
   pipelineActive = false;
   pipelineProgress = 0;
   private pipelinePollTimer: any = null;
-  private pipelineCompletedStages = new Set<string>();
 
   // Data
   dash: any = { total:0, positive:0, negative:0, eligible:0, avg_return:0, eligible_pct:0, last_refreshed:'-', market_status:'CLOSED' };
@@ -2973,7 +2184,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   uploadResult: any = null;
   refreshResult: any = null;
   uploadedStocks: any[] = [];
-  removingUploadedSymbols = new Set<string>();
   uploadedTotal = 0;
   uploadedPage = 0;
   uploadedPageSize = 10;
@@ -2984,18 +2194,13 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   portfolios: any[] = [];
   positionsBySymbol: Record<string, any> = {};
   tradeDraft: any = { portfolioId:null, symbol:'', tradeType:'BUY', qty:1, price:0 };
-  bulkOrderMode: 'PAPER' | 'REAL' = 'PAPER';
-  bulkTradeTime = 'NOW';
   totalTradingAmount = 100000;
   perStockAllocation = 10000;
-  filterBuyerSeller = false;
-  excludedCount = 0;
   // 15:15, matching top10.lock.time - the day's final ranking run is what the panel buys at.
   trendBuyTime = '15:15';
   // 15:00 on the next trading day - fifteen minutes before the 15:15 that buys the next
   // position, so a sell and a buy never land on the same minute.
   trendSellTime = '15:00';
-  trendHoldDays = 1;
   trendDays = 30;                        // number of days to back-test (spec §7)
   trendPeriod = '1M';                    // Time selection for the Avg Return Trend panel
   trendCustomDate = '';
@@ -3030,22 +2235,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   volResult: any = null;
   volRefreshing = false;
   volHoldingDay = 1;
-  // Historical Trade Analysis (BUYER / SELLER)
-  htaDirection: 'BUY' | 'SELL' = 'BUY';
-  htaPrimaryDate = '';
-  // A bar start. Candles are hourly from the 09:15 open, so the last one is 15:15 - and the
-  // EXACT price rule matches inside a single minute, so an off-grid time resolves to nothing.
-  htaPrimaryTime = '15:15';
-  htaSecondaryDate = '';
-  htaSecondaryTime = '10:00';
-  htaCapital = 100000;
-  htaPriceRule = 'NEXT';
-  htaResult: any = null;
-  htaError = '';
-  htaLoading = false;
-  htaSelected: Record<string, boolean> = {};
   rangeFrom = '';
   rangeTo = '';
+  /** Upper bound for every date picker on this screen - no future dates to choose. */
+  todayIso = new Date().toISOString().slice(0, 10);
   rangeResult: any = null;
 
   // Trade Batch state
@@ -3053,79 +2246,16 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   tradeBatchSummary: any = {};
   tradeBatchTrend: any[] = [];
   tradeBatchLoading = false;
-  tradeBatchCreating = false;
   tradeBatchSelling = '';
   tradeBatchFilter = 'ALL';
-  expandedBatchId = '';
 
   // Stale Previous Close diagnostic
   staleLoading = false;
   staleResult: any = null;
 
-  // Time Selection (spec §2) — named period drives DB-only historical buy pricing
-  // '1D', not 'NOW'. NOW resolves to TODAY, so before 15:20 the panel asked for a cut-off price
-  // that has not happened yet and every row showed "No price" - which reads as broken data rather
-  // than as a time that has not arrived. 1D is the last completed cut-off: the same frozen list the
-  // trend section below shows, so the two agree instead of contradicting each other.
-  /**
-   * This section's trading rule, fixed rather than chosen.
-   *
-   * <p>Buy at 15:20 on the previous trading day, sell at 11:00 on the next. Deliberately NOT
-   * the 15:15/15:00 the RSI 45 section uses - these are two different strategies that happen to
-   * share a screen, and tying them to one global setting made a change to either silently move
-   * the other.
-   */
-  readonly PREV_BUY_TIME  = '15:15';
-  readonly PREV_SELL_TIME = '10:15';
-
-  prevPeriod = '1D';
-  prevCustomDate = '';
-  prevBuyTime = '15:15';                 // fixed - see PREV_BUY_TIME
-  /**
-   * The times a stored candle actually starts at: 09:15 → 15:15, one per hour.
-   *
-   * This listed 09:00 → 15:30 in 5-minute steps, which was right while candles were 5 minutes
-   * wide. Candles are now hourly and anchored on the 09:15 open (livecandle.interval.minutes),
-   * so 66 of the 79 options it offered no longer correspond to any bar - and picking one did not
-   * fail visibly, it silently priced off the NEXT bar up to 59 minutes later. Offer only real
-   * bar starts. Keep in step with livecandle.interval.minutes if that is ever changed again.
-   */
-  readonly CANDLE_INTERVAL_MINUTES = CANDLE_INTERVAL_MINUTES;
-  buyTimeOptions: string[] = (() => {
-    const out: string[] = [];
-    // mins < close, not <= : a bar that would start exactly at the close is not a bar. The last
-    // one is 15:15, which is short (15 minutes) but real, and is the buy leg's time.
-    for (let mins = SESSION_OPEN_MINUTES; mins < SESSION_CLOSE_MINUTES; mins += CANDLE_INTERVAL_MINUTES) {
-      out.push(`${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`);
-    }
-    return out;
-  })();
-  // Sell leg of the Previous Top 10 back-test. NOW keeps the original
-  // mark-to-market behaviour; any other value prices the sell from history.
-  // The sell leg is the NEXT trading day, never "now" - a position bought yesterday at 15:20
-  // is closed at 11:00 today, and the server skips weekends and holidays when resolving it.
-  prevSellPeriod = '1D';
-  prevSellCustomDate = '';
-  prevSellTime = '10:15';                // fixed - see PREV_SELL_TIME
-  previewLoading = false;
-  periodPreview: any = null;
-  todayIso = new Date().toISOString().slice(0, 10);
   prevPeriodOptions = [
     { value: 'PAPER',  label: 'Paper' },
     { value: 'NOW',    label: 'Now' },
-    { value: '1D',     label: '1 Day' },
-    { value: '2D',     label: '2 Days' },
-    { value: '3D',     label: '3 Days' },
-    { value: '5D',     label: '5 Days' },
-    { value: '1W',     label: '1 Week' },
-    { value: '2W',     label: '2 Weeks' },
-    { value: '1M',     label: '1 Month' },
-    { value: '60D',    label: '60 Days' },
-    { value: 'CUSTOM', label: 'Custom Date' },
-  ];
-  /** Same days as the buy side minus Paper, which has no historical sell price. */
-  prevSellPeriodOptions = [
-    { value: 'NOW',    label: 'Now (live)' },
     { value: '1D',     label: '1 Day' },
     { value: '2D',     label: '2 Days' },
     { value: '3D',     label: '3 Days' },
@@ -3154,20 +2284,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   uploadSearch = '';
   private searchDebounce: any;
 
-  // Available period options â€” 5, 10, 20, 30, 60, 90
-  readonly chartPeriods = [5, 10, 15, 20, 25, 30, 60, 90];
-  readonly hardcodedReturnRanges = [
-    'Below -15%',
-    '-15% to -10%',
-    '-10% to -5%',
-    '-5% to 0%',
-    '0% to 5%',
-    '5% to 10%',
-    '10% to 15%',
-    '15% to 30%',
-    'Above 30%'
-  ];
-
   readonly Math = Math;
   private timer: any;
   private uploadedRequestId = 0;
@@ -3178,12 +2294,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
 
   // Donut segments for sector
   donutSegments: any[] = [];
-  distDonutSegments: any[] = [];
-  distPositiveLine: any[] = [];
-  distNegativeLine: any[] = [];
 
   readonly SECTOR_COLORS = ['#3b82f6','#22c55e','#f59e0b','#ef4444','#8b5cf6','#06b6d4','#ec4899','#14b8a6','#f97316','#84cc16'];
-  readonly DIST_COLORS   = ['#1e3a5f','#1e4d2b','#16a34a','#4ade80','#60a5fa','#f59e0b','#ef4444','#dc2626','#7f1d1d'];
 
   constructor(private api: ApiService, public auth: AuthService, private http: HttpClient, private livePrices: LivePriceService) {}
 
@@ -3416,7 +2528,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
                      'TradeRakshak_RSI45_Previous_Close_Less_Base_Price.csv');
   }
 
-  loadAll() { this.initBelowPricePanel(); this.loadDashboard(); this.loadRanking(); this.loadChartData(); this.loadPositions(); this.loadPortfolios(); this.loadUploadedStocks(); this.recalcAllocation(); this.loadUploadStats(); this.loadTradeBatches(); this.runBacktestTrend(); this.loadPeriodPreview(); }
+  loadAll() { this.initBelowPricePanel(); this.loadDashboard(); this.loadRanking(); this.loadChartData(); this.loadPositions(); this.loadPortfolios(); this.loadUploadedStocks(); this.recalcAllocation(); this.loadUploadStats(); this.loadTradeBatches(); this.runBacktestTrend(); }
 
   loadDashboard() {
     this.api.get<any>('/tracker/dashboard').subscribe({ next: r => {
@@ -3456,53 +2568,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       this.prevTop10Refreshing = false;
       this.top10RefreshError = true;
     }});
-  }
-
-  /**
-   * Re-runs the full ranking and reloads the panel. The button stays frozen for the whole
-   * round trip - scoring on the server, then the reload - and a repeat click while it is
-   * running is ignored rather than queued.
-   */
-  refreshTop10() {
-    if (this.top10Refreshing) return;
-    this.top10Refreshing = true;
-    this.manualTop10Refresh = true;
-    this.top10RefreshError = false;
-    this.ranking.set(true);
-    this.api.post<any>('/tracker/rank', {}).subscribe({
-      next: r => {
-        if (r.data) this.rd = r.data;
-        this.ranking.set(false);
-        this.finishTop10Refresh();
-      },
-      error: () => {
-        this.ranking.set(false);
-        this.top10RefreshError = true;
-        this.finishTop10Refresh();
-      }
-    });
-  }
-
-  /** Reloads the panel, then releases the button - never before. */
-  private finishTop10Refresh(): void {
-    this.api.get<any>('/tracker/ranking/latest').subscribe({
-      next: r => {
-        if (r.data && !r.data.message) {
-          this.rd = r.data;
-          this.buildSectorDonut();
-          const now = new Date().toISOString();
-          this.currentTop10LastUpdated = now;
-          this.previousTop10LastUpdated = now;
-        }
-        this.manualTop10Refresh = false;
-        this.top10Refreshing = false;
-      },
-      error: () => {
-        this.manualTop10Refresh = false;
-        this.top10Refreshing = false;
-        this.top10RefreshError = true;
-      }
-    });
   }
 
   // ── Server-pushed Current Top 10 diff (SSE) ──────────────────────────────
@@ -3545,9 +2610,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     });
   }
 
-  toggleAutomationPanel(): void { this.showAutomationPanel = !this.showAutomationPanel; }
-  togglePrevAutomationPanel(): void { this.showPrevAutomationPanel = !this.showPrevAutomationPanel; }
-
   /**
    * Previous Top 10 and its average-return bars are one view of the same numbers, so they
    * refresh together - a bar chart showing a different average from the table above it is
@@ -3559,36 +2621,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     const secs = Math.max(30, Number(this.automation.prevtop10_auto_refresh_interval_sec) || 300);
     this.prevAutoTimer = setInterval(() => {
       if (this.destroyed) return;
-      this.loadPeriodPreview();
       this.runBacktestTrend();
     }, secs * 1000);
-  }
-
-  onLiveModeChange(): void {
-    // Guard: switching to LIVE (real orders) requires explicit confirmation.
-    if (this.automation.prevtop10_execution_mode === 'LIVE') {
-      const ok = confirm(
-        'Enable LIVE execution mode?\n\nWhen the auto buy/sell cycle runs in LIVE mode it can place REAL broker orders using real money. ' +
-        'Leave this on PAPER unless you fully understand the risk. Continue with LIVE?');
-      if (!ok) { this.automation.prevtop10_execution_mode = 'PAPER'; }
-    }
-  }
-
-  saveAutomationConfig(): void {
-    this.automationSaving = true;
-    this.api.put<any>('/tracker/automation/config', this.automation).subscribe({
-      next: r => { if (r.data) this.automation = { ...this.automation, ...r.data }; this.automationSaving = false; },
-      error: () => { this.automationSaving = false; }
-    });
-  }
-
-  loadDist() {
-    this.api.get<any>('/tracker/distribution').subscribe({ next: r => {
-      this.dist = r.data?.distribution || [];
-      this.distPositiveLine = r.data?.positive_line || [];
-      this.distNegativeLine = r.data?.negative_line || [];
-      this.buildDistDonut();
-    }});
   }
 
   loadChartData() {
@@ -3627,68 +2661,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     return !!pos && Number(pos.qty || 0) > 0;
   }
 
-  isMarketHours(): boolean {
-    const now = new Date();
-    const h = now.getHours(), m = now.getMinutes();
-    const mins = h * 60 + m;
-    return mins >= 555 && mins <= 930; // 9:15 AM to 3:30 PM IST
-  }
-
-  refreshPreviousTop10(): void {
-    this.prevTop10Refreshing = true;
-    this.ranking.set(true);
-    this.api.post<any>('/tracker/rank', {}).subscribe({
-      next: r => {
-        if (r.data) this.rd = r.data;
-        this.ranking.set(false);
-        this.loadRanking();
-        this.loadChartData();
-      },
-      error: () => {
-        this.ranking.set(false);
-        this.prevTop10Refreshing = false;
-        this.loadRanking();
-      }
-    });
-  }
-
-  bulkPrevTop10Order(side: 'BUY' | 'SELL'): void {
-    const rows = this.rd?.previous_top10 || [];
-    if (!rows.length) {
-      alert('Previous Top 10 is not available yet.');
-      return;
-    }
-    if (!this.isMarketHours()) {
-      alert('Market is closed. Bulk trading is available only during market hours (9:15 AM - 3:30 PM IST). Paper trades will be logged.');
-    }
-    const ok = confirm(`${side} all Previous Top 10 stocks?\n\nThis will place ${side === 'BUY' ? 'buy' : 'sell'} orders for all 10 previous top stocks using Paper trading.\n\nAllocation: ₹${this.perStockAllocation}/stock.`);
-    if (!ok) return;
-    this.bulkTrading.set(true);
-    this.api.post<any>('/trading/stock-tracker/bulk-order', {
-      confirmed: true,
-      side,
-      mode: 'PAPER',
-      source: 'PREVIOUS_TOP10',
-      investmentAmountPerStock: this.perStockAllocation,
-      tradeTime: 'NOW',
-      exchange: 'NSE',
-      segment: 'EQ-SWG',
-      productType: 'CNC',
-      orderType: 'MARKET'
-    }).subscribe({
-      next: r => {
-        this.bulkTrading.set(false);
-        const data = r.data || r;
-        alert(`${side} All 10 completed.\nSuccess: ${data.success_count || 0}\nFailed: ${data.failed_count || 0}`);
-        this.loadPositions();
-      },
-      error: e => {
-        this.bulkTrading.set(false);
-        alert(e.error?.message || `${side} All 10 failed.`);
-      }
-    });
-  }
-
   // Trade Batch methods
   loadTradeBatches() {
     this.tradeBatchLoading = true;
@@ -3719,92 +2691,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     });
   }
 
-  // Spec §7: configurable back-test using actual stored intraday prices.
-  /**
-   * Replay the Current Top 10 across a date range. Rows come back carrying trade_date and
-   * avg_return_pct, the two fields the bars already read, so the same chart renders the
-   * range. Stored data only - no live feed - so this works outside market hours.
-   */
-  /** Buyer opens with a buy, seller opens with a sell - the primary leg is the opening one. */
-  htaPrimaryLabel(): string { return this.htaDirection === 'BUY' ? 'Buy' : 'Sell'; }
-  htaSecondaryLabel(): string { return this.htaDirection === 'BUY' ? 'Sell' : 'Buy'; }
-
-  /** Switching direction invalidates every number on screen, so clear rather than keep stale. */
-  onHtaDirectionChange(): void {
-    this.htaResult = null;
-    this.htaError = '';
-    this.htaSelected = {};
-  }
-
-  htaToggle(sym: string): void {
-    this.htaSelected[sym] = this.htaSelected[sym] === false;
-    this.runHistoricalTrade();
-  }
-  htaSelectAll(on: boolean): void {
-    for (const s of (this.htaResult?.stocks || [])) this.htaSelected[s.symbol] = on;
-    this.runHistoricalTrade();
-  }
-
-  htaBarColor(v: any): string {
-    const n = Number(v);
-    if (!isFinite(n) || n === 0) return '#94a3b8';
-    return n > 0 ? '#22c55e' : '#ef4444';
-  }
-  /** Full width at 10% either way - beyond that the bar simply saturates. */
-  htaBarWidth(v: any): string {
-    const n = Math.min(Math.abs(Number(v) || 0), 10);
-    return Math.round((n / 10) * 100) + '%';
-  }
-
-  /**
-   * Every figure is recalculated on the backend from stored data; nothing on this screen is
-   * trusted as an input to the maths. The button stays disabled while a call is in flight so
-   * repeated clicks cannot stack duplicate requests.
-   */
-  runHistoricalTrade(): void {
-    if (this.htaLoading) return;
-    if (!this.htaDirection) { this.htaError = 'Please select a Trade Direction (Buyer or Seller).'; return; }
-    if (!this.htaPrimaryDate || !this.htaPrimaryTime) {
-      this.htaError = 'Please select all required Date and Time fields.'; return;
-    }
-    const picked = Object.keys(this.htaSelected).filter(k => this.htaSelected[k] !== false);
-    const anyDeselected = Object.values(this.htaSelected).some(v => v === false);
-    this.htaLoading = true;
-    this.htaError = '';
-    this.api.post<any>('/tracker/historical-trade', {
-      trade_direction: this.htaDirection,
-      primary_date: this.htaPrimaryDate,
-      primary_time: this.htaPrimaryTime,
-      secondary_date: this.htaSecondaryDate || null,
-      secondary_time: this.htaSecondaryDate ? this.htaSecondaryTime : null,
-      capital: Number(this.htaCapital) || 0,
-      price_rule: this.htaPriceRule,
-      symbols: anyDeselected ? picked : null
-    }).subscribe({
-      next: r => {
-        const d = r.data || {};
-        this.htaLoading = false;
-        if (d.success === false) { this.htaResult = null; this.htaError = d.error || 'Calculation failed.'; return; }
-        this.htaResult = d;
-      },
-      error: (e: any) => {
-        this.htaLoading = false;
-        this.htaResult = null;
-        // An expired session used to surface as "unable to retrieve historical market
-        // data", which sends you looking for a data problem that does not exist.
-        const status = e?.status;
-        if (status === 401 || status === 403) {
-          this.htaError = 'Your session has expired. Please sign in again.';
-        } else if (status === 0) {
-          this.htaError = 'Cannot reach the server. Check that the application is running.';
-        } else {
-          this.htaError = e?.error?.message
-            || 'Unable to retrieve historical market data. Please try again.';
-        }
-      }
-    });
-  }
-
   /**
    * The single Run & Refresh top 10 action.
    *
@@ -3830,15 +2716,79 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.loadReconstructedTrend(from.toISOString().slice(0, 10), to.toISOString().slice(0, 10));
   }
 
+  /**
+   * How many stocks the plain RSI 45 section keeps - the heaviest traded five.
+   *
+   * This section is read as a shortlist to actually hold, so it stays capped; its sibling
+   * "with Volume" lists every crossing and passes no limit. The same number is sent to the
+   * chart endpoint, so the bars average these five and not the whole qualifying set.
+   */
+  readonly LOW_SECTION_STOCKS = 5;
+
   /** Which holding day the chart is showing. Day 1 is the first trading session after entry. */
   lowHoldingDay = 1;
-  readonly holdingDayChoices = [1, 2, 3, 4, 5];
+  /**
+   * Daily detail over the first two weeks, then the monthly checkpoints.
+   *
+   * Every day is measured from the ENTRY price, so Day 30 is entry-to-day-30 and not a chain of
+   * thirty one-day moves. Must stay in step with HOLDING_DAY_CHOICES in StockTrackerService -
+   * the server emits a dayN_return only for the days listed there, and a day offered here that
+   * it does not emit would read as "pending" forever rather than as an error.
+   */
+  readonly holdingDayChoices = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30];
+
+  /**
+   * How many of the most recent bars to draw. 0 means every bar in the loaded range.
+   *
+   * This trims the chart only at the right-hand edge; it never refetches. The figures printed
+   * under a chart are computed from the SAME trimmed set, so the win rate and average always
+   * describe the bars actually on screen rather than a wider population behind them.
+   */
+  barsOnScreen = 30;
+  readonly barsOnScreenChoices = [10, 20, 30, 50, 100, 0];
 
   setHoldingDay(d: number): void { this.lowHoldingDay = d; }
   setVolHoldingDay(d: number): void { this.volHoldingDay = d; }
+  setBatchHoldingDay(d: number): void { this.batchHoldingDay = d; }
+  setBarsOnScreen(n: number): void { this.barsOnScreen = n; }
+  barsLabel(n: number): string { return n === 0 ? 'All' : String(n); }
+
+  /** The newest n entries, or all of them when n is 0 or longer than the series. */
+  private lastBars<T>(arr: T[]): T[] {
+    const n = Number(this.barsOnScreen) || 0;
+    if (!arr || n <= 0 || arr.length <= n) return arr || [];
+    return arr.slice(arr.length - n);
+  }
+
+  /** Which holding day chart 2 is showing. Only its rebuilt modes carry per-trade prices. */
+  batchHoldingDay = 1;
+
+  /**
+   * True when chart 2 is drawn from rebuilt trades, which carry each stock's forward closes.
+   *
+   * The "closed" mode reads tracker_rankings.trade_avg_return - one stored number per day,
+   * settled next-day - so there is nothing in it to re-value at Day 30. Rather than show a
+   * day-1 figure under a "Day 30" heading, the selector is hidden in that mode.
+   */
+  get batchHoldingAvailable(): boolean {
+    return this.trendMode !== 'closed'
+        && (this.tradeBatchTrend || []).some((d: any) => (d.trades || []).length > 0);
+  }
+
+  get batchHoldingBars(): any[] {
+    const bars = this.lastBars(this.tradeBatchTrend || []);
+    if (!this.batchHoldingAvailable) return bars;
+    return bars.map((d: any) => {
+      const rs = (d.trades || [])
+        .map((t: any) => this.tradeDayReturn(t, this.batchHoldingDay))
+        .filter((v: number | null) => v != null) as number[];
+      const avg = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : null;
+      return { ...d, avg_return_pct: avg == null ? 0 : avg, day_return: avg, day_trades: rs.length };
+    });
+  }
 
   get volHoldingBars(): any[] {
-    return (this.volTrend || []).map(d => {
+    return this.lastBars(this.volTrend || []).map(d => {
       const rs = (d.trades || [])
         .map((t: any) => this.tradeDayReturn(t, this.volHoldingDay))
         .filter((v: number | null) => v != null) as number[];
@@ -3854,7 +2804,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
 
   get volHoldingStats(): any {
     const rs: number[] = [];
-    for (const d of this.volTrend || []) {
+    // The visible window, not the whole loaded range: a win rate printed under a chart has to
+    // be the win rate OF that chart. Reading the full series here would put one population in
+    // the bars and a different one in the line of figures below them.
+    for (const d of this.lastBars(this.volTrend || [])) {
       for (const t of (d.trades || [])) {
         const v = this.tradeDayReturn(t, this.volHoldingDay);
         if (v != null) rs.push(v);
@@ -3896,14 +2849,20 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   loadVolumeTop10() {
     if (this.volTopLoading) return;
     this.volTopLoading = true;
+    // Top 10 by raw traded volume across every candidate, not the whole shortlist.
+    // applyRanking=false already sorts the pool heaviest-traded first, so limit=10 takes the ten
+    // most heavily traded - which is what "maximum volume compared to all stocks" asks for, and
+    // deliberately not the volume-above-average test the table below applies.
     this.api.get<any>('/tracker/ranking/provisional-top10',
-                      { requireCrossing: 'true', applyRanking: 'false' }).subscribe({
+                      { requireCrossing: 'true', applyRanking: 'false', limit: '10' }).subscribe({
       next: r => { this.volProvisional = r?.data || null; },
       error: () => { this.volProvisional = null; }
     });
+    // limit=10: of everything that qualified, show the ten most heavily traded. Applied after
+    // identification, so it narrows the view rather than changing which stocks pass the test.
     this.api.get<any>('/tracker/ranking/below-price-top10',
                       { requireVolume: 'true', applyRanking: 'false',
-                        priceAtClose: 'true' }).subscribe({
+                        priceAtClose: 'true', limit: '10' }).subscribe({
       next: r => { this.volTop = r?.data || null; this.volTopLoading = false; },
       error: () => {
         this.volTop = { top10: [], message: 'Could not build the list. Check that prices are loaded.' };
@@ -3972,7 +2931,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
    * rather than counted as 0%, which would pull the bar towards flat.
    */
   get lowHoldingBars(): any[] {
-    return (this.lowTrend || []).map(d => {
+    return this.lastBars(this.lowTrend || []).map(d => {
       const rs = (d.trades || [])
         .map((t: any) => this.tradeDayReturn(t, this.lowHoldingDay))
         .filter((v: number | null) => v != null) as number[];
@@ -3995,7 +2954,8 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
    */
   get lowHoldingStats(): any {
     const rs: number[] = [];
-    for (const d of this.lowTrend || []) {
+    // Same window as the bars above - see volHoldingStats.
+    for (const d of this.lastBars(this.lowTrend || [])) {
       for (const t of (d.trades || [])) {
         const v = this.tradeDayReturn(t, this.lowHoldingDay);
         if (v != null) rs.push(v);
@@ -4075,7 +3035,12 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     // running on endpoint defaults - ranked, top ten - so the preview never matched the holding
     // it was previewing.
     this.api.get<any>('/tracker/ranking/provisional-top10',
-                      { requireCrossing: 'true', applyRanking: 'false' }).subscribe({
+                      // Heading into tomorrow previews what this section will hold, so it
+                      // carries the section's own five-stock cap. Without it the preview
+                      // listed every crossing and promised a holding twice the size of the
+                      // one the table beneath it would actually take.
+                      { requireCrossing: 'true', applyRanking: 'false',
+                        limit: String(this.LOW_SECTION_STOCKS) }).subscribe({
       next: r => { this.provisional = r?.data || null; },
       error: () => { this.provisional = null; }
     });
@@ -4085,7 +3050,7 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     // of a list whose whole purpose is to show which ones qualify.
     this.api.get<any>('/tracker/ranking/below-price-top10',
                       { requireVolume: 'false', applyRanking: 'false',
-                        priceAtClose: 'true' }).subscribe({
+                        priceAtClose: 'true', limit: String(this.LOW_SECTION_STOCKS) }).subscribe({
       next: r => { this.lowTop = r?.data || null; this.lowTopLoading = false; },
       error: () => {
         this.lowTop = { top10: [], message: 'Could not build the list. Check that prices are loaded.' };
@@ -4118,7 +3083,9 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       // under a heading whose table shows every crossing - the same mismatch applyRanking=false
       // was added to prevent.
       to: this.lowTo, applyReturnBand: 'false', requireCrossing: 'true',
-      applyRanking: 'false', requireVolume: 'false', priceAtClose: 'true'
+      // Same five stocks the table keeps, so a bar is the average of the rows above it.
+      applyRanking: 'false', requireVolume: 'false', priceAtClose: 'true',
+      limit: String(this.LOW_SECTION_STOCKS)
     }).subscribe({
       next: r => {
         const d = r?.data || {};
@@ -4192,6 +3159,9 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
           losing_stocks:  x.trade_losers ?? 0,
           total_stocks:   x.trade_symbol_count ?? 0,
           symbols:        x.symbols || [],
+          // Carried through so the holding selector can re-value this chart. The server was
+          // already sending these rows; this mapping simply dropped them on the floor.
+          trades:         x.priced || [],
           sell_date:      x.sell_date,
           buy_time:       'close',
           sell_time:      'next close',
@@ -4217,21 +3187,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
         this.trendRefreshing = false;
       }
     });
-  }
-
-  // Spec §2: named time selection — refresh the preview immediately on change.
-  //
-  // This used to call syncTrendToPeriod(), which copied the Day, buy time and sell time into the
-  // Avg Return Trend panel and re-ran it. The two are separate questions - one is "what did this
-  // basket do", the other is "how has the strategy performed over a window" - and tying them
-  // meant the trend's own Time control silently moved whenever the table above it changed, so a
-  // range chosen on the trend could not be kept. The trend now holds whatever you set on it.
-  //
-  // The Ranking Chart Bar stays anchored to this table on purpose: it lives inside this section
-  // and is that table drawn day by day.
-  onPeriodChange() {
-    if (this.prevPeriod === 'CUSTOM' && !this.prevCustomDate) return; // wait for a date
-    this.loadPeriodPreview();
   }
 
   /**
@@ -4270,167 +3225,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.runBacktestTrend();
   }
 
-  // ---- Ranking Chart Bar: one bar per trading day, average of that day's ten ----
-  rankingTrend: any[] = [];
-  rankingTrendLoading = false;
-  rankingTrendDays = 30;
-  rankingTrendDayOptions = [10, 15, 30, 60, 90];
-  rankingTrendEndDate = '';
-  /** True when the newest bar predates today - the feed is behind, not the chart. */
-  rankingTrendStale = false;
-  rankingTrendRule = '';
-
-  /**
-   * Rebuilds the day-by-day average for the window ending on the day the table is showing.
-   *
-   * Deliberately the SAME endpoint and the same arguments the table's own list comes from - no
-   * price ceiling, no return band, no crossing requirement - so the chart and the table cannot
-   * drift apart the way the stored ranking runs did. Each day is rebuilt from prices stored up
-   * to that date and settled against the next trading day, so no saved ranking is needed and
-   * days from before ranking was switched on still chart.
-   */
-  loadRankingChartBar(endDate?: string): void {
-    const end = endDate || this.rankingTrendEndDate
-      || this.periodPreview?.run_date || this.periodPreview?.buy_date;
-    if (!end) { this.rankingTrend = []; return; }
-    this.rankingTrendEndDate = end;
-
-    // Calendar days back, so weekends and holidays return fewer bars rather than quietly
-    // stretching the window further into the past than the label says.
-    const from = new Date(end + 'T00:00:00');
-    from.setDate(from.getDate() - Number(this.rankingTrendDays));
-
-    const params: any = {
-      from: from.toISOString().slice(0, 10),
-      to: end,
-      buyTime: this.prevBuyTime,
-      applyReturnBand: 'false',
-      requireCrossing: 'false',
-      // Selected the way Today top 10 Ranking Stocks selects - max 2 per sector - so this chart
-      // and the ranking table above it describe the same basket.
-      capPerSector: 'true'
-    };
-    // Pin the exit time only when a historical sell day is actually selected; otherwise leave the
-    // backend on its own next-day exit, which is what the table above is doing.
-    if (this.prevSellPeriod && this.prevSellPeriod !== 'NOW') params.sellTime = this.prevSellTime;
-
-    this.rankingTrendLoading = true;
-    this.api.get<any>('/tracker/ranking/reconstruct-trend', params).subscribe({
-      next: r => {
-        this.rankingTrend = r?.data?.days || [];
-        this.rankingTrendRule = r?.data?.rule || '';
-
-        // Name the bar that was actually drawn, not the day that was asked for.
-        //
-        // The window is requested against the calendar, but the rebuild only returns sessions
-        // that have stored data - so when the feed is behind, the newest bar is older than the
-        // requested end. The caption said "Last bar (4 Sep) is the table above" while the last
-        // bar on screen was 28 Aug, which reads as a chart showing stale figures rather than a
-        // chart that is honestly out of data. Re-anchoring to the last returned day makes the
-        // caption true, and makes the gap between it and today visible instead of hidden.
-        const last = this.rankingTrend.length
-          ? this.rankingTrend[this.rankingTrend.length - 1]?.date : null;
-        if (last) this.rankingTrendEndDate = last;
-        this.rankingTrendStale = !!(last && last < this.todayIso);
-
-        this.rankingTrendLoading = false;
-      },
-      error: () => {
-        this.rankingTrend = [];
-        this.rankingTrendRule = '';
-        this.rankingTrendLoading = false;
-      }
-    });
-  }
-
-  loadPeriodPreview() {
-    this.previewLoading = true;
-    const params: any = { period: this.prevPeriod, time: this.prevBuyTime };
-    if (this.prevPeriod === 'CUSTOM' && this.prevCustomDate) params.customDate = this.prevCustomDate;
-    if (this.prevSellPeriod && this.prevSellPeriod !== 'NOW') {
-      params.sellPeriod = this.prevSellPeriod;
-      params.sellTime = this.prevSellTime;
-      if (this.prevSellPeriod === 'CUSTOM' && this.prevSellCustomDate) params.sellCustomDate = this.prevSellCustomDate;
-    }
-    this.api.get<any>('/tracker/trade-batches/preview', params).subscribe({
-      next: r => {
-        this.periodPreview = r.data || null;
-        this.previewLoading = false;
-        // Anchor the chart to the day the table actually resolved to, not the day requested -
-        // "1 Day" can land on an earlier session, and the last bar must be the table on screen.
-        const end = this.periodPreview?.run_date || this.periodPreview?.buy_date;
-        if (end) this.loadRankingChartBar(end); else this.rankingTrend = [];
-      },
-      error: () => { this.periodPreview = null; this.previewLoading = false; this.rankingTrend = []; }
-    });
-  }
-
-  /** "22 Aug 15:30" for a stored stamp, "22 Aug - Live" when the leg is marked to market. */
-  stampLabel(date?: string, time?: string): string {
-    if (!date) return '-';
-    const d = new Date(date + 'T00:00:00');
-    const day = isNaN(d.getTime())
-      ? date
-      : d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-    return time ? `${day} ${time}` : day;
-  }
-
-  periodLabel(): string {
-    return this.prevPeriodOptions.find(o => o.value === this.prevPeriod)?.label || this.prevPeriod;
-  }
-
-  createTradeBatch() {
-    // The button no longer greys out when there is nothing to buy, so the reason has to be
-    // stated here instead - a live button that does nothing is worse than a dead one.
-    if (!(this.rd?.current_top10?.length)) {
-      alert('There is no Current Top 10 to buy yet.\n\nNothing met the entry test on the last '
-          + 'completed session, or prices have not been loaded. Refresh the Top 10 and try again.');
-      return;
-    }
-    if (this.prevPeriod === 'CUSTOM' && !this.prevCustomDate) { alert('Please pick a custom date first.'); return; }
-    const when = this.prevPeriod === 'NOW' || this.prevPeriod === 'PAPER'
-      ? 'at the current market price'
-      : 'using stored prices from ' + (this.periodPreview?.buy_date || this.periodLabel());
-    const ok = confirm('Buy All 10 from Current Top 10 (' + this.periodLabel() + ')?\n\nThis records buy prices for all 10 stocks ' + when + ' as a Paper trade batch.');
-    if (!ok) return;
-    this.tradeBatchCreating = true;
-    const body: any = { trade_type: 'PAPER', period: this.prevPeriod };
-    if (this.prevPeriod === 'CUSTOM' && this.prevCustomDate) body.custom_date = this.prevCustomDate;
-    this.api.post<any>('/tracker/trade-batches/buy', body).subscribe({
-      next: r => {
-        this.tradeBatchCreating = false;
-        const data = r.data || r;
-        if (data.success) {
-          alert((data.message) || ('Trade batch ' + (data.batch_id || '') + ' created with ' + (data.stocks || 10) + ' stocks.'));
-          this.loadTradeBatches();
-          this.loadTradeBatchTrend();
-        } else {
-          alert(data.error || 'Failed to create trade batch.');
-        }
-      },
-      error: e => { this.tradeBatchCreating = false; alert(e.error?.message || 'Failed to create trade batch.'); }
-    });
-  }
-
-  // Spec §2: is there an active (OPEN) batch to sell?
-  hasOpenBatch(): boolean {
-    return (this.tradeBatches || []).some((b: any) => b?.status === 'OPEN');
-  }
-
-  // Spec §2: section-level "Sell All 10" — closes the active Previous Top 10 batch(es).
-  sellAllOpenBatch() {
-    if (this.tradeBatchSelling) return;                       // already closing one
-    const open = (this.tradeBatches || []).filter((b: any) => b?.status === 'OPEN');
-    if (!open.length) { alert('No active (open) batch to sell. Use "Buy All 10" first.'); return; }
-    const ok = confirm('Sell All 10 — close ' + (open.length === 1 ? 'the active batch' : open.length + ' active batches') +
-      '?\n\nThis records sell prices at current market prices, calculates P/L, and updates Trade History.');
-    if (!ok) return;
-    // Close them one at a time. The old code fired every batch in parallel through a single
-    // `tradeBatchSelling` string: the first response cleared the flag while the rest were
-    // still in flight, leaving the button stuck (or clearing it early and double-firing).
-    this.sellBatchesSequentially(open.map((b: any) => b.batch_id));
-  }
-
   private sellBatchesSequentially(batchIds: string[]): void {
     const next = batchIds.shift();
     if (!next) { this.loadTradeBatches(); this.loadTradeBatchTrend(); return; }
@@ -4466,81 +3260,14 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     });
   }
 
-  deleteTradeBatch(batchId: string) {
-    const ok = confirm('Delete trade batch ' + batchId + '? This cannot be undone.');
-    if (!ok) return;
-    this.api.delete<any>(`/tracker/trade-batches/${batchId}`).subscribe({
-      next: () => { this.loadTradeBatches(); this.loadTradeBatchTrend(); },
-      error: () => alert('Failed to delete batch.')
-    });
-  }
-
   get batchTrendAvg(): number {
     if (!this.tradeBatchTrend.length) return 0;
     const sum = this.tradeBatchTrend.reduce((s: number, d: any) => s + (Number(d.avg_return_pct) || 0), 0);
     return Math.round((sum / this.tradeBatchTrend.length) * 100) / 100;
   }
 
-  /**
-   * Tallest bar in the Ranking Chart Bar, so every bar is scaled against the biggest day on
-   * screen. Floored at 1 so a quiet window still draws readable bars rather than a row of
-   * full-height ones, and never divides by zero.
-   */
-  get rankingChartMax(): number {
-    return Math.max(1, ...this.rankingTrend
-      .map((d: any) => Math.abs(Number(d?.trade_avg_return) || 0)));
-  }
-
-  /** Days that closed in profit. An unsettled day counts as neither, which is why it is shown. */
-  get rankingChartUp(): number {
-    return this.rankingTrend
-      .filter((d: any) => d?.trade_avg_return != null && Number(d.trade_avg_return) >= 0).length;
-  }
-
-  get rankingChartDown(): number {
-    return this.rankingTrend
-      .filter((d: any) => d?.trade_avg_return != null && Number(d.trade_avg_return) < 0).length;
-  }
-
-  /** Days in the window with no settled return - still on the axis, but with no bar. */
-  get rankingChartUnsettled(): number {
-    return this.rankingTrend.filter((d: any) => d?.trade_avg_return == null).length;
-  }
-
-  /**
-   * Mean of the settled days only. Counting an unsettled day as 0% would drag this toward zero
-   * and read as a flat day that never actually happened.
-   */
-  get rankingTrendAvg(): number {
-    const v = this.rankingTrend
-      .map((d: any) => d?.trade_avg_return)
-      .filter((x: any) => x != null)
-      .map((x: any) => Number(x));
-    if (!v.length) return 0;
-    return Math.round((v.reduce((s: number, x: number) => s + x, 0) / v.length) * 100) / 100;
-  }
-
-  rankingBarTooltip(d: any): string {
-    if (!d) return '';
-    const ret = d.trade_avg_return == null
-      ? 'not settled yet'
-      : Number(d.trade_avg_return).toFixed(2) + '%';
-    const parts = [
-      String(d.date),
-      'Average of that day\'s Top 10: ' + ret,
-      'Stocks ranked: ' + (d.stocks_ranked ?? '-')
-        + (d.trade_symbol_count != null ? '  (priced: ' + d.trade_symbol_count + ')' : '')
-    ];
-    if (d.trade_winners != null) {
-      parts.push('Winners: ' + d.trade_winners + ' | Losers: ' + d.trade_losers);
-    }
-    if (d.sell_date) parts.push('Bought ' + d.date + ' ' + this.prevBuyTime + ', sold ' + d.sell_date);
-    if (d.note) parts.push(String(d.note));
-    return parts.join('\n');
-  }
-
   get batchTrendMax(): number {
-    return Math.max(1, ...this.tradeBatchTrend.map((d: any) => Math.abs(Number(d.avg_return_pct) || 0)));
+    return Math.max(1, ...this.batchHoldingBars.map((d: any) => Math.abs(Number(d.avg_return_pct) || 0)));
   }
 
   /** Days in the window that closed in profit. */
@@ -4597,48 +3324,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     return h12 + ':' + m[2] + ' ' + suffix;
   }
 
-  /** Symbols whose ranking-component breakdown is open. */
-  expandedFactors = new Set<string>();
-
-  toggleFactors(symbol: string) {
-    if (this.expandedFactors.has(symbol)) this.expandedFactors.delete(symbol);
-    else this.expandedFactors.add(symbol);
-  }
-
-  /**
-   * The ranking components the engine actually used for one stock, strongest contribution first.
-   *
-   * <p>The stored map mixes real factors with bookkeeping entries (_skipped_components,
-   * _available_weight and so on), so anything prefixed with an underscore is filtered out rather
-   * than rendered as if it were a factor.
-   */
-  factorRows(s: any): any[] {
-    const fs = s?.factor_scores;
-    if (!fs || typeof fs !== 'object') return [];
-    return Object.keys(fs)
-      .filter(k => !k.startsWith('_'))
-      .map(k => {
-        const f = fs[k] || {};
-        const score = Number(f.score ?? 0) || 0;
-        const weight = Number(f.weight ?? 0) || 0;
-        return {
-          key: k,
-          label: f.label || k,
-          score,
-          weight,
-          // What this factor added to the score: its 0-10 result scaled by the weight it carries.
-          contribution: Math.round((score / 10) * weight * 10) / 10,
-        };
-      })
-      .sort((a, b) => b.contribution - a.contribution);
-  }
-
-  /** Components the engine could not score, with the reason it gave. */
-  skippedFactors(s: any): any[] {
-    const arr = s?.factor_scores?._skipped_components;
-    return Array.isArray(arr) ? arr : [];
-  }
-
   /**
    * The eleven ranking components in their fixed display order, straight from the API.
    *
@@ -4648,80 +3333,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
   components(s: any): any[] {
     const c = s?.factor_scores?._components;
     return Array.isArray(c) ? c : [];
-  }
-
-  /** Weight that actually had data - the divisor behind the score, and 100 minus what was skipped. */
-  weightUsed(s: any): number {
-    const w = Number(s?.factor_scores?._weight_used ?? 0) || 0;
-    if (w > 0) return w;
-    return this.components(s).filter(c => c.available)
-      .reduce((t: number, c: any) => t + (Number(c.weight) || 0), 0);
-  }
-
-  scoreColour(score: any): string {
-    const v = Number(score);
-    if (score == null || isNaN(v)) return '#64748b';   // n/a reads as absent, not as bad
-    return v >= 7 ? '#22c55e' : v >= 4 ? '#eab308' : '#ef4444';
-  }
-
-  componentHint(c: any): string {
-    const what: any = {
-      relative_strength:      'performance against the other stocks ranked in this run',
-      volume_growth:          'today\'s volume against its recent average',
-      trend_strength:         'how consistently price has moved in one direction',
-      rsi_strength:           'RSI(14) - momentum without over-extension',
-      ma_position:            'where price sits against its moving averages',
-      price_momentum:         'rate of recent price change',
-      week52_position:        'position within the 52-week range',
-      breakout_strength:      'proximity to a breakout above recent highs',
-      institutional_interest: 'delivery percentage as a proxy for institutional buying',
-      liquidity:              'traded value - how easily a position can be entered and exited',
-      market_cap_quality:     'size and stability of the company'
-    };
-    const base = c.label + ' - ' + c.weight + '% weight - ' + (what[c.key] || '');
-    return c.available ? base : base + ' - NOT COUNTED: ' + (c.reason || 'no source data');
-  }
-
-  /** Total weight of the components that could be scored - the divisor behind the final score. */
-  availableWeight(s: any): number {
-    const w = Number(s?.factor_scores?._available_weight ?? 0) || 0;
-    if (w > 0) return w;
-    return this.factorRows(s).reduce((t: number, f: any) => t + f.weight, 0);
-  }
-
-  factorContribTotal(s: any): number {
-    return Math.round(this.factorRows(s).reduce((t: number, f: any) => t + f.contribution, 0) * 10) / 10;
-  }
-
-  /** Bar width: this factor's contribution against the largest one on the same stock. */
-  factorBarPct(s: any, f: any): number {
-    const rows = this.factorRows(s);
-    const max = Math.max(0.1, ...rows.map((r: any) => r.contribution));
-    return Math.max(0, Math.min(100, (f.contribution / max) * 100));
-  }
-
-  /** Money committed across the Top 10 rows actually on screen. */
-  get top10TotalAlloc(): number {
-    return this.filteredTop10().length * (Number(this.perStockAllocation) || 0);
-  }
-
-  get top10TotalQty(): number {
-    return this.filteredTop10().reduce((t: number, s: any) => t + this.calcQty(s.current_price), 0);
-  }
-
-  get top10AvgScore(): number {
-    const rows = this.filteredTop10();
-    if (!rows.length) return 0;
-    const sum = rows.reduce((t: number, s: any) => t + (Number(s.score) || 0), 0);
-    return Math.round((sum / rows.length) * 100) / 100;
-  }
-
-  /** Average move today, over the rows that actually have a previous close to compare against. */
-  get top10AvgChange(): number {
-    const rows = this.filteredTop10().filter((s: any) => s.previous_close);
-    if (!rows.length) return 0;
-    const sum = rows.reduce((t: number, s: any) => t + (Number(s.today_return_pct) || 0), 0);
-    return Math.round((sum / rows.length) * 100) / 100;
   }
 
   batchBarTooltip(d: any): string {
@@ -4738,26 +3349,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
         + shortfall;
     }
     return `Batch: ${d.batch_id}\nDate: ${d.trade_date}\nBuy: ${d.buy_time} | Sell: ${d.sell_time || '-'}\nAvg Return: ${d.avg_return_pct}%\nWinners: ${d.winning_stocks} | Losers: ${d.losing_stocks}\nType: ${d.trade_type}`;
-  }
-
-  gainLoss(s: any): number {
-    const base = Number(s?.base_price || 0);
-    const curr = Number(s?.current_price || 0);
-    return base > 0 && curr > 0 ? curr - base : 0;
-  }
-
-  get prevReturnAvg(): number {
-    const rows = this.rd?.previous_top10 || [];
-    if (!rows.length) return 0;
-    const sum = rows.reduce((s: number, r: any) => s + (Number(r.current_return) || 0), 0);
-    return Math.round((sum / rows.length) * 100) / 100;
-  }
-
-  get remainingBalance(): number {
-    const count = (this.rd?.current_top10?.length) || 10;
-    const total = this.totalTradingAmount || 0;
-    const allocated = this.perStockAllocation * count;
-    return Math.max(0, total - allocated);
   }
 
   formatTimestamp(val: any): string {
@@ -4780,66 +3371,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     if (this.totalTradingAmount < 0) this.totalTradingAmount = 0;
     const count = (this.rd?.current_top10?.length) || 10;
     this.perStockAllocation = Math.floor((this.totalTradingAmount || 0) / count);
-  }
-
-  calcQty(price: number): number {
-    if (!price || price <= 0) return 0;
-    return Math.floor(this.perStockAllocation / price);
-  }
-
-  filteredTop10(): any[] {
-    const rows = this.rd?.current_top10 || [];
-    if (!this.filterBuyerSeller) return rows;
-    const filtered = rows.filter((s: any) => {
-      const signal = String(s.buy_sell_signal || '').toUpperCase();
-      return signal === 'BUY' || signal === 'SELL';
-    });
-    this.excludedCount = rows.length - filtered.length;
-    return filtered;
-  }
-
-  applyBuyerSellerFilter(): void {
-    this.excludedCount = 0;
-    if (this.filterBuyerSeller) {
-      const rows = this.rd?.current_top10 || [];
-      const filtered = rows.filter((s: any) => {
-        const signal = String(s.buy_sell_signal || '').toUpperCase();
-        return signal === 'BUY' || signal === 'SELL';
-      });
-      this.excludedCount = rows.length - filtered.length;
-    }
-  }
-
-  recalcTrend(): void {
-    this.sliceChartData();
-  }
-
-  openTrackerTrade(stock: any, tradeType: 'BUY' | 'SELL') {
-    if (!this.isMarketHours()) {
-      alert('Market is closed. Trading is available only during market hours (9:15 AM - 3:30 PM IST). Paper trades are logged for review.');
-    }
-    const symbol = String(stock?.symbol || '').toUpperCase();
-    if (tradeType === 'BUY' && this.hasPosition(symbol)) {
-      alert(`${symbol} already has an open position. Use Sell for this symbol.`);
-      return;
-    }
-    if (tradeType === 'SELL' && !this.hasPosition(symbol)) {
-      alert(`${symbol} has no open position, so Sell is not available.`);
-      return;
-    }
-    if (!this.portfolios.length) {
-      alert('Create a portfolio first, then place Buy/Sell trades from Stock Tracker.');
-      return;
-    }
-    this.tradeDraft = {
-      portfolioId: this.tradeDraft.portfolioId || this.portfolios[0][0],
-      symbol,
-      tradeType,
-      qty: tradeType === 'SELL' ? Math.max(1, Number(this.positionsBySymbol[symbol]?.qty || 1)) : 1,
-      price: Number(stock?.current_price || stock?.base_price || 0)
-    };
-    this.tradeError.set('');
-    this.showTradeModal.set(true);
   }
 
   closeTradeModal() {
@@ -4879,77 +3410,16 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     });
   }
 
-  bulkTop10Order(side: 'BUY' | 'SELL') {
-    const rows = this.rd?.current_top10 || [];
-    if (!rows.length) {
-      alert('Current Top 10 is not available yet.');
-      return;
-    }
-    if (!this.isMarketHours()) {
-      alert('Market is closed. Bulk trading is available only during market hours (9:15 AM - 3:30 PM IST). Paper trades will be logged.');
-    }
-    this.bulkOrderMode = 'PAPER';
-    const label = 'Paper trading';
-    const timeLabel = this.bulkTradeTime === 'NOW' ? 'now' : `at ${this.bulkTradeTime}`;
-    const ok = confirm(`${side} all Current Top 10 stocks using ${label} (${timeLabel})? Allocation: ₹${this.perStockAllocation}/stock. Every success or failure will be saved in the Trading Journal.`);
-    if (!ok) return;
-    this.bulkTrading.set(true);
-    this.api.post<any>('/trading/stock-tracker/bulk-order', {
-      confirmed: true,
-      side,
-      mode: 'PAPER',
-      investmentAmountPerStock: this.perStockAllocation,
-      tradeTime: this.bulkTradeTime,
-      exchange: 'NSE',
-      segment: 'EQ-SWG',
-      productType: 'CNC',
-      orderType: 'MARKET'
-    }).subscribe({
-      next: r => {
-        this.bulkTrading.set(false);
-        this.refreshResult = r.data || r;
-        this.loadPositions();
-      },
-      error: e => {
-        this.bulkTrading.set(false);
-        alert(e.error?.message || `${side} All 10 failed.`);
-      }
-    });
-  }
-
   /** Slice the full dataset to the selected periods â€” called on period change */
   sliceChartData() {
     this.chart1Data = this.chartData.slice(-this.chart1Period);
     this.chart2Data = this.chartData.slice(-this.chart2Period);
   }
 
-  /** Set Chart 1 period, reslice immediately â€” no API call needed */
-  setChart1Period(p: number) {
-    this.chart1Period = p;
-    this.sliceChartData();
-  }
-
-  /** Set Chart 2 period, reslice immediately â€” no API call needed */
-  setChart2Period(p: number) {
-    this.chart2Period = p;
-    this.sliceChartData();
-  }
-
   // â”€â”€ Stats computed â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   get profitPct()   { return this.dash.total > 0 ? (this.dash.positive / this.dash.total)*100 : 0; }
   get lossPct()     { return this.dash.total > 0 ? (this.dash.negative / this.dash.total)*100 : 0; }
   get eligiblePct() { return this.dash.total > 0 ? (this.dash.eligible / this.dash.total)*100 : 0; }
-  get totalDist()   { return this.distributionRows().reduce((s: number, b: any) => s + (b.count||0), 0); }
-  distributionRows() {
-    return this.hardcodedReturnRanges.map(label => {
-      const found = this.dist.find((b: any) => String(b.label || '') === label);
-      return {
-        label,
-        count: Number(found?.count || 0),
-        pct: Number(found?.pct || 0)
-      };
-    });
-  }
 
   private applyLiveQuote(q: any): void {
     const symbol = this.normalizeSymbol(q?.symbol);
@@ -5116,10 +3586,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     } catch { return str; }
   }
 
-  private isSignalSortColumn(col: string): boolean {
-    return ['buy_sell_signal','trend','today_volume_change_pct','below_52wh_pct','above_52wl_pct','pe_ratio'].includes(col);
-  }
-
   // Module scope on purpose: the router destroys this component when you leave the tracker, so
   // an instance field took the whole table with it. Coming back rebuilt every page from scratch -
   // which is why the section took just as long on the second visit as on the first. Held here it
@@ -5197,45 +3663,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.api.get<any>('/tracker/diagnostics/stale-prev-close').subscribe({
       next: r => { this.staleResult = r.data || { count: 0, stocks: [] }; this.staleLoading = false; },
       error: e => { this.staleLoading = false; alert(e.error?.message || 'Diagnostic failed. Please try again.'); }
-    });
-  }
-
-  isRemovingUploadedStock(symbol: string): boolean {
-    return this.removingUploadedSymbols.has(String(symbol || '').toUpperCase());
-  }
-
-  removeUploadedStock(stock: any): void {
-    const symbol = String(stock?.symbol || '').trim().toUpperCase();
-    if (!symbol) {
-      alert('Symbol is missing for this row.');
-      return;
-    }
-    const ok = confirm(`Remove ${symbol} from Uploaded Stock Details?\n\nThis will hide it from Stock Upload, dashboard counts, rankings, and exports. Historical records are kept for audit.`);
-    if (!ok) return;
-    this.removingUploadedSymbols.add(symbol);
-    this.api.delete<any>(`/tracker/stocks/${encodeURIComponent(symbol)}`).subscribe({
-      next: r => {
-        this.removingUploadedSymbols.delete(symbol);
-        if (r?.success === false) {
-          alert(r.message || 'Stock could not be removed.');
-          return;
-        }
-        this.uploadedStocks = this.uploadedStocks.filter(s => String(s.symbol || '').toUpperCase() !== symbol);
-        this.uploadedTotal = Math.max(0, this.uploadedTotal - 1);
-        this.selectedSymbols.delete(symbol);
-        if (!this.uploadedStocks.length && this.uploadedPage > 0) {
-          this.uploadedPage -= 1;
-        }
-        this.loadUploadedStocks();
-        this.loadDashboard();
-        this.loadRanking();
-        this.loadChartData();
-        this.loadUploadStats();
-      },
-      error: e => {
-        this.removingUploadedSymbols.delete(symbol);
-        alert(e?.error?.message || 'Stock could not be removed. Please try again.');
-      }
     });
   }
 
@@ -5354,13 +3781,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     this.loadUploadedStocks();
   }
 
-  setUploadedSort(sortBy: string, sortDir: string): void {
-    this.uploadedSortBy = sortBy || 'symbol';
-    this.uploadedSortDir = sortDir === 'desc' ? 'desc' : 'asc';
-    this.uploadedPage = 0;
-    this.loadUploadedStocks();
-  }
-
   toggleUploadedSort(col: string): void {
     if (this.uploadedSortBy === col) {
       this.uploadedSortDir = this.uploadedSortDir === 'asc' ? 'desc' : 'asc';
@@ -5385,144 +3805,9 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     if (this.uploadedSortBy !== col) return '';
     return this.uploadedSortDir === 'asc' ? '▲' : '▼';
   }
-  get distChartPoints() {
-    const rows = this.distributionRows();
-    if (!rows.length) return [];
-    const left = 30, right = 500, top = 14, bottom = 126;
-    const max = Math.max(1, ...rows.map((b: any) => Number(b.count) || 0));
-    const step = rows.length > 1 ? (right - left) / (rows.length - 1) : 0;
-    return rows.map((b: any, i: number) => {
-      const count = Number(b.count) || 0;
-      const x = left + (step * i);
-      const y = bottom - ((count / max) * (bottom - top));
-      return { label: b.label, x, y, count };
-    });
-  }
-  get distLinePoints() {
-    return this.distChartPoints.map(p => `${p.x},${p.y}`).join(' ');
-  }
-  private distSeriesPoints(rows: any[], positive: boolean) {
-    const data = Array.isArray(rows) && rows.length ? rows : [{ label: '0', value: 0, count: 0 }];
-    const left = 30, right = 500, zeroY = 75, top = 18, bottom = 126;
-    const maxCount = Math.max(1, ...data.map((b: any) => Number(b.count) || 0));
-    const step = data.length > 1 ? (right - left) / (data.length - 1) : 0;
-    return data.map((b: any, i: number) => {
-      const count = Number(b.count) || 0;
-      const x = left + (step * i);
-      const height = (count / maxCount) * (positive ? (zeroY - top) : (bottom - zeroY));
-      const y = positive ? zeroY - height : zeroY + height;
-      return { label: b.label, x, y, count };
-    });
-  }
-  get positiveDistChartPoints() {
-    return this.distSeriesPoints(this.distPositiveLine, true);
-  }
-  get negativeDistChartPoints() {
-    return this.distSeriesPoints(this.distNegativeLine, false);
-  }
-  get positiveDistLinePoints() {
-    return this.positiveDistChartPoints.map(p => `${p.x},${p.y}`).join(' ');
-  }
-  get negativeDistLinePoints() {
-    return this.negativeDistChartPoints.map(p => `${p.x},${p.y}`).join(' ');
-  }
-  get prevRunDate() {
-    if (this.rd?.prev_run_date) return this.rd.prev_run_date;
-    if (!this.rd?.run_date) return '';
-    try {
-      const d = new Date(this.rd.run_date);
-      d.setDate(d.getDate() - 1);
-      return d.toISOString().slice(0,10);
-    } catch { return ''; }
-  }
-
-  get compMetrics() {
-    if (!this.rd) return [];
-    return [
-      { label:'Average Return',  curr: this.rd.curr_avg_return||0, prev: this.rd.prev_avg_return||0, unit:'%', max:15 },
-      { label:'Win Ratio',       curr: this.rd.curr_win_ratio||0,  prev: this.rd.prev_win_ratio||0,  unit:'%', max:100 },
-      { label:'Positive Stocks', curr: this.rd.curr_positive||0,   prev: this.rd.prev_positive||0,   unit:'',  max:10 },
-      { label:'Negative Stocks', curr: this.rd.curr_negative||0,   prev: this.rd.prev_negative||0,   unit:'',  max:10 },
-      { label:'Average Score',   curr: this.avgScore('curr'),       prev: this.avgScore('prev'),       unit:'',  max:100 },
-    ];
-  }
-
-  avgScore(which: 'curr' | 'prev'): number {
-    const arr = which === 'curr' ? this.rd?.current_top10 : this.rd?.previous_top10;
-    if (!arr?.length) return 0;
-    return arr.reduce((s: number, x: any) => s + (x.score||0), 0) / arr.length;
-  }
-
-  /** Max absolute value in Chart 1 dataset â€” used to scale bar heights */
-  get chartMaxCurr(): number {
-    return Math.max(1, ...this.chart1Data.map((d: any) => Math.abs(d.curr_avg_return || 0)));
-  }
-
-  /** Max absolute value in Chart 2 dataset â€” used to scale bar heights */
-  get chartMaxPrev(): number {
-    return Math.max(1, ...this.chart2Data.map((d: any) => Math.abs(this.dayAvgReturn(d))));
-  }
-
-  /** Average of curr_avg_return over chart1Period â€” shown in summary box */
-  get chart1Avg(): number {
-    if (!this.chart1Data.length) return 0;
-    const sum = this.chart1Data.reduce((s: number, d: any) => s + (d.curr_avg_return || 0), 0);
-    return Math.round((sum / this.chart1Data.length) * 100) / 100;
-  }
-
-  /** Average of prev_avg_return over chart2Period â€” shown in summary box */
-  get chart2Avg(): number {
-    if (!this.chart2Data.length) return 0;
-    const sum = this.chart2Data.reduce((s: number, d: any) => s + this.dayAvgReturn(d), 0);
-    return Math.round((sum / this.chart2Data.length) * 100) / 100;
-  }
-
-  get chart2SymbolCount(): number {
-    return this.chart2Data.reduce((s: number, d: any) => s + (Number(d?.trade_symbol_count) || 0), 0);
-  }
-
-  get chart2Winners(): number {
-    return this.chart2Data.reduce((s: number, d: any) => s + (Number(d?.trade_winners) || 0), 0);
-  }
-
-  get chart2Losers(): number {
-    return this.chart2Data.reduce((s: number, d: any) => s + (Number(d?.trade_losers) || 0), 0);
-  }
-
-  get chart2Source(): string {
-    if (!this.chart2Data.length) return '-';
-    const counts = this.chart2Data.reduce((m: Record<string, number>, d: any) => {
-      const key = String(d?.trade_source || 'missing');
-      m[key] = (m[key] || 0) + 1;
-      return m;
-    }, {});
-    return (Object.entries(counts) as [string, number][]).sort((a, b) => b[1] - a[1])[0]?.[0] || '-';
-  }
-
-  get chart2FallbackCount(): number {
-    return this.chart2Data.filter((d: any) => d?.trade_source === 'ranking_fallback').length;
-  }
-
-  get chart2MissingCount(): number {
-    return this.chart2Data.filter((d: any) => d?.trade_source === 'missing').length;
-  }
-
-  dayAvgReturn(d: any): number {
-    return Number(d?.curr_avg_return ?? d?.trade_avg_return ?? d?.day_avg_return ?? 0) || 0;
-  }
 
   barH(val: number, max: number): number {
     return Math.max(2, Math.round((Math.abs(val) / max) * 72));
-  }
-
-  chartBarTooltip(d: any): string {
-    const ret = this.dayAvgReturn(d);
-    const date = d?.date || '-';
-    const winners = d?.trade_winners ?? '-';
-    const losers = d?.trade_losers ?? '-';
-    const symbols = d?.trade_symbol_count ?? '-';
-    const source = d?.trade_source || '-';
-    return `Date: ${date}\nAvg Return: ${ret.toFixed(2)}%\nSymbols: ${symbols}\nWinners: ${winners} | Losers: ${losers}\nSource: ${source}\nStrategy: Buy ${this.trendBuyTime}, Sell ${this.trendSellTime} +${this.trendHoldDays}D`;
   }
 
   formatChartDate(dateStr: string): string {
@@ -5550,18 +3835,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       const path  = this.donutPath(60, 60, 50, 28, startAngle, startAngle + angle);
       startAngle += angle;
       return { label, pct, color: this.SECTOR_COLORS[i % this.SECTOR_COLORS.length], path };
-    });
-  }
-
-  buildDistDonut() {
-    const nonZero = this.distributionRows().filter((b: any) => b.count > 0);
-    const total   = nonZero.reduce((s: number, b: any) => s + b.count, 0) || 1;
-    let startAngle = -Math.PI / 2;
-    this.distDonutSegments = nonZero.map((b: any, i: number) => {
-      const angle = (b.count / total) * 2 * Math.PI;
-      const path  = this.donutPath(55, 55, 44, 24, startAngle, startAngle + angle);
-      startAngle += angle;
-      return { label: b.label, color: this.DIST_COLORS[i % this.DIST_COLORS.length], path };
     });
   }
 
@@ -5661,74 +3934,10 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
 
   // ── Pipeline sequential module polling ──────────────────────────────────
 
-  startPipelinePolling(jobId: string): void {
-    this.stopPipelinePolling();
-    this.pipelineJobId = jobId;
-    this.pipelineActive = true;
-    this.pipelineProgress = 0;
-    this.pipelineStages = [];
-    this.pipelineCompletedStages.clear();
-    this.showUploadModal.set(false);
-
-    const poll = () => {
-      if (!this.pipelineJobId || this.destroyed) return;
-      this.api.get<any>(`/tracker/jobs/${this.pipelineJobId}/pipeline`).subscribe({
-        next: r => {
-          const data = r.data || r;
-          this.pipelineStages = data.stages || [];
-          this.pipelineProgress = data.pipeline_progress || 0;
-
-          for (const stage of this.pipelineStages) {
-            if (stage.status === 'COMPLETED' && !this.pipelineCompletedStages.has(stage.stage)) {
-              this.pipelineCompletedStages.add(stage.stage);
-              this.onPipelineStageCompleted(stage.stage);
-            }
-          }
-
-          const jobStatus = data.job_status || '';
-          if (jobStatus === 'COMPLETED' || jobStatus === 'CANCELLED' || jobStatus === 'FAILED') {
-            this.pipelineActive = false;
-            this.stopPipelinePolling();
-          }
-        },
-        error: () => {}
-      });
-    };
-    poll();
-    this.pipelinePollTimer = setInterval(poll, 2500);
-  }
-
   stopPipelinePolling(): void {
     if (this.pipelinePollTimer) {
       clearInterval(this.pipelinePollTimer);
       this.pipelinePollTimer = null;
-    }
-  }
-
-  private onPipelineStageCompleted(stage: string): void {
-    const now = new Date().toISOString();
-    switch (stage) {
-      case 'UPLOAD':
-        this.loadUploadStats();
-        this.loadDashboard();
-        break;
-      case 'STOCK_DETAILS':
-        this.clearUploadedCache();
-        this.loadUploadedStocks(true);
-        break;
-      case 'CURRENT_TOP10':
-        this.currentTop10LastUpdated = now;
-        this.loadRanking();
-        this.recalcAllocation();
-        break;
-      case 'PREVIOUS_TOP10':
-        this.previousTop10LastUpdated = now;
-        this.loadRanking();
-        break;
-      case 'AVG_TREND':
-        this.trendLastUpdated = now;
-        this.loadChartData();
-        break;
     }
   }
 
@@ -5750,28 +3959,15 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
     }
   }
 
-  runRanking() {
-    this.ranking.set(true);
-    this.api.post<any>('/tracker/rank', {}).subscribe({
-      next: r => { this.rd = r.data; this.ranking.set(false); this.autoRefreshAll('ranking'); },
-      error: () => this.ranking.set(false)
-    });
-  }
-
   // â”€â”€ All downloads use authenticated HTTP (JWT token passed in header) â”€â”€â”€â”€â”€â”€â”€
   // window.open() cannot pass Authorization header â€” replaced with HttpClient blob
   downloadEligible()        { this.downloadCsv('/tracker/export/eligible',    'TradeRakshak_Eligible_Stocks.csv'); }
   /** First touch of the base price since it was set, ATR14(D-1)/Close(D-1) >= 3%. No volume or
    *  ADX filter - both failed out-of-sample. The CSV carries the exit bracket with each row. */
-  downloadAtrBaseCrossover() {
-    this.downloadCsv('/tracker/export/atr-base-crossover?minAtrPct=3.0',
-                     'TradeRakshak_ATR_Base_Price_Crossover.csv');
+  downloadStochasticCrossover() {
+    this.downloadCsv('/tracker/export/stochastic-crossover',
+                     'TradeRakshak_Stochastic_Crossover.csv');
   }
-  downloadRankingCurrent()  { this.downloadCsv('/tracker/export/ranking',     'TradeRakshak_Current_Top10.csv'); }
-  downloadRankingPrevious() { this.downloadCsv('/tracker/export/previous',    'TradeRakshak_Previous_Top10.csv'); }
-  downloadHistorical()      { this.downloadCsv('/tracker/export/historical',  'TradeRakshak_Historical_Rankings.csv'); }
-  exportCsv()               { this.downloadCsv('/tracker/export/all-stocks',  'TradeRakshak_All_Stocks.csv'); }
-  exportDistribution()      { this.downloadCsv('/tracker/export/distribution','TradeRakshak_Distribution.csv'); }
 
   downloadUploadedStocks() {
     const params = new URLSearchParams({
@@ -5779,29 +3975,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
       sortDir: this.uploadedSortDir || 'asc'
     });
     this.downloadCsv(`/tracker/export/all-stocks?${params.toString()}`, 'TradeRakshak_Uploaded_Stocks.csv');
-  }
-
-  /**
-   * Authenticated CSV download â€” fetches with JWT token then triggers browser download.
-   * This correctly passes the Authorization header which window.open() cannot do.
-   */
-  /**
-   * Downloads the stocks behind the chart bars, one row per stock per day.
-   *
-   * <p>Deliberately exports the same figures the chart was drawn from rather than recomputing
-   * them, so a number in the spreadsheet can never disagree with the bar above it. Stocks that
-   * could not be priced are included with the reason, because a day showing four rows when ten
-   * were ranked is otherwise indistinguishable from a day that only ranked four.
-   *
-   * @param maxPrice price ceiling for the low-priced basket, or null for the full Top 10
-   */
-  /** Optional past session for the Previous Top 10 download; empty means the current view. */
-  prevExportDate = '';
-
-  downloadPrevTop10() {
-    const q = this.prevExportDate ? `?runDate=${this.prevExportDate}` : '';
-    this.downloadCsv('/tracker/export/prev-top10' + q,
-      `TradeRakshak_Previous_Top10_${this.prevExportDate || 'current'}.csv`);
   }
 
   downloadChartTrades(maxPrice: number | null) {
@@ -5859,122 +4032,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
                 : 'The server could not build this file (HTTP ' + s + '). Nothing was downloaded.');
       }
     });
-  }
-
-  exportPdf() {
-    const rd    = this.rd;
-    const top10 = rd?.current_top10 || [];
-    const prev10= rd?.previous_top10 || [];
-
-    const f = (v: any, dec = 2) => (v == null || v === '') ? 'â€”' : Number(v).toFixed(dec);
-    const p = (v: any) => v == null ? 'â€”' : String(v);
-    const retStyle = (v: any) => Number(v) >= 0 ? 'color:green;font-weight:bold' : 'color:red;font-weight:bold';
-
-    const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-    <title>TradeRakshakâ„¢ Performance Report</title>
-    <style>
-      body{font-family:Arial,sans-serif;font-size:11px;margin:20px;color:#1e293b}
-      h1{color:#1e3a5c;font-size:16px;margin-bottom:4px}
-      h2{color:#1e3a5c;font-size:13px;margin:16px 0 6px}
-      table{border-collapse:collapse;width:100%;margin-bottom:16px}
-      th{background:#1e3a5c;color:#fff;padding:6px 8px;text-align:left;font-size:10px;white-space:nowrap}
-      td{border:1px solid #e2e8f0;padding:5px 8px;font-size:10px}
-      tr:nth-child(even) td{background:#f8fafc}
-      .summary{display:flex;gap:20px;flex-wrap:wrap;background:#f1f5f9;padding:10px;border-radius:6px;margin-bottom:16px}
-      .sm{text-align:center}.sm .lbl{font-size:9px;color:#64748b}.sm .val{font-size:16px;font-weight:bold}
-      .disclaimer{font-size:9px;color:red;border:1px solid red;padding:6px;border-radius:4px;margin-bottom:12px}
-      @media print{body{margin:10px}.no-print{display:none}}
-    </style></head><body>
-    <h1>TradeRakshakâ„¢ â€” Stock Tracker Performance Report</h1>
-    <p style="font-size:10px;color:#64748b">
-      Generated: ${new Date().toLocaleString('en-IN')} |
-      Run Date: ${p(rd?.run_date)} |
-      Eligible Stocks: ${p(rd?.eligible_count)} |
-      Run ID: ${p(rd?.run_id)}
-    </p>
-    <div class="disclaimer">
-      âš  TradeRakshakâ„¢ is for EDUCATIONAL purposes only. Not SEBI-registered investment advice.
-      Past performance does not guarantee future results.
-    </div>
-
-    <!-- Summary stats -->
-    <div class="summary">
-      <div class="sm"><div class="lbl">Current Top-10 Avg Return</div>
-        <div class="val" style="${retStyle(rd?.curr_avg_return)}">${f(rd?.curr_avg_return)}%</div></div>
-      <div class="sm"><div class="lbl">Previous Top-10 Avg Return</div>
-        <div class="val" style="${retStyle(rd?.prev_avg_return)}">${f(rd?.prev_avg_return)}%</div></div>
-      <div class="sm"><div class="lbl">Current Win Ratio</div>
-        <div class="val" style="color:#2563eb">${f(rd?.curr_win_ratio)}%</div></div>
-      <div class="sm"><div class="lbl">Previous Win Ratio</div>
-        <div class="val" style="color:#2563eb">${f(rd?.prev_win_ratio)}%</div></div>
-      <div class="sm"><div class="lbl">Current Positive</div>
-        <div class="val" style="color:green">${p(rd?.curr_positive)}</div></div>
-      <div class="sm"><div class="lbl">Current Negative</div>
-        <div class="val" style="color:red">${p(rd?.curr_negative)}</div></div>
-    </div>
-
-    <!-- Current Top-10 table -->
-    <h2>Today top 10 Ranking Stocks</h2>
-    <table>
-      <thead><tr>
-        <th>Rank</th><th>Symbol</th><th>Sector</th><th>Market Cap</th><th>Score</th>
-        <th>Upload Date</th><th>Base Price (INR)</th><th>Current Price (INR)</th>
-        <th>Return %</th><th>Days Since Upload</th>
-      </tr></thead>
-      <tbody>
-        ${top10.map((s: any) => `<tr>
-          <td style="text-align:center;font-weight:bold">${p(s.rank)}</td>
-          <td style="font-weight:bold">${p(s.symbol)}</td>
-          <td>${p(s.sector)}</td>
-          <td>${p(s.market_cap)}</td>
-          <td style="text-align:right;color:#2563eb">${f(s.score)}</td>
-          <td>${p(s.upload_date)}</td>
-          <td style="text-align:right">${f(s.base_price)}</td>
-          <td style="text-align:right;font-weight:bold">${f(s.current_price)}</td>
-          <td style="text-align:right;${retStyle(s.return_pct)}">${f(s.return_pct)}%</td>
-          <td style="text-align:center">${p(s.days_since_upload)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-
-    <!-- Previous Top-10 table -->
-    <h2>Previous top 10 Ranking Stocks</h2>
-    <table>
-      <thead><tr>
-        <th>Rank</th><th>Symbol</th><th>Sector</th><th>Score</th>
-        <th>Buy Price (INR)</th><th>Current Price (INR)</th>
-        <th>Return %</th><th>Gain/Loss (â‚¹)</th><th>Days</th>
-      </tr></thead>
-      <tbody>
-        ${prev10.map((s: any, i: number) => {
-          const gl = (Number(s.current_price)||0) - (Number(s.base_price)||0);
-          return `<tr>
-            <td style="text-align:center">${i+1}</td>
-            <td style="font-weight:bold">${p(s.symbol)}</td>
-            <td>${p(s.sector)}</td>
-            <td style="text-align:right;color:#2563eb">${f(s.score)}</td>
-            <td style="text-align:right">${f(s.base_price)}</td>
-            <td style="text-align:right;font-weight:bold">${f(s.current_price)}</td>
-            <td style="text-align:right;${retStyle(s.current_return)}">${f(s.current_return)}%</td>
-            <td style="text-align:right;${retStyle(gl)}">${gl >= 0 ? '+' : ''}${f(gl)}</td>
-            <td style="text-align:center">${p(s.days_since_upload)}</td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
-
-    <p style="font-size:9px;color:#94a3b8;margin-top:20px;border-top:1px solid #e2e8f0;padding-top:8px">
-      TradeRakshakâ„¢ v11.6 | Report generated on ${new Date().toLocaleString('en-IN')} |
-      For educational purposes only | Not SEBI investment advice
-    </p>
-    </body></html>`;
-
-    const w = window.open('', '_blank');
-    if (w) {
-      w.document.write(html);
-      w.document.close();
-      setTimeout(() => w.print(), 500);
-    }
   }
 
   goToConfig() {
@@ -6036,19 +4093,6 @@ export class StockTrackerComponent implements OnInit, OnDestroy {
 
   isAdmin(): boolean {
     return this.auth.isAdmin();
-  }
-
-  bucketLabelColor(label: string): string {
-    if (label.includes('More than 30') || label.includes('> 30')) return '#4ade80';
-    if (label.includes('15% to 30'))   return '#86efac';
-    if (label.includes('10% to 15'))   return '#a3e635';
-    if (label.includes('5% to 10'))    return '#fbbf24';
-    if (label.includes('0% to 5'))     return '#93c5fd';
-    if (label.includes('-5% to 0'))    return '#94a3b8';
-    if (label.includes('-10% to -5'))  return '#f97316';
-    if (label.includes('-15% to -10')) return '#ef4444';
-    if (label.includes('More than -15') || label.includes('< -15')) return '#dc2626';
-    return '#94a3b8';
   }
 
   // ── Processing Job Dashboard ──

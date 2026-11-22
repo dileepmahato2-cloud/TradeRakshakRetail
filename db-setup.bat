@@ -199,5 +199,20 @@ echo  [..] Creating database %DB_NAME%
 :db_present
 if not exist "%DB_MARKER%" >"%DB_MARKER%" echo %DB_NAME% has been set up on this machine. While this file exists, START.bat will refuse to silently recreate the database if it goes missing.
 
+:: Warm the Flyway history page before Spring Boot asks for it.
+::
+:: PostgreSQL 18 reads through its new asynchronous I/O path (io_method=worker). On this
+:: machine a COLD read of flyway_schema_history intermittently fails with
+::   ERROR: could not read blocks 0..0 in file "pg_tblspc/.../56296": Invalid argument
+:: which kills startup at FlywayMigrationInitializer before Tomcat ever binds. Nothing is
+:: wrong with the file - it is 8192 bytes and reads cleanly at the OS level, and the same
+:: query succeeds the moment the page is in shared buffers.
+::
+:: Touching the table here puts it there. It is a workaround, not the cure: the real fix is
+:: io_method = sync in postgresql.conf, which is a postmaster setting and needs a planned
+:: PostgreSQL restart. Failure is ignored on purpose - if the table does not exist yet this
+:: is a first run, and Flyway is about to create it.
+"%PSQL_EXE%" -h localhost -p 5432 -U "%POSTGRES_USER%" -d "%DB_NAME%" -c "SELECT count(*) FROM flyway_schema_history" >nul 2>&1
+
 echo  [OK] Database ready: %DB_NAME%
 exit /b 0

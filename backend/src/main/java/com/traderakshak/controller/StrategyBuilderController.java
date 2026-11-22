@@ -14,6 +14,10 @@ import com.traderakshak.repository.StrategyRepository;
 import com.traderakshak.service.BacktestEngine;
 import com.traderakshak.service.NextDayPredictionService;
 import com.traderakshak.service.StrategyBuilderService;
+import com.traderakshak.service.strategy.ast.AstNode;
+import com.traderakshak.service.strategy.ast.AstParser;
+import com.traderakshak.service.strategy.ast.AstValidator;
+import com.traderakshak.service.strategy.ast.FieldCatalogue;
 import com.traderakshak.util.DateUtil;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -38,6 +42,9 @@ public class StrategyBuilderController {
     private final BacktestEngine          backtestEngine;
     private final NextDayPredictionService nextDayPredictionService;
     private final ObjectMapper            objectMapper;
+    private final FieldCatalogue          fieldCatalogue;
+    private final AstParser               astParser;
+    private final AstValidator            astValidator;
 
     @PersistenceContext private EntityManager em;
 
@@ -47,6 +54,106 @@ public class StrategyBuilderController {
     @Operation(summary = "Get all supported indicators with parameters")
     public ResponseEntity<ApiResponse<Map<String, Object>>> indicators() {
         return ResponseEntity.ok(ApiResponse.ok(buildIndicatorCatalog()));
+    }
+
+    // ── Rule tree: field catalogue and validation ─────────────────────────────
+
+    /**
+     * Every field, indicator and financial metric the rule engine understands.
+     *
+     * <p>Distinct from /indicators above, which lists only indicators and is shaped for the
+     * existing builder screens. This one is the single source the rule canvas, the validator and
+     * the natural-language interpreter all read, so the three cannot drift into accepting
+     * different spellings of the same field.
+     *
+     * <p>Each entry carries its availability. Every financial metric is published as NO_DATA
+     * while the fundamentals table is empty, which lets the canvas grey them out rather than
+     * offering rules that silently match nothing.
+     */
+    @GetMapping("/fields")
+    @Operation(summary = "Field catalogue for the rule builder: price, volume, indicators, "
+                       + "derived values and financials, each with its parameters and availability")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> fields() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (FieldCatalogue.FieldDef f : fieldCatalogue.all()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("key", f.key());
+            m.put("label", f.label());
+            m.put("category", f.category().name());
+            m.put("unit", f.unit());
+            m.put("availability", f.availability().name());
+            List<Map<String, Object>> ps = new ArrayList<>();
+            for (FieldCatalogue.ParamDef p : f.params()) {
+                Map<String, Object> pm = new LinkedHashMap<>();
+                pm.put("name", p.name());
+                pm.put("type", p.type());
+                pm.put("default", p.defaultValue());
+                pm.put("min", p.min());
+                pm.put("max", p.max());
+                ps.add(pm);
+            }
+            m.put("params", ps);
+            out.add(m);
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("fields", out);
+        body.put("count", out.size());
+        return ResponseEntity.ok(ApiResponse.ok(body));
+    }
+
+    /**
+     * Checks a rule tree without saving or running it.
+     *
+     * <p>Errors come back keyed by AST path - {@code cases[0].when.children[2].right} - so the
+     * canvas can highlight the offending node. A rule that cannot run should fail here, with the
+     * node pointed at, rather than forty seconds into a universe scan.
+     *
+     * <p>Warnings do not block a save: a rule referencing a financial metric is valid and will
+     * simply match nothing until that data lands.
+     */
+    @PostMapping("/validate")
+    @Operation(summary = "Validate a rule tree, returning errors and warnings keyed by AST path")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> validateAst(
+            @RequestBody Map<String, Object> body) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        Object ruleAst = body == null ? null : body.get("rule_ast");
+        if (ruleAst == null && body != null) ruleAst = body.get("ast");
+
+        if (ruleAst == null) {
+            out.put("ok", false);
+            out.put("issues", List.of(Map.of(
+                "path", "", "severity", "ERROR", "message", "No rule was supplied.")));
+            return ResponseEntity.ok(ApiResponse.ok(out));
+        }
+
+        AstNode tree;
+        try {
+            tree = ruleAst instanceof String s
+                ? astParser.parse(s)
+                : astParser.parse(objectMapper.valueToTree(ruleAst));
+        } catch (AstParser.AstParseException e) {
+            // A shape error stops parsing, so there is exactly one and it is this.
+            out.put("ok", false);
+            out.put("issues", List.of(Map.of(
+                "path", e.path() == null ? "" : e.path(),
+                "severity", "ERROR",
+                "message", e.getMessage())));
+            return ResponseEntity.ok(ApiResponse.ok(out));
+        }
+
+        AstValidator.Result result = astValidator.validate(tree);
+        List<Map<String, Object>> issues = new ArrayList<>();
+        for (AstValidator.Issue i : result.issues()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("path", i.path());
+            m.put("severity", i.severity().name());
+            m.put("message", i.message());
+            issues.add(m);
+        }
+        out.put("ok", result.ok());
+        out.put("issues", issues);
+        out.put("error_count", result.errors().size());
+        return ResponseEntity.ok(ApiResponse.ok(out));
     }
 
     // ── Strategy CRUD ─────────────────────────────────────────────────────────

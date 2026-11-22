@@ -3399,7 +3399,6 @@ export class DataManagementComponent implements OnInit, OnDestroy {
 
   defaultDependentSections(): DependentSection[] {
     return [
-      { section: 'Dashboard', route: '/dashboard', tables: 'market_data, stock_master', usage: 'Market mood, stock count, latest market date' },
       { section: 'Backtesting', route: '/backtesting', tables: 'market_data', usage: 'Historical close series for strategy testing' },
       { section: 'Stock Ranking', route: '/ranking', tables: 'stock_master, market_data, sector_data', usage: 'Universe selection and ranking inputs' },
       { section: 'Strategy Builder', route: '/strategy-builder', tables: 'stock_master, market_data', usage: 'Symbols and latest OHLCV conditions' },

@@ -92,7 +92,7 @@ export class LoginComponent {
     this.loading.set(true);
     this.error.set('');
     this.auth.login(this.email, this.password, this.consent).subscribe({
-      next: () => this.router.navigate(['/dashboard']),
+      next: () => this.router.navigate(['/stock-tracker']),
       error: err => {
         this.error.set(err.error?.message || 'Login failed. Please try again.');
         this.loading.set(false);
