@@ -137,118 +137,71 @@ public class DhanHistoricalBackfillService {
         if (requireBroker && credential == null) {
             throw new IllegalStateException("Select a verified Dhan broker connection before fetching Stock List.");
         }
-        instrumentRefreshStatus = instrumentStatus("running", "Downloading Dhan public instrument master CSV.", 5, 100, "Downloading", null);
-        String csv = http.get(DHAN_SCRIP_MASTER, Map.of("Accept", "text/csv"), 30000);
-        instrumentRefreshStatus = instrumentStatus("running", "Parsing Dhan instrument master rows.", 20, 100, "Parsing", null);
-        List<Map<String, String>> rows = parseCsv(csv);
-        instrumentRefreshStatus = instrumentStatus("running", "Saving Dhan instruments and equity stock master rows.", 0, rows.size(), "Saving", null);
-        TransactionTemplate tx = new TransactionTemplate(transactionManager);
-        Integer imported = tx.execute(status -> {
-            int count = 0;
-            int equityStockRows = 0;
-            for (Map<String, String> row : rows) {
-                String securityId = first(row, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SMST_SECURITY_ID");
-                if (securityId.isBlank()) continue;
-                String exchange = first(row, "SEM_EXM_EXCH_ID", "EXCH_ID");
-                String segment = first(row, "SEM_SEGMENT", "SEGMENT");
-                String exchangeSegment = exchangeSegment(exchange, segment);
-                String instrument = first(row, "SEM_INSTRUMENT_NAME", "INSTRUMENT");
-                String instrumentType = first(row, "SEM_EXCH_INSTRUMENT_TYPE", "INSTRUMENT_TYPE");
-                String symbol = first(row, "SM_SYMBOL_NAME", "SYMBOL_NAME");
-                String dhanTradingSymbol = first(row, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL");
-                String display = first(row, "SEM_CUSTOM_SYMBOL", "DISPLAY_NAME");
-                String isin = first(row, "ISIN", "SEM_ISIN_CODE", "SM_ISIN_CODE");
-                String underlyingSecurityId = first(row, "UNDERLYING_SECURITY_ID", "SEM_UNDERLYING_SECURITY_ID", "SM_UNDERLYING_SECURITY_ID");
-                String underlyingSymbol = first(row, "UNDERLYING_SYMBOL", "SEM_UNDERLYING_SYMBOL", "SM_UNDERLYING_SYMBOL");
-                String expiryDate = first(row, "SEM_EXPIRY_DATE", "SM_EXPIRY_DATE", "EXPIRY_DATE");
-                String optionType = first(row, "SEM_OPTION_TYPE", "OPTION_TYPE");
-                Double lotSize = number(first(row, "SEM_LOT_UNITS", "LOT_SIZE"));
-                Double tickSize = number(first(row, "SEM_TICK_SIZE", "TICK_SIZE"));
-                // raw_json is deliberately not written for instruments. Every field it held
-                // is already parsed into a typed column below, and keeping Dhan's whole CSV
-                // row as JSON - column names repeated on each of ~212k rows - cost about
-                // 161 MB per instrument table (322 MB across both) for data nothing reads.
-                em.createNativeQuery(
-                    "INSERT INTO dhan_instruments(security_id,exchange,segment_code,exchange_segment,instrument,instrument_type," +
-                    "symbol_name,trading_symbol,display_name,isin,underlying_security_id,underlying_symbol,expiry_date,strike_price,option_type,lot_size,updated_at) " +
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
-                    "ON CONFLICT (security_id, exchange_segment) DO UPDATE SET " +
-                    "exchange=EXCLUDED.exchange, segment_code=EXCLUDED.segment_code, instrument=EXCLUDED.instrument, " +
-                    "instrument_type=EXCLUDED.instrument_type, symbol_name=EXCLUDED.symbol_name, trading_symbol=EXCLUDED.trading_symbol, " +
-                    "display_name=EXCLUDED.display_name, isin=EXCLUDED.isin, underlying_security_id=EXCLUDED.underlying_security_id, " +
-                    "underlying_symbol=EXCLUDED.underlying_symbol, expiry_date=EXCLUDED.expiry_date, strike_price=EXCLUDED.strike_price, " +
-                    "option_type=EXCLUDED.option_type, lot_size=EXCLUDED.lot_size, updated_at=EXCLUDED.updated_at")
-                    .setParameter(1, securityId)
-                    .setParameter(2, exchange)
-                    .setParameter(3, segment)
-                    .setParameter(4, exchangeSegment)
-                    .setParameter(5, instrument)
-                    .setParameter(6, instrumentType)
-                    .setParameter(7, symbol)
-                    .setParameter(8, dhanTradingSymbol.isBlank() ? symbol : dhanTradingSymbol)
-                    .setParameter(9, display)
-                    .setParameter(10, isin)
-                    .setParameter(11, underlyingSecurityId)
-                    .setParameter(12, underlyingSymbol)
-                    .setParameter(13, expiryDate)
-                    .setParameter(14, number(first(row, "SEM_STRIKE_PRICE", "STRIKE_PRICE")))
-                    .setParameter(15, optionType)
-                    .setParameter(16, lotSize)
-                    .setParameter(17, DateUtil.now())
-                    .executeUpdate();
-                // broker_instruments used to receive a byte-for-byte second copy of every row
-                // written to dhan_instruments above (212,736 rows, ~70 MB). dhan_instruments is
-                // the single instrument master; its underlying_symbol already carries the ticker
-                // that copy's `symbol` column held, so the duplicate write is gone.
-                if (isEquityStockInstrument(exchange, exchangeSegment, instrument, instrumentType)) {
-                    String masterSymbol = underlyingSymbol;
-                    if (!masterSymbol.isBlank()) {
-                        em.createNativeQuery(
-                            "INSERT INTO stock_master(exchange,symbol,company_name,sector,industry,status,source,as_on_date,series,isin,segment,lot_size) " +
-                            "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?) " +
-                            "ON CONFLICT (exchange, symbol) DO UPDATE SET " +
-                            "company_name=COALESCE(NULLIF(EXCLUDED.company_name,''),stock_master.company_name), " +
-                            "source=EXCLUDED.source, as_on_date=EXCLUDED.as_on_date, series=EXCLUDED.series, isin=EXCLUDED.isin, " +
-                            "segment=EXCLUDED.segment, lot_size=EXCLUDED.lot_size, status='active'")
-                            .setParameter(1, normalizeExchange(exchange))
-                            .setParameter(2, masterSymbol.trim().toUpperCase(Locale.ROOT))
-                            .setParameter(3, display.isBlank() ? masterSymbol : display)
-                            .setParameter(4, "Unknown")
-                            .setParameter(5, "Unknown")
-                            .setParameter(6, "DHAN")
-                            .setParameter(7, DateUtil.today())
-                            .setParameter(8, instrument.isBlank() ? "ES" : instrument)
-                            .setParameter(9, isin)
-                            .setParameter(10, "Equity")
-                            .setParameter(11, lotSize == null ? 1 : lotSize.intValue())
-                            .executeUpdate();
-                        equityStockRows++;
-                    }
+        // Streamed, not buffered. The previous shape of this method was:
+        //
+        //     String csv  = http.get(...)            // 40 MB of text, plus the 40 MB byte[]
+        //     List<Map>   = parseCsv(csv)            // ~212,000 LinkedHashMaps
+        //     one transaction around 212,000 inserts
+        //
+        // which is what exhausted the heap on a 2 GB server. parseCsv held every row TWICE -
+        // once as String[] and again as a LinkedHashMap - and rebuilt the column name for every
+        // cell of every row (header[c].trim().toUpperCase() inside the inner loop), so a file
+        // with ~20 columns produced over four million throwaway key strings. Peak live set ran
+        // to several hundred megabytes for a file of forty.
+        //
+        // Now: one line in memory at a time, column names resolved once into an index, and the
+        // inserts committed in chunks. Peak heap is a chunk, not a file, so this no longer
+        // scales with the size of Dhan's master.
+        instrumentRefreshStatus = instrumentStatus("running",
+            "Streaming Dhan public instrument master CSV.", 5, 100, "Downloading", null);
+
+        final Map<String, Integer> columnIndex = new LinkedHashMap<>();
+        final List<String[]> batch = new ArrayList<>(INSTRUMENT_CHUNK);
+        final int[] counters = new int[2];          // 0 = instruments written, 1 = stock_master rows
+        final TransactionTemplate tx = new TransactionTemplate(transactionManager);
+
+        http.forEachLine(DHAN_SCRIP_MASTER, Map.of("Accept", "text/csv"), 30000, line -> {
+            if (line == null || line.isBlank()) return;
+            String[] cols = splitCsv(line);
+            if (columnIndex.isEmpty()) {
+                // Header, resolved once. This is the allocation that used to happen per cell.
+                for (int i = 0; i < cols.length; i++) {
+                    columnIndex.put(cols[i].trim().toUpperCase(Locale.ROOT), i);
                 }
-                count++;
-                if (count == rows.size() || count % 500 == 0) {
-                    instrumentRefreshStatus = instrumentStatus("running", "Saving Dhan instruments and Stock Master equity rows.", count, rows.size(), "Saving", Map.of("equityStockRows", equityStockRows));
-                }
+                return;
             }
-            em.createNativeQuery(
-                "INSERT INTO broker_data_snapshots(user_id,institution_id,broker_credential_id,broker_name,data_type,source,payload_json,status,message,created_at,normalized_table,rows_imported) " +
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-                .setParameter(1, user.getId())
-                .setParameter(2, user.getInstitutionId())
-                .setParameter(3, credential == null ? null : credential.id())
-                .setParameter(4, "dhan")
-                .setParameter(5, "Stock List")
-                .setParameter(6, "DHAN")
-                .setParameter(7, "{\"sourceUrl\":\"" + DHAN_SCRIP_MASTER + "\",\"imported\":" + count + "}")
-                .setParameter(8, "completed")
-                .setParameter(9, "Dhan stock list refreshed.")
-                .setParameter(10, DateUtil.now())
-                .setParameter(11, "dhan_instruments, broker_instruments")
-                .setParameter(12, count)
-                .executeUpdate();
-            return count;
+            batch.add(cols);
+            if (batch.size() >= INSTRUMENT_CHUNK) {
+                flushInstrumentBatch(tx, columnIndex, batch, counters);
+                instrumentRefreshStatus = instrumentStatus("running",
+                    "Saving Dhan instruments and Stock Master equity rows.",
+                    counters[0], 0, "Saving", Map.of("equityStockRows", counters[1]));
+            }
         });
-        int count = imported == null ? 0 : imported;
+        if (!batch.isEmpty()) flushInstrumentBatch(tx, columnIndex, batch, counters);
+
+        if (columnIndex.isEmpty()) {
+            throw new IllegalStateException(
+                "Dhan instrument master returned no header row - nothing was imported.");
+        }
+        final int count = counters[0];
+
+        tx.executeWithoutResult(status -> em.createNativeQuery(
+            "INSERT INTO broker_data_snapshots(user_id,institution_id,broker_credential_id,broker_name,data_type,source,payload_json,status,message,created_at,normalized_table,rows_imported) " +
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
+            .setParameter(1, user.getId())
+            .setParameter(2, user.getInstitutionId())
+            .setParameter(3, credential == null ? null : credential.id())
+            .setParameter(4, "dhan")
+            .setParameter(5, "Stock List")
+            .setParameter(6, "DHAN")
+            .setParameter(7, "{\"sourceUrl\":\"" + DHAN_SCRIP_MASTER + "\",\"imported\":" + count + "}")
+            .setParameter(8, "completed")
+            .setParameter(9, "Dhan stock list refreshed.")
+            .setParameter(10, DateUtil.now())
+            .setParameter(11, "dhan_instruments")
+            .setParameter(12, count)
+            .executeUpdate());
         // Recovery: a fresh instrument master may carry corrected security IDs for
         // symbols that were previously marked permanently unfetchable (DH-905 on
         // both quote + historical, usually a stale/wrong securityId). Clear that
@@ -269,10 +222,12 @@ public class DhanHistoricalBackfillService {
             "status", "completed",
             "source", "DHAN",
             "sourceUrl", DHAN_SCRIP_MASTER,
-            "targetTable", "dhan_instruments / broker_instruments / stock_master",
+            "targetTable", "dhan_instruments / stock_master",
             "rowsImported", count,
             "processedRows", count,
-            "totalRows", rows.size(),
+            // The row count IS the import count now: streaming never holds the file, so there is
+            // no parsed list to measure a separate total against.
+            "totalRows", count,
             "currentStep", "Completed",
             "message", "Dhan stock list fetched and " + count + " instrument rows saved."
         );
@@ -2194,23 +2149,121 @@ public class DhanHistoricalBackfillService {
         return fromMonth + " " + fromYear + "-" + toMonth + " " + toYear;
     }
 
-    private List<Map<String, String>> parseCsv(String csv) {
-        List<String[]> rows = csv.lines().filter(l -> !l.isBlank()).map(this::splitCsv).toList();
-        if (rows.isEmpty()) return List.of();
-        String[] header = rows.get(0);
-        List<Map<String, String>> out = new ArrayList<>();
-        for (int i = 1; i < rows.size(); i++) {
-            String[] cols = rows.get(i);
-            Map<String, String> row = new LinkedHashMap<>();
-            for (int c = 0; c < header.length && c < cols.length; c++) {
-                row.put(header[c].trim().toUpperCase(Locale.ROOT), cols[c].trim());
+
+    /** Rows written per transaction. Bounds both heap and how much WAL one commit produces. */
+    private static final int INSTRUMENT_CHUNK = 1000;
+
+    /** One CSV cell by column name, trying each alias in turn. Replaces the per-row Map. */
+    static String at(String[] cols, Map<String, Integer> index, String... names) {   // package-private: see DhanScripMasterParsingTest
+        for (String name : names) {
+            Integer i = index.get(name);
+            if (i != null && i < cols.length) {
+                String v = cols[i];
+                if (v != null && !v.isBlank()) return v.trim();
             }
-            out.add(row);
         }
-        return out;
+        return "";
     }
 
-    private String[] splitCsv(String line) {
+    /**
+     * Writes one chunk of instrument rows and clears the batch.
+     *
+     * <p>Its own transaction, deliberately. The whole import used to run inside a single
+     * transaction spanning ~212,000 inserts, which holds every row lock to the end, keeps one
+     * PostgreSQL backend pinned, and leaves nothing on disk if the last row fails. Committing in
+     * chunks means a failure costs one chunk, and the EntityManager is cleared each time so the
+     * persistence context cannot grow with the file.
+     */
+    private void flushInstrumentBatch(TransactionTemplate tx, Map<String, Integer> index,
+                                      List<String[]> batch, int[] counters) {
+        if (batch.isEmpty()) return;
+        List<String[]> chunk = new ArrayList<>(batch);
+        batch.clear();
+        tx.executeWithoutResult(status -> {
+            for (String[] cols : chunk) {
+                String securityId = at(cols, index, "SEM_SMST_SECURITY_ID", "SECURITY_ID", "SMST_SECURITY_ID");
+                if (securityId.isBlank()) continue;
+                String exchange = at(cols, index, "SEM_EXM_EXCH_ID", "EXCH_ID");
+                String segment = at(cols, index, "SEM_SEGMENT", "SEGMENT");
+                String exchangeSegment = exchangeSegment(exchange, segment);
+                String instrument = at(cols, index, "SEM_INSTRUMENT_NAME", "INSTRUMENT");
+                String instrumentType = at(cols, index, "SEM_EXCH_INSTRUMENT_TYPE", "INSTRUMENT_TYPE");
+                String symbol = at(cols, index, "SM_SYMBOL_NAME", "SYMBOL_NAME");
+                String dhanTradingSymbol = at(cols, index, "SEM_TRADING_SYMBOL", "TRADING_SYMBOL");
+                String display = at(cols, index, "SEM_CUSTOM_SYMBOL", "DISPLAY_NAME");
+                String isin = at(cols, index, "ISIN", "SEM_ISIN_CODE", "SM_ISIN_CODE");
+                String underlyingSecurityId = at(cols, index, "UNDERLYING_SECURITY_ID", "SEM_UNDERLYING_SECURITY_ID", "SM_UNDERLYING_SECURITY_ID");
+                String underlyingSymbol = at(cols, index, "UNDERLYING_SYMBOL", "SEM_UNDERLYING_SYMBOL", "SM_UNDERLYING_SYMBOL");
+                String expiryDate = at(cols, index, "SEM_EXPIRY_DATE", "SM_EXPIRY_DATE", "EXPIRY_DATE");
+                String optionType = at(cols, index, "SEM_OPTION_TYPE", "OPTION_TYPE");
+                Double lotSize = number(at(cols, index, "SEM_LOT_UNITS", "LOT_SIZE"));
+
+                // raw_json is deliberately not written for instruments. Every field it held is
+                // already parsed into a typed column below, and keeping Dhan's whole CSV row as
+                // JSON - column names repeated on each of ~212k rows - cost about 161 MB per
+                // instrument table for data nothing reads.
+                em.createNativeQuery(
+                    "INSERT INTO dhan_instruments(security_id,exchange,segment_code,exchange_segment,instrument,instrument_type," +
+                    "symbol_name,trading_symbol,display_name,isin,underlying_security_id,underlying_symbol,expiry_date,strike_price,option_type,lot_size,updated_at) " +
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
+                    "ON CONFLICT (security_id, exchange_segment) DO UPDATE SET " +
+                    "exchange=EXCLUDED.exchange, segment_code=EXCLUDED.segment_code, instrument=EXCLUDED.instrument, " +
+                    "instrument_type=EXCLUDED.instrument_type, symbol_name=EXCLUDED.symbol_name, trading_symbol=EXCLUDED.trading_symbol, " +
+                    "display_name=EXCLUDED.display_name, isin=EXCLUDED.isin, underlying_security_id=EXCLUDED.underlying_security_id, " +
+                    "underlying_symbol=EXCLUDED.underlying_symbol, expiry_date=EXCLUDED.expiry_date, strike_price=EXCLUDED.strike_price, " +
+                    "option_type=EXCLUDED.option_type, lot_size=EXCLUDED.lot_size, updated_at=EXCLUDED.updated_at")
+                    .setParameter(1, securityId)
+                    .setParameter(2, exchange)
+                    .setParameter(3, segment)
+                    .setParameter(4, exchangeSegment)
+                    .setParameter(5, instrument)
+                    .setParameter(6, instrumentType)
+                    .setParameter(7, symbol)
+                    .setParameter(8, dhanTradingSymbol.isBlank() ? symbol : dhanTradingSymbol)
+                    .setParameter(9, display)
+                    .setParameter(10, isin)
+                    .setParameter(11, underlyingSecurityId)
+                    .setParameter(12, underlyingSymbol)
+                    .setParameter(13, expiryDate)
+                    .setParameter(14, number(at(cols, index, "SEM_STRIKE_PRICE", "STRIKE_PRICE")))
+                    .setParameter(15, optionType)
+                    .setParameter(16, lotSize)
+                    .setParameter(17, DateUtil.now())
+                    .executeUpdate();
+
+                if (isEquityStockInstrument(exchange, exchangeSegment, instrument, instrumentType)
+                    && !underlyingSymbol.isBlank()) {
+                    em.createNativeQuery(
+                        "INSERT INTO stock_master(exchange,symbol,company_name,sector,industry,status,source,as_on_date,series,isin,segment,lot_size) " +
+                        "VALUES(?,?,?,?,?,'active',?,?,?,?,?,?) " +
+                        "ON CONFLICT (exchange, symbol) DO UPDATE SET " +
+                        "company_name=COALESCE(NULLIF(EXCLUDED.company_name,''),stock_master.company_name), " +
+                        "source=EXCLUDED.source, as_on_date=EXCLUDED.as_on_date, series=EXCLUDED.series, isin=EXCLUDED.isin, " +
+                        "segment=EXCLUDED.segment, lot_size=EXCLUDED.lot_size, status='active'")
+                        .setParameter(1, normalizeExchange(exchange))
+                        .setParameter(2, underlyingSymbol.trim().toUpperCase(Locale.ROOT))
+                        .setParameter(3, display.isBlank() ? underlyingSymbol : display)
+                        .setParameter(4, "Unknown")
+                        .setParameter(5, "Unknown")
+                        .setParameter(6, "DHAN")
+                        .setParameter(7, DateUtil.today())
+                        .setParameter(8, instrument.isBlank() ? "ES" : instrument)
+                        .setParameter(9, isin)
+                        .setParameter(10, "Equity")
+                        .setParameter(11, lotSize == null ? 1 : lotSize.intValue())
+                        .executeUpdate();
+                    counters[1]++;
+                }
+                counters[0]++;
+            }
+            // Without this the persistence context keeps every statement's state for the whole
+            // import, which is the same unbounded growth the chunking was added to remove.
+            em.flush();
+            em.clear();
+        });
+    }
+
+    static String[] splitCsv(String line) {   // package-private + static: pure, see DhanScripMasterParsingTest
         List<String> cells = new ArrayList<>();
         StringBuilder cell = new StringBuilder();
         boolean quote = false;
@@ -2939,13 +2992,6 @@ public class DhanHistoricalBackfillService {
                 .setParameter(6, batchId).executeUpdate());
     }
 
-    private String first(Map<String, String> row, String... keys) {
-        for (String key : keys) {
-            String value = row.getOrDefault(key.toUpperCase(Locale.ROOT), "");
-            if (value != null && !value.isBlank()) return value;
-        }
-        return "";
-    }
 
     private String writeJson(Object value) {
         try { return mapper.writeValueAsString(value); }

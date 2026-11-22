@@ -55,6 +55,159 @@ Chart.register(...registerables);
     </div>
   </div>
 
+  <!-- ══ Market Trend Identification Engine ══════════════════════════════════
+       First thing on the page, deliberately: every other number here describes the
+       market, and this one says what to DO about it. -->
+  @if (health?.success) {
+    <div class="card" style="padding:0; margin-bottom:14px; overflow:hidden; border:1px solid #1e2a3b;">
+
+      <!-- Status band. Colour carries the state, but never alone - the words say it too. -->
+      <div style="display:flex; align-items:stretch; flex-wrap:wrap;"
+           [style.background]="health.status_colour + '1a'"
+           [style.borderLeft]="'5px solid ' + health.status_colour">
+
+        <div style="flex:1 1 340px; padding:14px 18px;">
+          <div style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.6px;">
+            Market Status
+          </div>
+          <div style="font-size:24px; font-weight:800; line-height:1.2; margin-top:2px;"
+               [style.color]="health.status_colour">
+            {{ health.market_status }}
+          </div>
+          <div style="font-size:12px; color:#e2e8f0; margin-top:6px; font-weight:600;">
+            {{ health.recommended_action }}
+          </div>
+          @if (health.strong_buy_blocked_by?.length) {
+            <div style="font-size:10px; color:#facc15; margin-top:6px;">
+              Score is 80+, but Strong Buy also needs: {{ health.strong_buy_blocked_by.join('; ') }}
+            </div>
+          }
+        </div>
+
+        <div style="flex:0 0 190px; padding:14px 18px; display:flex; flex-direction:column;
+                    justify-content:center; align-items:center; border-left:1px solid #1e2a3b;">
+          <div style="font-size:10px; color:#94a3b8; text-transform:uppercase; letter-spacing:.6px;">
+            Health Score
+          </div>
+          <div style="font-size:42px; font-weight:800; line-height:1.05;"
+               [style.color]="health.status_colour">
+            {{ health.market_health_score | number:'1.0-1' }}
+          </div>
+          <div style="font-size:10px; color:#64748b;">out of 100</div>
+          <div style="width:100%; height:6px; background:#0f172a; border-radius:3px; margin-top:8px;">
+            <div style="height:6px; border-radius:3px;"
+                 [style.width]="health.market_health_score + '%'"
+                 [style.background]="health.status_colour"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- The readings the specification asks to display -->
+      <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:#1e2a3b;">
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">% Above 20 DMA</div>
+          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.pct_above_20dma | number:'1.1-1' }}%</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">% Above 50 DMA</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="health.pct_above_50dma >= 70 ? '#22c55e' : '#e2e8f0'">
+            {{ health.pct_above_50dma | number:'1.1-1' }}%
+          </div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">% Above 200 DMA</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="health.pct_above_200dma >= 60 ? '#22c55e' : '#e2e8f0'">
+            {{ health.pct_above_200dma | number:'1.1-1' }}%
+          </div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;"
+             [title]="health.advancing + ' advancing vs ' + health.declining + ' declining'">
+          <div style="font-size:9.5px; color:#94a3b8;">Advance / Decline</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="(health.advance_decline_ratio || 0) > 1 ? '#22c55e' : '#ef4444'">
+            {{ health.advance_decline_ratio == null ? 'n/a' : (health.advance_decline_ratio | number:'1.2-2') }}
+          </div>
+          <div style="font-size:9px; color:#64748b;">{{ health.advancing }} up &middot; {{ health.declining }} down</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;"
+             [title]="health.new_highs + ' at a 52-week high vs ' + health.new_lows + ' at a 52-week low'">
+          <div style="font-size:9.5px; color:#94a3b8;">New High / New Low</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="(health.nh_nl_ratio || 0) >= 1 ? '#22c55e' : '#ef4444'">
+            {{ health.nh_nl_ratio == null ? 'n/a' : (health.nh_nl_ratio | number:'1.2-2') }}
+          </div>
+          <div style="font-size:9px; color:#64748b;">{{ health.new_highs }} hi &middot; {{ health.new_lows }} lo</div>
+        </div>
+
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">Volume Participation</div>
+          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.volume_participation_pct | number:'1.1-1' }}%</div>
+          <div style="font-size:9px; color:#64748b;">{{ health.stocks_above_avg_volume }} above 20-day avg</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">Composite RSI (14)</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="health.composite_rsi_state === 'BULLISH' ? '#22c55e' : health.composite_rsi_state === 'BEARISH' ? '#ef4444' : '#facc15'">
+            {{ health.composite_rsi == null ? 'n/a' : (health.composite_rsi | number:'1.1-1') }}
+          </div>
+          <div style="font-size:9px; color:#64748b;">{{ health.composite_rsi_state }}</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;" [title]="health.composite_note">
+          <div style="font-size:9.5px; color:#94a3b8;">Composite Trend</div>
+          <div style="font-size:19px; font-weight:800;"
+               [style.color]="health.composite_trend === 'BULLISH' ? '#22c55e' : health.composite_trend === 'BEARISH' ? '#ef4444' : '#facc15'">
+            {{ health.composite_trend }}
+          </div>
+          <div style="font-size:9px; color:#64748b;">close vs 50 vs 200 DMA</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">% Above 100 DMA</div>
+          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.pct_above_100dma | number:'1.1-1' }}%</div>
+        </div>
+        <div style="background:#0d1829; padding:10px 14px;">
+          <div style="font-size:9.5px; color:#94a3b8;">Universe</div>
+          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.total_stocks | number }}</div>
+          <div style="font-size:9px; color:#64748b;">{{ health.universe }}</div>
+        </div>
+      </div>
+
+      <!-- Where the score came from. A single number nobody can take apart is a number
+           nobody can argue with, which is the opposite of useful. -->
+      <div style="padding:10px 16px; border-top:1px solid #1e2a3b;">
+        <div style="font-size:9.5px; color:#94a3b8; text-transform:uppercase; letter-spacing:.5px; margin-bottom:7px;">
+          Score breakdown
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:8px 16px;">
+          @for (row of breakdownRows; track row.key) {
+            <div>
+              <div style="display:flex; justify-content:space-between; font-size:10px; margin-bottom:3px;">
+                <span style="color:#cbd5e1;">{{ row.label }}</span>
+                <span style="color:#94a3b8;">{{ row.earned | number:'1.0-1' }} / {{ row.max }}</span>
+              </div>
+              <div style="height:5px; background:#0f172a; border-radius:3px;">
+                <div style="height:5px; border-radius:3px; background:#1d6adb;"
+                     [style.width]="barPct(row) + '%'"></div>
+              </div>
+            </div>
+          }
+        </div>
+        <div style="font-size:9.5px; color:#64748b; margin-top:9px; line-height:1.6;">
+          As of {{ health.as_of }} &middot; {{ health.composite_note }}
+          @if (health.universe_warning) {
+            <div style="color:#facc15; margin-top:4px;">{{ health.universe_warning }}</div>
+          }
+        </div>
+      </div>
+    </div>
+  } @else if (health && !health.success) {
+    <div class="card" style="padding:14px 18px; margin-bottom:14px; border-left:4px solid #facc15;">
+      <div style="font-size:13px; font-weight:700; color:#facc15;">Market Health Score unavailable</div>
+      <div style="font-size:11px; color:#94a3b8; margin-top:4px;">{{ health.message }}</div>
+    </div>
+  }
+
   @if (loading && !data) {
     <div style="text-align:center; padding:60px; color:#94a3b8; font-size:14px;">
       <span class="spin" style="width:24px; height:24px; border-width:3px; margin-bottom:12px; display:block; margin:0 auto 12px;"></span>

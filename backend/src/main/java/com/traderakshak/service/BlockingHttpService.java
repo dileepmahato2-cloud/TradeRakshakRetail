@@ -30,6 +30,48 @@ public class BlockingHttpService {
         return read(con);
     }
 
+    /**
+     * Streams a response line by line instead of materialising it.
+     *
+     * <p>get() calls readAllBytes() and then wraps the result in a String, so a 40 MB download
+     * costs 80 MB of heap before anything has been parsed. On a 2 GB box the JVM defaults to a
+     * 512 MB heap, and the Dhan scrip master alone was enough to exhaust it. Nothing needs the
+     * whole document at once - every caller here is walking rows - so hand the reader out and
+     * let the caller consume it a line at a time. Peak heap becomes one line.
+     *
+     * <p>The connection is closed when this returns, so the consumer must not retain the reader.
+     */
+    public void forEachLine(String url, Map<String, String> headers, int timeoutMs,
+                            java.util.function.Consumer<String> onLine) throws Exception {
+        String finalUrl = normalizeDhanUrl(url);
+        logRequest("GET", finalUrl, headers, null);
+        HttpURLConnection con = open(finalUrl, "GET", headers, timeoutMs);
+        int code = con.getResponseCode();
+        InputStream stream = code >= 400 ? con.getErrorStream() : con.getInputStream();
+        if (stream == null) throw new IllegalStateException("HTTP " + code + ": empty response");
+        if (code >= 400) {
+            try (InputStream is = stream) {
+                throw new IllegalStateException("HTTP " + code + ": "
+                    + new String(is.readAllBytes(), StandardCharsets.UTF_8));
+            }
+        }
+        long started = System.currentTimeMillis();
+        long lines = 0, bytes = 0;
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(stream, StandardCharsets.UTF_8), 1 << 16)) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                lines++;
+                bytes += line.length() + 1;
+                onLine.accept(line);
+            }
+        } finally {
+            con.disconnect();
+        }
+        log.info("HTTP GET {} streamed status={} lines={} approxBytes={} in {} ms",
+            finalUrl, code, lines, bytes, System.currentTimeMillis() - started);
+    }
+
     public String postJson(String url, Map<String, String> headers, Object body, int timeoutMs) throws Exception {
         String finalUrl = normalizeDhanUrl(url);
         byte[] payload = mapper.writeValueAsBytes(body);
