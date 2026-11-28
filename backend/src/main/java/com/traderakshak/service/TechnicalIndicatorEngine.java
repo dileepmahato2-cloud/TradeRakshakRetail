@@ -254,6 +254,52 @@ public class TechnicalIndicatorEngine {
     }
 
     // ── Stochastic Oscillator (%K, %D) ────────────────────────────────────────
+    /**
+     * Stochastic with an explicit %K smoothing - the (14, 3, 3) form.
+     *
+     * <p>Three numbers, not two, because "stochastic 14, 3, 3" means three different things:
+     * the look-back for raw %K, the smoothing applied to it, and the period of %D over the
+     * result. The two-argument form below is the FAST stochastic, where raw %K is used
+     * unsmoothed; what most platforms draw by default, and what this screen's rules are written
+     * against, is the SLOW one, where %K is itself a 3-period average.
+     *
+     * <p>The difference is not cosmetic. Raw %K jumps the full height of its range on a single
+     * bar, so it crosses %D far more often than the smoothed line does - a crossing rule built
+     * on the fast version fires on noise the slow version never sees.
+     *
+     * @param smoothK 1 leaves %K raw, which makes this identical to the two-argument form
+     */
+    public double[] stochastic(List<Double> highs, List<Double> lows, List<Double> closes,
+                               int kPeriod, int smoothK, int dPeriod) {
+        if (closes == null || closes.size() < kPeriod) return new double[]{50, 50};
+        List<Double> raw = new ArrayList<>();
+        for (int i = kPeriod - 1; i < closes.size(); i++) {
+            double hh = Double.MIN_VALUE, ll = Double.MAX_VALUE;
+            for (int j = i - kPeriod + 1; j <= i; j++) {
+                hh = Math.max(hh, highs.get(j));
+                ll = Math.min(ll, lows.get(j));
+            }
+            raw.add(hh == ll ? 50 : (closes.get(i) - ll) / (hh - ll) * 100);
+        }
+        if (raw.isEmpty()) return new double[]{50, 50};
+
+        // %K smoothed, as a series, because %D is an average OF the smoothed line - taking it
+        // over the raw one would be a different indicator wearing the same name.
+        List<Double> kLine = new ArrayList<>();
+        if (smoothK <= 1) {
+            kLine.addAll(raw);
+        } else {
+            for (int i = smoothK - 1; i < raw.size(); i++) {
+                kLine.add(avg(raw.subList(i - smoothK + 1, i + 1)));
+            }
+        }
+        if (kLine.isEmpty()) return new double[]{50, 50};
+
+        double lastK = last(kLine);
+        double lastD = kLine.size() >= dPeriod ? sma(kLine, dPeriod) : lastK;
+        return new double[]{round1(lastK), round1(lastD)};
+    }
+
     public double[] stochastic(List<Double> highs, List<Double> lows, List<Double> closes, int kPeriod, int dPeriod) {
         if (closes == null || closes.size() < kPeriod) return new double[]{50, 50};
         List<Double> kValues = new ArrayList<>();

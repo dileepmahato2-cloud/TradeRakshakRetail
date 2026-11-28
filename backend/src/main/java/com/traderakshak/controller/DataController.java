@@ -205,6 +205,24 @@ public class DataController {
         return ResponseEntity.ok(ApiResponse.ok(dataFetchEngine.validateDateRange(fromDate, toDate)));
     }
 
+    // == Exchange holiday calendar ==========================================
+
+    /** Fetch NSE's published trading-holiday calendar and store it. */
+    @PostMapping("/market-holidays/fetch")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> fetchMarketHolidays() {
+        // The fetch bumps HolidayCalendarVersion, which retires the cached calendar, so this
+        // takes effect on the next screen read rather than waiting out a cache entry.
+        return ResponseEntity.ok(ApiResponse.ok(nseExchangeFetchService.fetchTradingHolidays()));
+    }
+
+    /** The stored equity (CM) holiday calendar, newest year first. */
+    @GetMapping("/market-holidays")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMarketHolidays(
+            @RequestParam(required = false) Integer year) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            nseExchangeFetchService.storedTradingHolidays(year)));
+    }
+
     @GetMapping("/error-codes")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getErrorCodes() {
         return ResponseEntity.ok(ApiResponse.ok(dataFetchEngine.getErrorCodes()));

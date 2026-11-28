@@ -5,8 +5,21 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.traderakshak.dto.response.ApiResponse;
 import com.traderakshak.entity.User;
 import com.traderakshak.service.AppConfigService;
+import com.traderakshak.service.BrokerFundsService;
+import com.traderakshak.service.DemoAccountService;
+import com.traderakshak.service.AutoStrategySourceService;
 import com.traderakshak.service.StockTrackerService;
 import com.traderakshak.service.BlockingHttpService;
+import com.traderakshak.service.CapitalAllocationService;
+import com.traderakshak.service.BrokerageCalculator;
+import com.traderakshak.service.StrategyAuditService;
+import com.traderakshak.service.BrokerTradeImportService;
+import com.traderakshak.service.VolumeBreakoutAutoTradeService;
+import com.traderakshak.service.OrderReconciliationService;
+import com.traderakshak.service.BrokerOrderStatus;
+import com.traderakshak.service.PositionExitRules;
+import com.traderakshak.service.PositionMonitorService;
+import com.traderakshak.service.PnlDashboardService;
 import com.traderakshak.service.TradingGateClient;
 import com.traderakshak.util.DateUtil;
 import com.traderakshak.util.UserMessage;
@@ -40,23 +53,57 @@ import java.util.Map;
 @RestController
 @RequestMapping("/trading")
 public class TradingController {
+
+    private static final org.slf4j.Logger log =
+        org.slf4j.LoggerFactory.getLogger(TradingController.class);
     private static final String DHAN_API = "https://api.dhan.co/v2";
 
     @PersistenceContext
     private EntityManager em;
+    private final DemoAccountService demoAccount;
+    private final BrokerFundsService brokerFunds;
     private final BlockingHttpService http;
     private final ObjectMapper mapper;
     private final TradingGateClient tradingGate;
     private final AppConfigService appConfig;
     private final StockTrackerService stockTracker;
+    private final BrokerageCalculator brokerage;
+    private final CapitalAllocationService allocation;
+    private final PnlDashboardService pnl;
+    private final PositionMonitorService positionMonitor;
+    private final OrderReconciliationService reconciliation;
+    private final VolumeBreakoutAutoTradeService autoTrade;
+    private final AutoStrategySourceService     autoSources;
+    private final BrokerTradeImportService tradeImport;
+    private final StrategyAuditService strategyAudit;
 
     public TradingController(BlockingHttpService http, ObjectMapper mapper, TradingGateClient tradingGate,
-                             AppConfigService appConfig, StockTrackerService stockTracker) {
+                             AppConfigService appConfig, StockTrackerService stockTracker,
+                             BrokerageCalculator brokerage, CapitalAllocationService allocation,
+                             DemoAccountService demoAccount,
+                             BrokerFundsService brokerFunds,
+                             PnlDashboardService pnl, PositionMonitorService positionMonitor,
+                             OrderReconciliationService reconciliation,
+                             VolumeBreakoutAutoTradeService autoTrade,
+                             AutoStrategySourceService autoSources,
+                             BrokerTradeImportService tradeImport,
+                             StrategyAuditService strategyAudit) {
+        this.tradeImport = tradeImport;
+        this.strategyAudit = strategyAudit;
+        this.pnl = pnl;
+        this.positionMonitor = positionMonitor;
+        this.reconciliation = reconciliation;
+        this.autoTrade = autoTrade;
+        this.autoSources = autoSources;
         this.tradingGate = tradingGate;
         this.http = http;
         this.mapper = mapper;
         this.appConfig = appConfig;
         this.stockTracker = stockTracker;
+        this.brokerage = brokerage;
+        this.allocation = allocation;
+        this.demoAccount = demoAccount;
+        this.brokerFunds = brokerFunds;
     }
 
     /**
@@ -130,6 +177,46 @@ public class TradingController {
             req.put("targetPct", appConfig.getDouble("trading.default_target_pct", 10.0));
         if (dbl(req.get("trailingStopLossPct"), 0) <= 0)
             req.put("trailingStopLossPct", appConfig.getDouble("trading.default_trailing_stop_loss_pct", 2.0));
+    }
+
+    /**
+     * The real account's funds, from the broker.
+     *
+     * <p>Always answers. When the broker cannot be reached it returns the last successful
+     * reading with its timestamp and {@code stale: true}, rather than a zero that would read as
+     * an empty account.
+     */
+    @GetMapping("/broker-funds")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> brokerFunds(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(brokerFunds.funds(user)));
+    }
+
+    // ---- Demo (paper) account -------------------------------------------------------------
+    //
+    // Paper trading had no balance: only a deployment cap that nothing debited and nothing
+    // persisted, so a paper strategy could spend the same rupee every session. These expose the
+    // virtual account that now stands behind it.
+
+    /** The demo account as the Filters panel shows it: balance, buying power, opening balance. */
+    @GetMapping("/demo-account")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> demoAccount(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            demoAccount.summary(user.getId(), user.getInstitutionId())));
+    }
+
+    /** Every movement on the demo account, newest first, with the balance after each. */
+    @GetMapping("/demo-account/ledger")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> demoAccountLedger(
+            @RequestParam(defaultValue = "100") int limit,
+            @AuthenticationPrincipal User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("entries", demoAccount.ledger(user.getId(), user.getInstitutionId(), limit));
+        // The stored balance beside the ledger total, so a drift between them is visible rather
+        // than quietly corrected.
+        out.put("reconciliation", demoAccount.recomputeBalance(user.getId(), user.getInstitutionId()));
+        return ResponseEntity.ok(ApiResponse.ok(out));
     }
 
     @GetMapping("/dashboard")
@@ -246,6 +333,561 @@ public class TradingController {
         headers.setContentType(MediaType.parseMediaType("text/csv"));
         headers.setContentDisposition(ContentDisposition.attachment().filename("trading_journal.csv").build());
         return ResponseEntity.ok().headers(headers).body(bytes);
+    }
+
+    /**
+     * Equal-split allocation preview for a selected set of stocks.
+     *
+     * <p>Called on every tick and untick, and again immediately before an order is submitted. It
+     * is a pure function of (total, selection, current prices) rather than cached state, so the
+     * second call against a moved price cannot produce a quantity the first call's price would
+     * have afforded but the current one does not.
+     */
+    /**
+     * Section 10's dashboard. Gross and net reported separately throughout, because for a
+     * one-session hold the difference between them is the whole question.
+     */
+    /**
+     * Settle real orders against Dhan's own order book.
+     *
+     * <p>Read-only at the broker: it never places, modifies or cancels anything. One
+     * {@code GET /orders} call covers the whole day, and an order whose placement response was
+     * lost is found by the correlation id it was sent with.
+     */
+    /**
+     * Import today's executed trades from the broker and reconcile them against the journal.
+     *
+     * <p>Section 9. {@code dryRun} defaults to TRUE: an endpoint that writes trades into a journal
+     * should not do so because something issued a bare POST, and the preview is the point - the
+     * broker's trade book is its view of the day, not necessarily the whole story of a position.
+     */
+    @PostMapping("/broker-trades/import")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> importBrokerTrades(
+            @RequestParam(defaultValue = "true") boolean dryRun,
+            @RequestBody(required = false) Map<String, Object> req,
+            @AuthenticationPrincipal User user) {
+        Map<String, Object> result = tradeImport.importTrades(user, dryRun,
+            req == null ? null : stringList(req.get("orderIds")));
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("TRADE-IMPORT", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /** The audit trail: selections, allocations and order events, newest first. Section 11. */
+    @GetMapping("/audit-trail")
+    public ResponseEntity<ApiResponse<java.util.List<Map<String, Object>>>> auditTrail(
+            @RequestParam(required = false) String strategy,
+            @RequestParam(required = false) String eventType,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "200") int limit,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            strategyAudit.trail(user.getId(), strategy, eventType, from, to, limit)));
+    }
+
+    @PostMapping("/reconcile")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reconcileOrders(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(reconciliation.reconcile(user)));
+    }
+
+    /**
+     * Automated entry for the Volume Breakout shortlist.
+     *
+     * <p>{@code dryRun=true} by default, on purpose: an endpoint that places orders should not do
+     * so because someone curled it to see what it did. Pass {@code dryRun=false} to actually
+     * place. PAPER mode opens simulated positions; REAL mode records the signal and reports it as
+     * awaiting submission rather than reaching around the compliance gate, which runs on the
+     * submit endpoint immediately before an order reaches the broker.
+     */
+    /**
+     * Place paper orders for the stocks the user ticked. Requires an explicit confirmation.
+     *
+     * <p>REAL is refused here by design - it must pass the compliance gate on the submit
+     * endpoint - and the response says so rather than failing quietly.
+     */
+    @PostMapping("/volbreakout/place")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutPlace(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        Map<String, Object> result = autoTrade.placeManual(
+            user.getId(), user.getInstitutionId(), symbolList(req.get("symbols")),
+            dbl(req.get("totalInvestment"), 0), upper(req.get("mode"), "PAPER"),
+            bool(req.get("confirmed")));
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("VOLBREAKOUT-PLACE", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /** Manual sell: closes open paper positions in the named stocks at the current price. */
+    @PostMapping("/volbreakout/sell")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutSell(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        Map<String, Object> result = autoTrade.sellManual(user.getId(),
+            symbolList(req.get("symbols")), upper(req.get("mode"), "PAPER"),
+            bool(req.get("confirmed")));
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("VOLBREAKOUT-SELL", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    @PostMapping("/volbreakout/auto-buy")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutAutoBuy(
+            @RequestParam(defaultValue = "true") boolean dryRun,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            autoTrade.autoBuy(user.getId(), user.getInstitutionId(), dryRun)));
+    }
+
+    /** Automated exit: runs the stop-loss / target / trailing / time-exit sweep now. */
+    @PostMapping("/volbreakout/auto-sell")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutAutoSell(
+            @RequestParam(defaultValue = "true") boolean dryRun,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            autoTrade.autoSell(user.getId(), positionMonitor, dryRun)));
+    }
+
+    /**
+     * What automation would and would not do right now, and why.
+     *
+     * <p>Exists because "my automation did nothing" is otherwise unanswerable without reading
+     * logs. Every failing condition is listed, not just the first - fixing one and rediscovering
+     * the next, a restart at a time, is the worst version of this.
+     */
+    /**
+     * Both modes' automation settings in one response, for the Auto Trading panel.
+     *
+     * <p>Both, always, rather than only the live one: the panel shows Paper and Real side by
+     * side so that switching between them is an informed choice and not a discovery.
+     */
+    // ── Auto Buy & Sell, for any strategy in the system ──────────────────────
+    //
+    // The volbreakout endpoints above drive one strategy and will keep doing so. These drive
+    // whichever strategy is selected, including anything built in the Strategy Builder, and
+    // hold their settings per strategy and per mode so arming one never arms another.
+
+    /** Every strategy automation can be pointed at: the built-in sections and saved builds. */
+    @GetMapping("/auto/strategies")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> autoStrategies(
+            @AuthenticationPrincipal User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("sources", autoSources.sources(user));
+        out.put("liveMode", autoTrade.mode());
+        out.put("realTradingAuthorized", autoTrade.realTradingAllowed(user.getId()));
+        out.put("brokerReady", autoTrade.brokerReady(user.getId()));
+        out.put("marketSessionLive", stockTracker.isTradingSessionLive());
+        out.put("positionMonitorEnabled", positionMonitor.isEnabled());
+        out.put("reconciliationEnabled", reconciliation.isEnabled());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /**
+     * The stocks a strategy identifies right now.
+     *
+     * <p>Resolved through the same call the strategy's own screen makes, so the two cannot show
+     * different lists for the same strategy.
+     */
+    @GetMapping("/auto/strategies/stocks")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> autoStrategyStocks(
+            @RequestParam String key, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(autoSources.resolve(user, key)));
+    }
+
+    /** One strategy's automation settings, both modes, so the choice between them is informed. */
+    @GetMapping("/auto/strategies/settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> autoStrategySettings(
+            @RequestParam String key, @AuthenticationPrincipal User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("key", key);
+        out.put("paper", autoSources.settings(key, "PAPER"));
+        out.put("real",  autoSources.settings(key, "REAL"));
+        out.put("liveMode", autoTrade.mode());
+        out.put("realTradingAuthorized", autoTrade.realTradingAllowed(user.getId()));
+        out.put("brokerReady", autoTrade.brokerReady(user.getId()));
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    @PostMapping("/auto/strategies/settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> saveAutoStrategySettings(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        String key = text(req.get("key"));
+        if (key.isBlank()) {
+            return ResponseEntity.badRequest().body(
+                ApiResponse.error("AUTO-KEY", "Which strategy? No key was supplied."));
+        }
+        Map<String, Object> result = autoSources.saveSettings(
+            user.getId(), key, upper(req.get("mode"), "PAPER"), req);
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("AUTO-SETTINGS", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /**
+     * Buy or sell a strategy's current stocks now.
+     *
+     * <p>{@code dryRun} is the default: asking what automation would do must never be the thing
+     * that makes it happen.
+     */
+    @PostMapping("/auto/strategies/run")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> runAutoStrategy(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        String key = text(req.get("key"));
+        if (key.isBlank()) {
+            return ResponseEntity.badRequest().body(
+                ApiResponse.error("AUTO-KEY", "Which strategy? No key was supplied."));
+        }
+        boolean dryRun = !req.containsKey("dryRun") || bool(req.get("dryRun"));
+        String mode = upper(req.get("mode"), "PAPER");
+        if ("REAL".equals(mode) && !dryRun && !bool(req.get("confirmed"))) {
+            return ResponseEntity.badRequest().body(ApiResponse.error("AUTO-CONFIRM",
+                "A real order must be confirmed. Nothing was placed."));
+        }
+        Map<String, Object> result = autoSources.run(user, key, upper(req.get("side"), "BUY"),
+                                                     mode, dryRun, bool(req.get("confirmed")));
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("AUTO-RUN", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    @GetMapping("/volbreakout/settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutSettings(
+            @AuthenticationPrincipal User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("liveMode", autoTrade.mode());
+        out.put("strategyEnabled", stockTracker.isVolumeBreakoutEnabled());
+        out.put("paper", autoTrade.settingsFor("PAPER"));
+        out.put("real", autoTrade.settingsFor("REAL"));
+        // Entry conditions are the screen's, not a per-mode setting: the same shortlist feeds
+        // both modes, so a mode that screened differently would not be the same strategy.
+        Map<String, Object> entry = new LinkedHashMap<>();
+        entry.put("previousCloseBelowBase", true);
+        entry.put("currentAtOrAboveBase", true);
+        entry.put("volumeAboveAverage", true);
+        entry.put("volumeLookbackSessions", 20);
+        entry.put("requireStochasticCross", stockTracker.isStochCrossRequired());
+        entry.put("shortlistSize", 5);
+        entry.put("finalizeTime", stockTracker.getVolumeBreakoutFinalizeTime());
+        out.put("entryConditions", entry);
+        // Exit conditions are per mode, because they are the risk settings.
+        Map<String, Object> exit = new LinkedHashMap<>();
+        exit.put("timeExit", "Sold at the next trading day's close");
+        exit.put("realOrderTime", autoTrade.realOrderTime());
+        exit.put("stopLossTracked", "per position");
+        exit.put("trailingStopTracked", "per position, from that position's own high water mark");
+        out.put("exitConditions", exit);
+        out.put("realTradingAuthorized", autoTrade.realTradingAllowed(user.getId()));
+        out.put("brokerReady", autoTrade.brokerReady(user.getId()));
+        out.put("positionMonitorEnabled", positionMonitor.isEnabled());
+        out.put("reconciliationEnabled", reconciliation.isEnabled());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /** Saves one mode's automation settings. The body names the mode; nothing else is touched. */
+    @PostMapping("/volbreakout/settings")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> saveVolBreakoutSettings(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        Map<String, Object> result = autoTrade.saveSettings(
+            user.getId(), upper(req.get("mode"), "PAPER"), req);
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("VOLBREAKOUT-SETTINGS", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /**
+     * Arms the strategy and picks the live mode.
+     *
+     * <p>Separate from saving settings on purpose. Editing a Real stop loss is not the same
+     * decision as arming Real trading, and one request that did both would make the second
+     * happen as a side effect of the first.
+     */
+    @PostMapping("/volbreakout/mode")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setVolBreakoutMode(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        String wanted = req.get("mode") == null ? null : upper(req.get("mode"), "PAPER");
+        Boolean enabled = req.containsKey("enabled") ? bool(req.get("enabled")) : null;
+        if ("REAL".equals(wanted) && !bool(req.get("confirmed"))) {
+            return ResponseEntity.badRequest().body(ApiResponse.error("VOLBREAKOUT-MODE",
+                "Switching to REAL must be confirmed. Nothing was changed."));
+        }
+        Map<String, Object> result = autoTrade.setLiveMode(user.getId(), wanted, enabled);
+        result.put("settings", autoTrade.effectiveSettings());
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    @GetMapping("/volbreakout/auto-status")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volBreakoutAutoStatus(
+            @AuthenticationPrincipal User user) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("strategyEnabled", stockTracker.isVolumeBreakoutEnabled());
+        out.put("autoBuyEnabled", autoTrade.isAutoBuyEnabled());
+        out.put("autoSellEnabled", autoTrade.isAutoSellEnabled());
+        out.put("mode", autoTrade.mode());
+        out.put("marketSessionLive", stockTracker.isTradingSessionLive());
+        out.put("positionMonitorEnabled", positionMonitor.isEnabled());
+        out.put("reconciliationEnabled", reconciliation.isEnabled());
+        out.put("finalizeTime", stockTracker.getVolumeBreakoutFinalizeTime());
+        out.put("realOrderTime", autoTrade.realOrderTime());
+        out.put("investmentAmount", autoTrade.investmentAmount());
+        out.put("maxOpenPositions", autoTrade.maxOpenPositions());
+        out.put("maxDailyLoss", autoTrade.maxDailyLoss());
+        out.put("stopLossPct", autoTrade.stopLossPct());
+        out.put("trailingStopPct", autoTrade.trailingStopPct());
+        out.put("targetPct", autoTrade.targetPct());
+        // A dry run, so asking what automation would do never causes it to happen.
+        out.put("buyPreview", autoTrade.autoBuy(user.getId(), user.getInstitutionId(), true));
+        out.put("note", "Entry and exit are both measured at the 15:30 close. A REAL market order "
+            + "cannot be filled AT the close - 15:30 is the bell, and the official close is a "
+            + "weighted average of the last thirty minutes - so a real order is sent at "
+            + autoTrade.realOrderTime() + " and fills at whatever is trading then. Paper fills use "
+            + "the official close exactly. The journal keeps both figures.");
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    @GetMapping("/pnl/dashboard")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> pnlDashboard(
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String symbol,
+            @RequestParam(required = false) String strategy,
+            @RequestParam(required = false) String mode,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            pnl.dashboard(user.getId(), from, to, symbol, strategy, mode)));
+    }
+
+    /**
+     * Run the stop-loss / trailing-stop / target / time-exit sweep now rather than waiting for the
+     * next minute. Reports what it closed and why.
+     */
+    @PostMapping("/positions/sweep")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> sweepPositions(
+            @AuthenticationPrincipal User user) {
+        if (!positionMonitor.isEnabled()) {
+            return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "success", false, "examined", 0, "closed", List.of(),
+                "message", "The position monitor is off. Turn on positionmonitor.enabled in "
+                         + "Application Settings to let stop-loss and target rules close positions.")));
+        }
+        return ResponseEntity.ok(ApiResponse.ok(positionMonitor.sweep(user.getId())));
+    }
+
+    /**
+     * Open positions with their live mark, high-water mark and the levels each rule currently sits
+     * at - so a user can see where a stop actually is rather than inferring it from a percentage.
+     */
+    @GetMapping("/positions/open")
+    @SuppressWarnings("unchecked")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> openPositions(
+            @AuthenticationPrincipal User user) {
+        List<Object[]> rows = em.createNativeQuery(
+            "SELECT id,symbol,qty,entry_price,entry_date,stop_loss_pct,trailing_sl_level,target_pct,"
+          + "high_water_mark,strategy_key,sector FROM paper_trades "
+          + "WHERE user_id=? AND status='open' ORDER BY id DESC")
+            .setParameter(1, user.getId()).getResultList();
+
+        List<String> symbols = rows.stream().map(r -> text(r[1])).distinct().toList();
+        Map<String, Double> prices = symbols.isEmpty()
+            ? Map.of() : stockTracker.executablePrices(symbols);
+
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Object[] r : rows) {
+            double entry = dbl(r[3], 0);
+            double price = prices.getOrDefault(stockTracker.normalizeSymbol(text(r[1])), 0.0);
+            double stopPct = dbl(r[5], 0), trailPct = dbl(r[6], 0), targetPct = dbl(r[7], 0);
+            double high = PositionExitRules.advanceHighWater(dbl(r[8], 0), entry, price);
+            int qty = integer(r[2], 0);
+
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id", r[0]);
+            m.put("symbol", text(r[1]));
+            m.put("sector", text(r[10]));
+            m.put("quantity", qty);
+            m.put("entryPrice", entry);
+            m.put("entryDate", text(r[4]));
+            m.put("currentPrice", price);
+            m.put("strategyKey", text(r[9]));
+            m.put("highWaterMark", high);
+            // The actual levels, not the percentages. A percentage is what was configured; a price
+            // is what will happen, and only one of those is checkable at a glance against a chart.
+            m.put("stopLossPrice", stopPct > 0 ? round(entry * (1 - stopPct / 100.0)) : null);
+            m.put("trailingStopPrice", trailPct > 0 ? round(high * (1 - trailPct / 100.0)) : null);
+            m.put("targetPrice", targetPct > 0 ? round(entry * (1 + targetPct / 100.0)) : null);
+            double unreal = price > 0 && entry > 0 ? round((price - entry) * qty) : 0;
+            m.put("unrealizedPnl", unreal);
+            m.put("unrealizedPct", entry > 0 && price > 0
+                ? round((price - entry) / entry * 100) : 0);
+            // What it will cost to get out of this and what the position has to clear.
+            var c = qty > 0 && entry > 0
+                ? brokerage.roundTrip(BrokerageCalculator.Product.DELIVERY, "NSE",
+                                      entry, price > 0 ? price : entry, qty) : null;
+            m.put("estimatedRoundTripCharges", c == null ? 0 : c.total());
+            m.put("netUnrealizedPnl", c == null ? unreal : round(unreal - c.total()));
+            out.add(m);
+        }
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    @PostMapping("/allocate/preview")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> allocatePreview(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        List<String> symbols = symbolList(req.get("symbols"));
+        if (symbols.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                "success", false, "legs", List.of(), "selectedCount", 0,
+                "message", "Select at least one stock to allocate across.")));
+        }
+        // Priced here rather than taken from the request body. A client-supplied price is a price
+        // from whenever that screen last painted, and sizing an order on it is the stale-quantity
+        // problem this preview exists to prevent.
+        Map<String, Double> priced = new LinkedHashMap<>();
+        Map<String, Double> latest = stockTracker.executablePrices(symbols);
+        for (String s : symbols) {
+            priced.put(s, latest.getOrDefault(stockTracker.normalizeSymbol(s), 0.0));
+        }
+        // The balance comes from the account the caller names, which is the whole point of
+        // section 1: a Demo allocation is sized against the virtual ledger and a Real one against
+        // the broker's own buying power.
+        //
+        // This previously fell through to portfolioSummary's "availableFunds", a fixed notional
+        // of 100,000 minus whatever is open. Measured on the live server that figure had reached
+        // -88,580.93, so the preview reported every basket as unaffordable and refused to size
+        // anything - the comment that used to be here describes the same failure and tried to
+        // dodge it by preferring a configured override that is set to 0 in practice.
+        //
+        // An explicit availableCash in the request still wins, and so does a configured override,
+        // because both are deliberate. What is gone is the silent fall-back to a notional that
+        // can go negative.
+        String acct = upper(req.get("accountType"), "PAPER");
+        boolean real = "REAL".equals(acct) || "LIVE".equals(acct);
+
+        Double accountBalance = null;
+        String balanceSource;
+        if (real) {
+            Map<String, Object> funds = brokerFunds.funds(user);
+            // Buying power, not cash plus collateral: it is what an equity delivery order may
+            // actually use. Null when the broker could not be read - and a real order must not be
+            // sized against a guess, so that stays null rather than becoming a number.
+            Object bp = funds.get("buying_power");
+            if (bp == null) bp = funds.get("available_balance");
+            accountBalance = bp instanceof Number n ? n.doubleValue() : null;
+            balanceSource = Boolean.TRUE.equals(funds.get("stale"))
+                ? "broker (last known reading, could not be refreshed)"
+                : "broker";
+            if (accountBalance == null) {
+                return ResponseEntity.ok(ApiResponse.ok(Map.of(
+                    "success", false, "legs", List.of(), "selectedCount", symbols.size(),
+                    "accountType", "REAL", "availableBalance", (Object) null,
+                    "message", "The broker balance could not be read, so a real order cannot be "
+                             + "sized. " + String.valueOf(funds.getOrDefault("message", "")).trim())));
+            }
+        } else {
+            accountBalance = demoAccount.balance(user.getId(), user.getInstitutionId());
+            balanceSource = "demo ledger";
+        }
+
+        double configured = appConfig.getDouble("volbreakout.available.funds", 0);
+        double available = dbl(req.get("availableCash"),
+                               configured > 0 ? configured : accountBalance);
+        Map<String, Object> result = allocation.allocate(
+            dbl(req.get("totalInvestment"), 0), available, priced,
+            productOf(req.get("productType")), upper(req.get("exchange"), "NSE"));
+
+        // Section 11's record of stock selection, deselection and capital allocation. Written
+        // here because this is the one place that sees both at once - which stocks are ticked and
+        // what that produces - and it deduplicates internally, so the preview recalculating on
+        // every tick does not turn the trail into a click log.
+        strategyAudit.recordSelection(user.getId(), user.getInstitutionId(),
+            textOr(req.get("strategyKey"), "volbreakout"), upper(req.get("mode"), "PAPER"),
+            symbols, dbl(req.get("totalInvestment"), 0), result);
+
+        // Which account the sizing assumed, and where that balance came from. Stated on every
+        // response: a quantity means nothing without knowing whose money it was sized against,
+        // and this is what stops a real allocation being read as a paper one.
+        result.put("accountType", real ? "REAL" : "PAPER");
+        result.put("accountBalance", accountBalance);
+        result.put("balanceSource", balanceSource);
+        return ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    /**
+     * Charges on a trade, itemised, at Dhan's published rates.
+     *
+     * <p>Exposed on its own because the journal, the allocation strip and the order preview all
+     * need the same figure, and because a user ought to be able to check a number the application
+     * is about to subtract from their P&amp;L against their own contract note.
+     */
+    @PostMapping("/charges/preview")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> chargesPreview(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        BrokerageCalculator.Product product = productOf(req.get("productType"));
+        String exchange = upper(req.get("exchange"), "NSE");
+        int qty = integer(req.get("quantity"), 0);
+        double buyPrice = dbl(req.get("buyPrice"), dbl(req.get("price"), 0));
+        double sellPrice = dbl(req.get("sellPrice"), 0);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("product", product.name());
+        out.put("exchange", exchange);
+        if (sellPrice > 0 && buyPrice > 0) {
+            var rt = brokerage.roundTrip(product, exchange, buyPrice, sellPrice, qty);
+            out.put("roundTrip", rt.asMap());
+            // Spelled out because it is the number that decides whether a one-session strategy
+            // can work at all: it has to average more than this, gross, just to break even.
+            out.put("breakEvenMovePct", rt.totalPct());
+        } else {
+            String side = upper(req.get("side"), "BUY");
+            var leg = brokerage.charges(product,
+                "SELL".equals(side) ? BrokerageCalculator.Side.SELL : BrokerageCalculator.Side.BUY,
+                exchange, buyPrice > 0 ? buyPrice : dbl(req.get("price"), 0), qty,
+                // The DP fee is per ISIN per day, not per order, so a caller splitting an exit
+                // across orders must claim it on one of them only.
+                bool(req.getOrDefault("lastDeliverySellOfDay", true)));
+            out.put("leg", leg.asMap());
+            out.put("side", side);
+        }
+        out.put("note", "Rates from Dhan's published pricing. Equity delivery is zero-brokerage; "
+            + "the cost is statutory plus the per-ISIN depository fee. Verify against a contract "
+            + "note before relying on net P&L.");
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /**
+     * Delivery unless told otherwise.
+     *
+     * <p>Defaulting to delivery is deliberate rather than alphabetical: this platform's strategies
+     * hold overnight, and mislabelling a delivery trade as intraday understates a round trip by
+     * roughly a third - no STT on the buy leg, a fifth of the stamp duty, and no DP fee.
+     * Under-reporting cost is the direction that makes a losing strategy look viable.
+     */
+    private BrokerageCalculator.Product productOf(Object raw) {
+        String p = upper(raw, "DELIVERY");
+        if (p.startsWith("INTRA") || "MIS".equals(p)) return BrokerageCalculator.Product.INTRADAY;
+        if (p.startsWith("MTF")) return BrokerageCalculator.Product.MTF;
+        return BrokerageCalculator.Product.DELIVERY;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> symbolList(Object raw) {
+        List<String> out = new ArrayList<>();
+        if (raw instanceof List<?> list) {
+            for (Object o : list) {
+                String s = upper(o, "");
+                if (!s.isBlank() && !out.contains(s)) out.add(s);
+            }
+        } else if (raw != null) {
+            for (String s : text(raw).split("[,\\s]+")) {
+                String u = s.trim().toUpperCase(Locale.ROOT);
+                if (!u.isBlank() && !out.contains(u)) out.add(u);
+            }
+        }
+        return out;
     }
 
     @PostMapping("/order/preview")
@@ -594,8 +1236,26 @@ public class TradingController {
                 "access-token", decode(String.valueOf(broker[4])),
                 "client-id", String.valueOf(broker[3])
             );
+            // The deterministic correlation id is what makes a lost placement response
+            // recoverable. If this POST times out the order may well have reached Dhan - the
+            // request succeeded and only the reply was lost - and without an id of our own there
+            // is no way to ask "did it?". GET /orders/external/{correlation-id} answers it, but
+            // only for an id we chose in advance and can reproduce.
+            //
+            // Derived from the idempotency key, so the same logical order always yields the same
+            // id, and shortened to Dhan's 30-character, restricted-character limit by
+            // BrokerOrderStatus.correlationId - our own key has colons and is far too long.
+            String idemKey = text(req.get("idempotencyKey")).isBlank()
+                ? BrokerOrderStatus.idempotencyKey(user.getId(), text(req.get("strategyKey")),
+                        symbol, side, DateUtil.today(), lng(req.get("signalId")) == null
+                            ? 0 : lng(req.get("signalId")))
+                : text(req.get("idempotencyKey"));
+            String correlationId = BrokerOrderStatus.correlationId(
+                user.getId(), DateUtil.today(), idemKey);
+
             Map<String, Object> body = new LinkedHashMap<>();
             body.put("dhanClientId", String.valueOf(broker[3]));
+            body.put("correlationId", correlationId);
             body.put("transactionType", side);
             body.put("exchangeSegment", instrument.exchangeSegment());
             body.put("productType", text(req.getOrDefault("productType", "CNC")));
@@ -722,24 +1382,48 @@ public class TradingController {
         }
     }
 
+    /**
+     * The Top 10 that bulk orders are placed against, CALCULATED rather than read back.
+     *
+     * <p>This used to read {@code tracker_ranking_items} for the newest stored run, with no
+     * fallback, and that was wrong in a way that mattered: a stored run carries the
+     * {@code current_price} it saw when it ran. Orders were therefore being sized against a price
+     * from whenever the last ranking happened - up to five minutes stale during a session, and
+     * arbitrarily stale once the per-refresh ranking is switched off, which is now a supported
+     * setting. "Buy all ten" on yesterday's prices is not a slow screen, it is a wrong order.
+     *
+     * <p>The Top 10 screen already computes this list live - {@code getLatestRankingFull} runs
+     * {@code buildFallbackTop10Ranking} first and only falls back to stored runs for history. Using
+     * the same call makes the orders agree with the screen the user clicked from, which they
+     * previously did not.
+     */
     @SuppressWarnings("unchecked")
     private List<Map<String, Object>> currentTop10(User user) {
-        List<Object[]> rows = em.createNativeQuery(
-            "SELECT i.rank_position,i.symbol,i.sector,i.current_price,i.return_pct,i.composite_score " +
-            "FROM tracker_ranking_items i JOIN tracker_rankings r ON r.run_id=i.run_id " +
-            "WHERE r.institution_id=? AND r.user_id=? AND i.user_id=? AND i.is_current_top10=1 " +
-            "AND i.run_id=(SELECT run_id FROM tracker_rankings WHERE institution_id=? AND user_id=? ORDER BY run_date DESC,id DESC LIMIT 1) " +
-            "ORDER BY i.rank_position LIMIT 10")
-            .setParameter(1, user.getInstitutionId())
-            .setParameter(2, user.getId())
-            .setParameter(3, user.getId())
-            .setParameter(4, user.getInstitutionId())
-            .setParameter(5, user.getId()).getResultList();
         List<Map<String, Object>> list = new ArrayList<>();
-        for (Object[] r : rows) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("rank", r[0]); m.put("symbol", r[1]); m.put("sector", r[2]); m.put("price", r[3]); m.put("returnPct", r[4]); m.put("score", r[5]);
-            list.add(m);
+        try {
+            Map<String, Object> ranking = stockTracker.getLatestRankingFull(
+                user.getId(), user.getInstitutionId(), true);
+            List<Map<String, Object>> top =
+                (List<Map<String, Object>>) ranking.getOrDefault("current_top10", List.of());
+            int rank = 0;
+            for (Map<String, Object> s : top) {
+                if (++rank > 10) break;
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("rank", rank);
+                m.put("symbol", s.get("symbol"));
+                m.put("sector", s.get("sector"));
+                // Named "price" because that is what the order path reads.
+                m.put("price", s.get("current_price"));
+                m.put("returnPct", s.get("return_pct"));
+                m.put("score", s.get("composite_score"));
+                list.add(m);
+            }
+        } catch (Exception e) {
+            // Empty, never a stale stored list. A bulk-order flow that silently falls back to old
+            // prices is the failure this method was changed to remove, so an error here has to
+            // produce nothing to trade rather than something wrong to trade.
+            log.warn("Current Top 10 could not be calculated, so no orders will be prepared: {}",
+                e.getMessage());
         }
         return list;
     }
@@ -944,15 +1628,74 @@ public class TradingController {
         try {
             String ref = "TJ-" + user.getId() + "-" + DateUtil.today().replace("-", "") + "-" + (q("SELECT COUNT(*) FROM trading_journal") + 1);
             Map<String, Object> calc = orderCalculation(req);
-            em.createNativeQuery("INSERT INTO trading_journal(trade_ref,order_id,user_id,institution_id,user_name,strategy_key,strategy_name,trading_mode,trade_type,stock_name,symbol,sector,quantity,buy_price,sell_price,stop_loss,trailing_stop_loss,target_price,capital_utilized,margin_utilized,brokerage_charges,net_profit_loss,exit_reason,outcome,system_remarks,user_remarks,broker_name,broker_response,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            BrokerageCalculator.Product product = productOf(req.get("productType"));
+            String exchange = upper(req.get("exchange"), "NSE");
+
+            // Charges computed here rather than taken from the request body. They used to be
+            // dbl(req.get("brokerageCharges"), 0) - whatever the caller sent, and zero for every
+            // caller that sent nothing, which was most of them. A one-session delivery round trip
+            // costs about 0.30% of the position, so a journal recording zero charges reports a
+            // net P&L identical to gross and makes a losing strategy read as a winner.
+            //
+            // One leg only. This row is one order; the opposite leg gets its own row with its own
+            // charges, and adding a round trip here would double-count.
+            double price = buyPrice > 0 ? buyPrice : sellPrice;
+            double chargeTotal = 0;
+            String chargeJson = null;
+            if (qty > 0 && price > 0) {
+                var leg = brokerage.charges(product,
+                    "SELL".equalsIgnoreCase(tradeType)
+                        ? BrokerageCalculator.Side.SELL : BrokerageCalculator.Side.BUY,
+                    exchange, price, qty, true);
+                chargeTotal = leg.total();
+                chargeJson = toJsonQuiet(leg.asMap());
+            }
+            double gross = pnl;
+            double net = Math.round((gross - chargeTotal) * 100.0) / 100.0;
+
+            // Only a genuinely placed order carries an idempotency key. journal() is also called
+            // for validation failures, margin rejections and exceptions, and giving those a key
+            // would have the unique index refuse the user's legitimate retry.
+            String idemKey = text(req.get("idempotencyKey"));
+            if (idemKey.isBlank()) idemKey = null;
+
+            em.createNativeQuery("INSERT INTO trading_journal(trade_ref,order_id,user_id,institution_id,user_name,strategy_key,strategy_name,trading_mode,trade_type,stock_name,symbol,sector,quantity,buy_price,sell_price,stop_loss,trailing_stop_loss,target_price,capital_utilized,margin_utilized,brokerage_charges,net_profit_loss,exit_reason,outcome,system_remarks,user_remarks,broker_name,broker_response,created_at,updated_at,"
+                + "gross_pnl,charges_breakdown,trade_status,filled_qty,pending_qty,broker_order_id,idempotency_key,product_type,signal_at,order_placed_at,is_manual) "
+                + "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                 .setParameter(1, ref).setParameter(2, text(req.get("orderId"))).setParameter(3, user.getId()).setParameter(4, user.getInstitutionId()).setParameter(5, user.getName())
                 .setParameter(6, textOr(req.get("strategyKey"), "manual")).setParameter(7, textOr(req.get("strategyName"), "Manual Trade")).setParameter(8, mode).setParameter(9, tradeType)
                 .setParameter(10, symbol).setParameter(11, symbol).setParameter(12, text(req.get("sector"))).setParameter(13, qty).setParameter(14, buyPrice).setParameter(15, sellPrice)
                 .setParameter(16, calc.get("stopLossPrice")).setParameter(17, calc.get("trailingStopPrice")).setParameter(18, calc.get("targetPrice")).setParameter(19, calc.get("orderValue"))
-                .setParameter(20, calc.get("marginUtilizationPct")).setParameter(21, dbl(req.get("brokerageCharges"), 0)).setParameter(22, pnl).setParameter(23, exitReason).setParameter(24, outcome)
+                .setParameter(20, calc.get("marginUtilizationPct")).setParameter(21, chargeTotal).setParameter(22, net).setParameter(23, exitReason).setParameter(24, outcome)
                 .setParameter(25, systemRemarks).setParameter(26, text(req.get("userRemarks"))).setParameter(27, text(req.get("brokerName"))).setParameter(28, text(req.get("brokerResponse")))
-                .setParameter(29, DateUtil.now()).setParameter(30, DateUtil.now()).executeUpdate();
-        } catch (Exception ignored) {}
+                .setParameter(29, DateUtil.now()).setParameter(30, DateUtil.now())
+                .setParameter(31, gross)
+                .setParameter(32, chargeJson)
+                // PLACED, not FILLED. Section 10: a signal is not an order and an order is not a
+                // fill. Only the reconciler, having read the broker's own order book, may call
+                // something filled.
+                .setParameter(33, textOr(req.get("tradeStatus"), "PLACED"))
+                .setParameter(34, 0).setParameter(35, qty)
+                .setParameter(36, text(req.get("brokerOrderId")))
+                .setParameter(37, idemKey)
+                .setParameter(38, product.name())
+                .setParameter(39, textOr(req.get("signalAt"), DateUtil.now()))
+                .setParameter(40, DateUtil.now())
+                .setParameter(41, bool(req.get("isManual")) ? 1 : 0)
+                .executeUpdate();
+        } catch (Exception e) {
+            // A unique-key violation here is the idempotency guard doing its job: this logical
+            // order is already journalled, and the second attempt being a no-op is the desired
+            // outcome. Anything else is a real failure and must not vanish - the previous
+            // `catch (Exception ignored) {}` swallowed both alike, so a journal that had stopped
+            // recording would have looked exactly like a quiet day.
+            String msg = String.valueOf(e.getMessage());
+            if (msg.contains("ux_tj_idem") || msg.toLowerCase(Locale.ROOT).contains("duplicate")) {
+                log.debug("Journal entry already exists for this order; not recorded twice.");
+            } else {
+                log.warn("Could not write the trade journal entry for {}: {}", symbol, msg);
+            }
+        }
     }
 
     private void audit(User user, String strategyKey, String strategyName, String mode, String eventType, String symbol, String side, String status, String message, String brokerName, String brokerResponse, Object details) {
@@ -1043,6 +1786,28 @@ public class TradingController {
     private String escSql(String s) { return s == null ? "" : s.replace("'", "''"); }
     private String toJson(Object o) { try { return mapper.writeValueAsString(o); } catch (Exception e) { return "{}"; } }
     private String text(Object v) { return v == null ? "" : String.valueOf(v).trim(); }
+    /** Accepts a JSON array or a comma/space separated string. */
+    @SuppressWarnings("unchecked")
+    private static java.util.List<String> stringList(Object raw) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (raw instanceof java.util.List<?> l) {
+            for (Object o : l) if (o != null && !String.valueOf(o).isBlank()) out.add(String.valueOf(o).trim());
+        } else if (raw != null && !String.valueOf(raw).isBlank()) {
+            for (String p : String.valueOf(raw).split("[,\s]+")) if (!p.isBlank()) out.add(p.trim());
+        }
+        return out;
+    }
+
+
+    /**
+     * Serialise a charge breakdown for storage. Returns null on failure rather than throwing: a
+     * journal row that loses its itemised charges is worth far more than no journal row at all,
+     * and the total is stored in its own column regardless.
+     */
+    private String toJsonQuiet(Object value) {
+        try { return mapper.writeValueAsString(value); }
+        catch (Exception e) { return null; }
+    }
     private String upper(Object v, String fallback) { String s = text(v); return s.isBlank() ? fallback : s.toUpperCase(Locale.ROOT); }
     private boolean bool(Object v) { return Boolean.TRUE.equals(v) || "true".equalsIgnoreCase(String.valueOf(v)) || "1".equals(String.valueOf(v)); }
     private int integer(Object v, int fallback) { try { return v == null ? fallback : ((Number) (v instanceof Number ? v : Double.parseDouble(String.valueOf(v)))).intValue(); } catch (Exception e) { return fallback; } }

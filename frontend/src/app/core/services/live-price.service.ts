@@ -1,5 +1,5 @@
 import { Injectable, NgZone, signal } from '@angular/core';
-import { Subject } from 'rxjs';
+import { ReplaySubject, Subject } from 'rxjs';
 import { environment } from '../../../environments/environment';
 import { AuthService } from './auth.service';
 
@@ -11,9 +11,20 @@ export class LivePriceService {
   private refCount = 0;
 
   readonly quote$ = new Subject<any>();
-  readonly status$ = new Subject<any>();
-  readonly top10$ = new Subject<any>();
-  readonly sync$ = new Subject<any>();
+  /**
+   * Replays the last status to whoever subscribes next.
+   *
+   * <p>This was a plain Subject, which only ever emits to subscribers that were already
+   * listening. Leaving the Stock Upload screen destroys its subscription; coming back creates a
+   * fresh one that receives NOTHING until the server happens to push the next status event - so
+   * the Live Price Feed panel sat blank or stale on every return, for as long as that gap
+   * happened to be. A ReplaySubject of one hands the newest known status over immediately and
+   * the panel paints on the first frame, while still updating from the stream as before.
+   */
+  readonly status$ = new ReplaySubject<any>(1);
+  /** Same reasoning as status$: these back panels that must render on re-entry, not on next push. */
+  readonly top10$ = new ReplaySubject<any>(1);
+  readonly sync$ = new ReplaySubject<any>(1);
   readonly refresh$ = new Subject<any>();
   readonly connectionState = signal<'connected' | 'connecting' | 'disconnected'>('disconnected');
 

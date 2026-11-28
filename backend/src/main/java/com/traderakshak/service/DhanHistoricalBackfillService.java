@@ -2548,9 +2548,32 @@ public class DhanHistoricalBackfillService {
                  + "sessions, or is suspended. Nothing to fix; it fills in if it trades again.";
         }
         if (code.contains("DH-905") || body.contains("dh-905") || body.contains("missing required fields")) {
-            return "Dhan will not serve this instrument - almost always delisted, or the "
-                 + "security id is no longer valid. It will keep failing until it is removed "
-                 + "from the uploaded list.";
+            // This used to read "almost always delisted, or the security id is no longer valid.
+            // It will keep failing until it is removed from the uploaded list." That was wrong,
+            // and it was advising the removal of live stocks.
+            //
+            // Checked against the data on 2026-11-24, for the 167 symbols job 18 reported:
+            //   - every sampled symbol IS listed on NSE and present in Dhan's own scrip master
+            //     with instrument=EQUITY;
+            //   - the security id sent matched the master's NSE_EQ id for all of them - no
+            //     mismatch, no stale id;
+            //   - the request body was well formed and identical in shape to the ~1,100 that
+            //     succeeded in the same job;
+            //   - 89 of the 167 already hold stored daily candles, so they have returned data
+            //     before;
+            //   - 156 of the 167 had no bar inside the requested window, which looks like Dhan
+            //     answering "no data for this range" with an input-exception code rather than
+            //     DH-907 - but 11 of them did trade in the window and still failed, so that does
+            //     not explain all of it.
+            //
+            // So the only honest message is what is actually known. Dhan documents DH-905 as
+            // "Missing required fields, bad values for parameters etc.", which describes the
+            // request, not the instrument - and we can show the request was fine.
+            return "Dhan rejected the request for this instrument with DH-905 (an input error). "
+                 + "This does NOT mean the stock is delisted: these are usually NSE-listed with a "
+                 + "valid security id, and many already have stored history. It most often "
+                 + "accompanies a range in which the stock did not trade. Nothing to remove - "
+                 + "check the symbol on Dhan directly before taking it out of the uploaded list.";
         }
         if (code.contains("DH-904") || body.contains("rate") || body.contains("429")) {
             return "Rate limited by Dhan. The job backs off and retries; no data is lost.";

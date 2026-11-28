@@ -27,7 +27,21 @@ public sealed interface AstNode {
      *              fields keeps "RSI between 55 and 75" one node, which is how the builder renders
      *              it and how the strength scorer counts it.
      */
-    record Compare(CompareOp op, Operand left, List<Operand> right) implements AstNode {}
+    record Compare(CompareOp op, Operand left, List<Operand> right,
+                   Timeframe timeframe) implements AstNode {
+
+        /**
+         * Daily, which is what every rule written before timeframes existed meant.
+         *
+         * <p>A default rather than a required field on purpose: adding the component and making
+         * all callers state it would have turned a widening of the language into a migration,
+         * and a stored rule that suddenly needs a field it does not have is a rule that stops
+         * loading.
+         */
+        public Compare(CompareOp op, Operand left, List<Operand> right) {
+            this(op, left, right, Timeframe.DAILY);
+        }
+    }
 
     /**
      * IF / ELSE IF / ELSE.
@@ -53,11 +67,20 @@ public sealed interface AstNode {
     /**
      * A claim over a run of periods: rising, falling, highest, lowest.
      *
+     * <p>A period is one bar of the node's own timeframe, so RISING over 5 on the hourly reads
+     * five hourly bars, not five days.
+     *
      * <p>Deliberately not a {@link Compare}. Conflating the two is tempting because they both end
      * in a boolean, but a quantifier reads N periods and has no right-hand operand, so folding it
      * into Compare means a node whose shape depends on its operator.
      */
-    record Quantifier(QuantifierOp op, int periods, Operand over) implements AstNode {}
+    record Quantifier(QuantifierOp op, int periods, Operand over,
+                      Timeframe timeframe) implements AstNode {
+
+        public Quantifier(QuantifierOp op, int periods, Operand over) {
+            this(op, periods, over, Timeframe.DAILY);
+        }
+    }
 
     enum Action { IDENTIFY, SKIP }
 

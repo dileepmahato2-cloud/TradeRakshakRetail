@@ -15,11 +15,16 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+
 /**
  * Single source of truth for market status and the trading calendar.
  *
- * Holidays come from the {@code market.holidays} application setting (comma /
- * newline / space separated {@code yyyy-MM-dd} dates). Session timings come from
+ * Holidays come from the {@code market_holidays} table, which is fetched from NSE's published
+ * calendar, with the {@code market.holidays} application setting (comma / newline / space
+ * separated {@code yyyy-MM-dd} dates) kept as a manual override and as the fallback when the
+ * table is empty. Session timings come from
  * {@code market.session.open} / {@code market.session.close} (defaults 09:15 /
  * 15:30 IST). Everything is holiday- and weekend-aware.
  */
@@ -35,16 +40,47 @@ public class MarketCalendarService {
 
     private final AppConfigService appConfig;
     private final MarketDataCache cache;
+    private final HolidayCalendarVersion holidayVersion;
+    @PersistenceContext private EntityManager em;
 
     public ZoneId zone() { return IST; }
 
     public LocalDate today() { return LocalDate.now(IST); }
 
-    /** Parsed set of configured holiday dates (defensive against bad input). */
+    /**
+     * Every date the exchange was closed, from both sources.
+     *
+     * <p>The {@code market_holidays} table is the calendar NSE publishes and is the authority:
+     * it is refreshed from NSE, so it stays correct when the exchange amends the year (a
+     * municipal election closed the market on 15 Jan 2026, which no list written in advance
+     * would have carried). The config key is unioned on top as a manual override for a date NSE
+     * has not published yet, and carries the whole calendar on a server that cannot reach NSE.
+     *
+     * <p>This used to read the config key alone, which shipped empty and was never filled - so
+     * every holiday in the platform's history read as an ordinary trading day.
+     *
+     * <p>The cache key carries the calendar version, so a fetch takes effect at once instead of
+     * waiting out the previous entry's minute.
+     */
     public Set<LocalDate> holidays() {
-        Set<LocalDate> cached = cache.get("market.holidays");
+        String key = "market.holidays.v" + (holidayVersion == null ? 0L : holidayVersion.get());
+        Set<LocalDate> cached = cache.get(key);
         if (cached != null) return cached;
         Set<LocalDate> out = new HashSet<>();
+
+        try {
+            for (Object o : em.createNativeQuery(
+                    "SELECT to_char(holiday_date,'YYYY-MM-DD') FROM market_holidays "
+                  + "WHERE exchange='NSE' AND segment='CM'").getResultList()) {
+                if (o == null) continue;
+                try { out.add(LocalDate.parse(String.valueOf(o), ISO)); } catch (Exception ignored) {}
+            }
+        } catch (Exception e) {
+            // Before V55 has run, or if the table is unreachable: fall through to the config key
+            // rather than reporting every day a trading day.
+            log.debug("Stored holiday calendar unavailable: {}", e.getMessage());
+        }
+
         String raw = appConfig.getString("market.holidays", "");
         if (raw != null && !raw.isBlank()) {
             for (String token : raw.split("[,;\\s]+")) {
@@ -53,8 +89,57 @@ public class MarketCalendarService {
                 try { out.add(LocalDate.parse(t, ISO)); } catch (Exception ignored) {}
             }
         }
-        cache.put("market.holidays", out, 60000L);
+        cache.put(key, out, 60000L);
         return out;
+    }
+
+    /**
+     * Whether the platform may call an external provider right now.
+     *
+     * <p>Outbound calls are allowed only on a trading day, between
+     * {@code automation.window.start} and {@code automation.window.end} (08:00 to 16:00 by
+     * default). Outside that - overnight, at weekends and on exchange holidays - the schedulers
+     * that reach Dhan or NSE stand down.
+     *
+     * <p>Deliberately one predicate rather than an hour check copied into each job. There are
+     * nine schedulers making outbound calls and they currently carry nine slightly different
+     * cron windows; a rule expressed once can be read once, and a holiday added to the calendar
+     * reaches all of them at the same moment.
+     *
+     * <p>Work that does not leave the machine is NOT gated by this: folding ticks into candles,
+     * writing the end-of-day candle, recomputing market health and finalising a shortlist are
+     * database operations on data already held, and stopping them would lose the session's work
+     * rather than save a call.
+     */
+    public boolean isAutomationWindowOpen() {
+        return isAutomationWindowOpen(ZonedDateTime.now(IST));
+    }
+
+    /** As above, at a given moment - the form the tests drive. */
+    public boolean isAutomationWindowOpen(ZonedDateTime nowIst) {
+        LocalDate date = nowIst.toLocalDate();
+        if (isWeekend(date) || isHoliday(date)) return false;
+        LocalTime now = nowIst.toLocalTime();
+        return !now.isBefore(automationStart()) && now.isBefore(automationEnd());
+    }
+
+    /** First moment of the day an automatic external call may be made. 08:00 by default. */
+    public LocalTime automationStart() {
+        return parseTime(appConfig.getString("automation.window.start", "08:00"), LocalTime.of(8, 0));
+    }
+
+    /** The moment automatic external calls stop for the day. 16:00 by default. */
+    public LocalTime automationEnd() {
+        return parseTime(appConfig.getString("automation.window.end", "16:00"), LocalTime.of(16, 0));
+    }
+
+    /** A short sentence for a log line, so a skipped run says why rather than going silent. */
+    public String automationWindowReason() {
+        ZonedDateTime now = ZonedDateTime.now(IST);
+        LocalDate date = now.toLocalDate();
+        if (isWeekend(date)) return "weekend";
+        if (isHoliday(date)) return "exchange holiday";
+        return "outside " + automationStart() + "-" + automationEnd() + " IST";
     }
 
     public boolean isHoliday(LocalDate date) {

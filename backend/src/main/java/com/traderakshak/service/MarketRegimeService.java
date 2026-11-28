@@ -4,6 +4,7 @@ import com.traderakshak.util.DateUtil;
 import jakarta.persistence.EntityManager;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -45,10 +46,13 @@ public class MarketRegimeService {
 
     private final EntityManager em;
     private final TechnicalIndicatorEngine indicators;
+    private final org.springframework.transaction.support.TransactionTemplate tx;
 
-    public MarketRegimeService(EntityManager em, TechnicalIndicatorEngine indicators) {
+    public MarketRegimeService(EntityManager em, TechnicalIndicatorEngine indicators,
+                               org.springframework.transaction.support.TransactionTemplate tx) {
         this.em = em;
         this.indicators = indicators;
+        this.tx = tx;
     }
 
     // ---------------------------------------------------------------- universe
@@ -186,6 +190,275 @@ public class MarketRegimeService {
     private static double round1(double v) { return Math.round(v * 10.0) / 10.0; }
     private static double round2(double v) { return Math.round(v * 100.0) / 100.0; }
 
+    /**
+     * Last computed reading, served to every caller for an hour.
+     *
+     * <p>computeMarketHealth() walks ~2,600 symbols over 260 sessions and then chains a
+     * composite series over the same range. That is seconds of work, and it was being run on
+     * every page view - which is why the status band appeared blank and only filled in once the
+     * request came back. Market breadth is a daily measure built from daily closes; recomputing
+     * it per request measures nothing new, it just makes the reader wait. So compute it at most
+     * once an hour and hand the cached reading over immediately.
+     */
+    private volatile Map<String, Object> cached;
+    private volatile long cachedAtMs;
+    private static final long CACHE_TTL_MS = 60 * 60 * 1000L;
+
+    /** Serves the cached reading, recomputing only when it has aged out. */
+    public Map<String, Object> marketHealth() {
+        return marketHealth(false);
+    }
+
+    /**
+     * Serves the reading, optionally forcing a recompute first.
+     *
+     * <p>{@code force} is what the Refresh button on the status band sends. Without it the
+     * button could only ever re-fetch the same cached map, which looks identical to a button
+     * that does nothing - and that is exactly how it was reported.
+     */
+    public Map<String, Object> marketHealth(boolean force) {
+        Map<String, Object> snapshot = cached;
+        if (!force && snapshot != null && System.currentTimeMillis() - cachedAtMs < CACHE_TTL_MS) {
+            return stamped(snapshot);
+        }
+        return stamped(force ? forceRefreshMarketHealth() : refreshMarketHealth());
+    }
+
+    /**
+     * How old the served reading is, added at serve time rather than at compute time.
+     *
+     * <p>Without this the screen cannot tell a reading computed a minute ago from one computed
+     * fifty-nine minutes ago, so "it is not updating" is unanswerable - by the user or by
+     * anyone reading the logs afterwards. The reading itself is immutable and shared between
+     * callers, so the age goes on a copy.
+     */
+    private Map<String, Object> stamped(Map<String, Object> reading) {
+        if (reading == null) return null;
+        Map<String, Object> out = new LinkedHashMap<>(reading);
+        long at = cachedAtMs;
+        out.put("computed_at_epoch_ms", at);
+        out.put("cache_age_seconds", at <= 0 ? null : (System.currentTimeMillis() - at) / 1000);
+        out.put("cache_ttl_seconds", CACHE_TTL_MS / 1000);
+        return out;
+    }
+
+    /** Recomputes and replaces the cached reading. */
+    public synchronized Map<String, Object> refreshMarketHealth() {
+        // Re-check inside the lock: several requests can arrive while the first is still
+        // computing, and without this each of them would run the whole scan again.
+        Map<String, Object> snapshot = cached;
+        if (snapshot != null && System.currentTimeMillis() - cachedAtMs < CACHE_TTL_MS) {
+            return snapshot;
+        }
+        return recompute();
+    }
+
+    /** Recomputes unconditionally, ignoring the TTL. Still serialized, so two Refresh clicks
+     *  arriving together scan the universe once, not twice. */
+    public synchronized Map<String, Object> forceRefreshMarketHealth() {
+        return recompute();
+    }
+
+    private Map<String, Object> recompute() {
+        long t0 = System.currentTimeMillis();
+        Map<String, Object> fresh = computeMarketHealth();
+        cached = fresh;
+        cachedAtMs = System.currentTimeMillis();
+        log.info("[MarketRegime] Recomputed in {} ms: {} score={}", cachedAtMs - t0,
+            fresh.get("market_status"), fresh.get("market_health_score"));
+        persist(fresh);
+        return fresh;
+    }
+
+    /**
+     * Keep the reading.
+     *
+     * <p>Filed under the SESSION it describes, not the wall clock. A reading computed this
+     * morning from Monday's closes is a statement about Monday, and filing it under today would
+     * put two different days' markets under one date the first time the feed fell behind.
+     *
+     * <p>Replaced in place rather than appended: the engine recomputes hourly and twelve
+     * near-identical rows per day would bury the one number anyone wants. A failure here is
+     * logged and swallowed - the reading is still served, and losing the history is not a reason
+     * to fail the panel that shows it.
+     */
+    private void persist(Map<String, Object> m) {
+        if (m == null || !Boolean.TRUE.equals(m.get("success"))) return;
+        String session = str(m.get("as_of"));
+        if (session == null || session.isBlank()) return;
+        try {
+            tx.executeWithoutResult(t -> em.createNativeQuery(
+                "INSERT INTO market_health_history(trade_date,market_status,recommended_action,"
+              + "market_health_score,pct_above_20dma,pct_above_50dma,pct_above_100dma,"
+              + "pct_above_200dma,advancing,declining,advance_decline_ratio,new_highs,new_lows,"
+              + "nh_nl_ratio,volume_participation_pct,stocks_above_avg_volume,composite_rsi,"
+              + "composite_rsi_state,composite_trend,total_stocks,universe,computed_at) "
+              + "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+              + "ON CONFLICT (trade_date) DO UPDATE SET "
+              + "market_status=EXCLUDED.market_status,"
+              + "recommended_action=EXCLUDED.recommended_action,"
+              + "market_health_score=EXCLUDED.market_health_score,"
+              + "pct_above_20dma=EXCLUDED.pct_above_20dma,"
+              + "pct_above_50dma=EXCLUDED.pct_above_50dma,"
+              + "pct_above_100dma=EXCLUDED.pct_above_100dma,"
+              + "pct_above_200dma=EXCLUDED.pct_above_200dma,"
+              + "advancing=EXCLUDED.advancing,declining=EXCLUDED.declining,"
+              + "advance_decline_ratio=EXCLUDED.advance_decline_ratio,"
+              + "new_highs=EXCLUDED.new_highs,new_lows=EXCLUDED.new_lows,"
+              + "nh_nl_ratio=EXCLUDED.nh_nl_ratio,"
+              + "volume_participation_pct=EXCLUDED.volume_participation_pct,"
+              + "stocks_above_avg_volume=EXCLUDED.stocks_above_avg_volume,"
+              + "composite_rsi=EXCLUDED.composite_rsi,"
+              + "composite_rsi_state=EXCLUDED.composite_rsi_state,"
+              + "composite_trend=EXCLUDED.composite_trend,"
+              + "total_stocks=EXCLUDED.total_stocks,universe=EXCLUDED.universe,"
+              + "computed_at=EXCLUDED.computed_at")
+                .setParameter(1, session)
+                .setParameter(2, str(m.get("market_status")))
+                .setParameter(3, str(m.get("recommended_action")))
+                .setParameter(4, dbl(m.get("market_health_score")))
+                .setParameter(5, dbl(m.get("pct_above_20dma")))
+                .setParameter(6, dbl(m.get("pct_above_50dma")))
+                .setParameter(7, dbl(m.get("pct_above_100dma")))
+                .setParameter(8, dbl(m.get("pct_above_200dma")))
+                .setParameter(9, intg(m.get("advancing")))
+                .setParameter(10, intg(m.get("declining")))
+                .setParameter(11, dbl(m.get("advance_decline_ratio")))
+                .setParameter(12, intg(m.get("new_highs")))
+                .setParameter(13, intg(m.get("new_lows")))
+                .setParameter(14, dbl(m.get("nh_nl_ratio")))
+                .setParameter(15, dbl(m.get("volume_participation_pct")))
+                .setParameter(16, intg(m.get("stocks_above_avg_volume")))
+                .setParameter(17, dbl(m.get("composite_rsi")))
+                .setParameter(18, str(m.get("composite_rsi_state")))
+                .setParameter(19, str(m.get("composite_trend")))
+                .setParameter(20, intg(m.get("total_stocks")))
+                .setParameter(21, str(m.get("universe")))
+                .setParameter(22, DateUtil.now())
+                .executeUpdate());
+        } catch (Exception e) {
+            log.warn("[MarketRegime] Could not store the {} reading: {}", session, e.getMessage());
+        }
+    }
+
+    private static String str(Object o) { return o == null ? null : String.valueOf(o); }
+    private static Double dbl(Object o) { return o instanceof Number n ? n.doubleValue() : null; }
+    private static Integer intg(Object o) { return o instanceof Number n ? n.intValue() : null; }
+
+    /** The stored readings, newest first. */
+    @SuppressWarnings("unchecked")
+    public List<Map<String, Object>> history(int limit) {
+        try {
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT trade_date,market_status,recommended_action,market_health_score,"
+              + "pct_above_20dma,pct_above_50dma,pct_above_100dma,pct_above_200dma,"
+              + "advancing,declining,advance_decline_ratio,new_highs,new_lows,nh_nl_ratio,"
+              + "volume_participation_pct,stocks_above_avg_volume,composite_rsi,"
+              + "composite_rsi_state,composite_trend,total_stocks,universe,computed_at "
+              + "FROM market_health_history ORDER BY trade_date DESC LIMIT "
+              + Math.max(1, Math.min(limit, 2000))).getResultList();
+            String[] keys = {"trade_date","market_status","recommended_action","market_health_score",
+                "pct_above_20dma","pct_above_50dma","pct_above_100dma","pct_above_200dma",
+                "advancing","declining","advance_decline_ratio","new_highs","new_lows","nh_nl_ratio",
+                "volume_participation_pct","stocks_above_avg_volume","composite_rsi",
+                "composite_rsi_state","composite_trend","total_stocks","universe","computed_at"};
+            List<Map<String, Object>> out = new ArrayList<>(rows.size());
+            for (Object[] r : rows) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                for (int i = 0; i < keys.length; i++) m.put(keys[i], r[i]);
+                out.add(m);
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("[MarketRegime] History read failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * The history as CSV.
+     *
+     * <p>One row per session, oldest last, with the headings a reader can sort on. The notes
+     * above the table state what the universe actually is, because every percentage below is a
+     * percentage OF that universe and the number means something different for the Nifty 500
+     * than for every listed equity.
+     */
+    public byte[] historyCsv(int limit) {
+        List<Map<String, Object>> rows = history(limit);
+        StringBuilder csv = new StringBuilder();
+        csv.append("TradeRakshak - Daily Market Status\n");
+        csv.append("Generated: ").append(DateUtil.now()).append("\n");
+        csv.append("Sessions: ").append(rows.size()).append("\n");
+        csv.append("Each row is one trading session's settled reading. Percentages are of the "
+                 + "universe named in that row, so a figure is only comparable with another row "
+                 + "using the same universe.\n");
+        csv.append("DISCLAIMER: For educational purposes only. Not SEBI investment advice.\n\n");
+        csv.append("Trade Date,Market Status,Recommended Action,Health Score,"
+                 + "% Above 20 DMA,% Above 50 DMA,% Above 100 DMA,% Above 200 DMA,"
+                 + "Advancing,Declining,A/D Ratio,New Highs,New Lows,NH/NL Ratio,"
+                 + "Volume Participation %,Stocks Above Avg Volume,Composite RSI,"
+                 + "Composite RSI State,Composite Trend,Total Stocks,Universe,Computed At\n");
+        if (rows.isEmpty()) {
+            csv.append("No reading has been stored yet. The engine writes one on each recompute, "
+                     + "hourly between 08:00 and 20:00 on weekdays.\n");
+        }
+        for (Map<String, Object> r : rows) {
+            csv.append(q(r.get("trade_date"))).append(",")
+               .append(q(r.get("market_status"))).append(",")
+               .append(q(r.get("recommended_action"))).append(",")
+               .append(n(r.get("market_health_score"))).append(",")
+               .append(n(r.get("pct_above_20dma"))).append(",")
+               .append(n(r.get("pct_above_50dma"))).append(",")
+               .append(n(r.get("pct_above_100dma"))).append(",")
+               .append(n(r.get("pct_above_200dma"))).append(",")
+               .append(n(r.get("advancing"))).append(",")
+               .append(n(r.get("declining"))).append(",")
+               .append(n(r.get("advance_decline_ratio"))).append(",")
+               .append(n(r.get("new_highs"))).append(",")
+               .append(n(r.get("new_lows"))).append(",")
+               .append(n(r.get("nh_nl_ratio"))).append(",")
+               .append(n(r.get("volume_participation_pct"))).append(",")
+               .append(n(r.get("stocks_above_avg_volume"))).append(",")
+               .append(n(r.get("composite_rsi"))).append(",")
+               .append(q(r.get("composite_rsi_state"))).append(",")
+               .append(q(r.get("composite_trend"))).append(",")
+               .append(n(r.get("total_stocks"))).append(",")
+               .append(q(r.get("universe"))).append(",")
+               .append(q(r.get("computed_at"))).append("\n");
+        }
+        return csv.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Blank for null, and quoted when the value itself contains a comma or a quote. */
+    private static String q(Object o) {
+        if (o == null) return "";
+        String v = String.valueOf(o);
+        return v.contains(",") || v.contains("\"")
+            ? "\"" + v.replace("\"", "\"\"") + "\"" : v;
+    }
+    private static String n(Object o) {
+        if (!(o instanceof Number num)) return "";
+        double d = num.doubleValue();
+        return d == Math.rint(d) ? String.valueOf((long) d)
+                                 : String.valueOf(Math.round(d * 100.0) / 100.0);
+    }
+
+    /**
+     * Hourly refresh through the trading day, so the panel is never the thing that pays for it.
+     *
+     * <p>Runs on the hour from 08:00 to 20:00 IST. Outside those hours the cached reading simply
+     * ages out and the next visitor triggers one recompute - there is no point scanning the
+     * universe hourly through the night when no close has changed.
+     */
+    @Scheduled(cron = "0 0 8-20 * * MON-FRI", zone = "Asia/Kolkata")
+    public void hourlyRefresh() {
+        try {
+            forceRefreshMarketHealth();
+        } catch (Exception e) {
+            log.warn("[MarketRegime] Hourly refresh failed: {}", e.getMessage());
+        }
+    }
+
     public Map<String, Object> computeMarketHealth() {
         Map<String, Object> out = new LinkedHashMap<>();
         Universe u = resolveUniverse();
@@ -235,8 +508,27 @@ public class MarketRegimeService {
         double pctAbove100 = pct(above100, total);
         double pctAbove200 = pct(above200, total);
         // Zero declines would make the ratio infinite; report that rather than dividing by it.
-        Double adr  = dec > 0 ? (double) adv / dec : (adv > 0 ? null : 0.0);
-        Double nhnl = newLow > 0 ? (double) newHigh / newLow : (newHigh > 0 ? null : 0.0);
+        //
+        // The null branches are cast to (Double) deliberately. In "cond ? null : 0.0" the 0.0 is
+        // a primitive, so the conditional expression's type is double and Java unboxes the null
+        // branch - throwing NullPointerException the moment it is taken. That is not theoretical:
+        // on a day with no new 52-week lows the whole market health computation threw, the
+        // endpoint returned 500, and the panel could not render at all. The cast makes the
+        // expression's type Double, so null stays null.
+        //
+        // Written as if/else, not a conditional expression. Casting the null branch to (Double)
+        // is NOT enough: the other branch is a primitive double, so the conditional's type is
+        // still double by binary numeric promotion and the boxed branch is unboxed regardless.
+        // That was the first attempt at this fix and a unit test caught it still throwing.
+        Double adr;
+        if (dec > 0)      adr = (double) adv / dec;
+        else if (adv > 0) adr = null;        // everything advanced: unbounded, so report absent
+        else              adr = 0.0;         // nothing moved either way: a real, flat reading
+
+        Double nhnl;
+        if (newLow > 0)       nhnl = (double) newHigh / newLow;
+        else if (newHigh > 0) nhnl = null;   // highs with no lows: unbounded
+        else                  nhnl = 0.0;
         double volParticipation = pct(volUp, volMeasurable);
 
         List<Double> comp = compositeSeries(u);

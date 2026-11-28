@@ -58,6 +58,27 @@ public class DhanLivePriceService {
 
     private static final String DHAN_FEED_URL = "wss://api-feed.dhan.co";
     private static final int REQUEST_SUBSCRIBE_QUOTE = 17;
+
+    /**
+     * Bytes a Dhan v2 Quote packet carries AFTER the last traded price.
+     *
+     * <p>The packet is 50 bytes: an 8-byte header, a 4-byte LTP, then 38 bytes of
+     * last-traded-qty, LTT, ATP, volume, total sell/buy quantity and open/close/high/low. The
+     * parser seeks past the header and the LTP, so exactly 38 bytes remain at that point.
+     *
+     * <p>This guard read {@code >= 42}. Four bytes too many, so for every quote packet ever
+     * received the test failed, the branch below was skipped, and each tick was reduced to its
+     * LTP. Measured on the live feed: 1,305 of 1,305 quotes had {@code ltp > 0} and volume,
+     * open and close all zero, with high and low equal to the LTP - those two only because of
+     * the {@code high <= 0} fallback further down, which disguised the gap as a flat bar rather
+     * than a missing one.
+     *
+     * <p>The cost was not cosmetic. Both RSI 45 sections test current-day volume against a
+     * 20-session average, and with no live volume that condition fell back to the last stored
+     * daily figure all session. The feed had been delivering the number the whole time; nothing
+     * read it.
+     */
+    private static final int QUOTE_BYTES_AFTER_LTP = 38;
     private static final int RESPONSE_TICKER = 2;
     private static final int RESPONSE_QUOTE = 4;
     private static final int RESPONSE_FULL = 8;
@@ -294,6 +315,30 @@ public class DhanLivePriceService {
                 pauseForMarketClose();
                 return;
             }
+            // Ask the stored expiry BEFORE spending a connection on a token we already know is
+            // dead.
+            //
+            // A Dhan access token lives about 24 hours, so it expires every single day. The expiry
+            // was being stored and shown on the Broker screen and consulted by nothing: this
+            // method simply connected, got AUTHENTICATION_FAILED, and tried again fifteen seconds
+            // later. On 2026-11-24 that produced 156 identical failures between 09:15 and 15:30,
+            // no live price anywhere in the application for a whole session, and no statement
+            // anywhere of the one fact that would have fixed it in a minute.
+            String expired = expiredTokenMessage();
+            if (expired != null) {
+                connectionStatus.set("DISCONNECTED");
+                websocketStatus.set("CLOSED");
+                apiStatus.set("TOKEN_EXPIRED");
+                lastApiError.set(expired);
+                // Logged once per transition rather than on every attempt: 156 copies of one
+                // sentence is how the real message got lost in the first place.
+                if (tokenExpiryReported.compareAndSet(false, true)) {
+                    log.warn("[LiveFeed] {}", expired);
+                    logEvent("TOKEN_EXPIRED", "ERROR", null, expired, null);
+                }
+                return;
+            }
+            tokenExpiryReported.set(false);
             ensureLivePriceSchema();
             connect();
         } catch (Exception e) {
@@ -305,6 +350,49 @@ public class DhanLivePriceService {
             scheduleReconnect();
         } finally {
             connecting.set(false);
+        }
+    }
+
+    /** So one sentence is logged per transition, not once per fifteen-second retry. */
+    private final java.util.concurrent.atomic.AtomicBoolean tokenExpiryReported =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * A plain statement of the problem when the stored Dhan token has expired, else null.
+     *
+     * <p>Reads {@code broker_credentials.token_expiry}, which the Broker screen already writes on
+     * every re-authentication. Compared as an ISO string prefix rather than parsed, because the
+     * column is TEXT and has carried more than one format - and a parse failure must read as "I
+     * cannot tell", never as "expired", or a formatting change would silently stop the feed.
+     *
+     * <p>Only an expiry that is definitely in the past blocks a connection. Anything unreadable,
+     * missing, or in the future lets the attempt proceed exactly as before.
+     */
+    private String expiredTokenMessage() {
+        try {
+            @SuppressWarnings("unchecked")
+            List<Object[]> rows = em.createNativeQuery(
+                "SELECT COALESCE(token_expiry,''), COALESCE(broker_label, broker_name), id "
+              + "FROM broker_credentials WHERE broker_name='dhan' AND is_active=1 AND is_verified=1 "
+              + "ORDER BY updated_at DESC NULLS LAST LIMIT 1").getResultList();
+            if (rows.isEmpty()) return null;
+            String expiry = String.valueOf(rows.get(0)[0]).trim();
+            if (expiry.length() < 10) return null;          // nothing stored - let it try
+            // 'yyyy-MM-ddTHH:mm:ss...' or 'yyyy-MM-dd HH:mm:ss'. Normalise the separator so one
+            // string comparison covers both.
+            String nowIso = LocalDateTime.now(IST).toString().replace('T', ' ');
+            String expIso = expiry.replace('T', ' ');
+            if (expIso.compareTo(nowIso) > 0) return null;  // still valid
+            return "Dhan access token expired at " + expiry.substring(0, Math.min(19, expiry.length()))
+                 + ". Live prices will not update anywhere in the application until it is renewed - "
+                 + "open Broker, re-authenticate Dhan, and the feed reconnects on its own within "
+                 + "fifteen seconds. A Dhan token lasts about 24 hours, so this is due daily "
+                 + "before the 09:15 open.";
+        } catch (Exception e) {
+            // Unknown must not block the feed. Falling through means the worst case is the old
+            // behaviour, which is strictly better than refusing to connect over a failed query.
+            log.debug("[LiveFeed] Token expiry check skipped: {}", e.getMessage());
+            return null;
         }
     }
 
@@ -383,6 +471,13 @@ public class DhanLivePriceService {
                 em.createNativeQuery("ALTER TABLE live_price_quotes ADD COLUMN IF NOT EXISTS dhan_security_id TEXT").executeUpdate();
                 em.createNativeQuery("ALTER TABLE live_price_quotes ADD COLUMN IF NOT EXISTS last_traded_price REAL").executeUpdate();
                 em.createNativeQuery("ALTER TABLE live_price_quotes ADD COLUMN IF NOT EXISTS price_updated_at TEXT").executeUpdate();
+                // Aggregate book quantities from the Quote packet. BIGINT, not REAL: these are
+                // share counts that routinely run into crores, and REAL has 24 bits of mantissa -
+                // it starts losing whole shares above about 1.7 crore, so a large-cap book would
+                // be stored approximately. The gate only asks whether they are zero, but the
+                // figures are displayed too, and a displayed share count should be exact.
+                em.createNativeQuery("ALTER TABLE live_price_quotes ADD COLUMN IF NOT EXISTS total_buy_quantity BIGINT DEFAULT 0").executeUpdate();
+                em.createNativeQuery("ALTER TABLE live_price_quotes ADD COLUMN IF NOT EXISTS total_sell_quantity BIGINT DEFAULT 0").executeUpdate();
                 em.createNativeQuery("CREATE INDEX IF NOT EXISTS idx_lpq_symbol ON live_price_quotes(symbol, updated_at DESC)").executeUpdate();
                 em.createNativeQuery("CREATE INDEX IF NOT EXISTS idx_lpq_tick ON live_price_quotes(tick_received_at DESC)").executeUpdate();
                 em.createNativeQuery("CREATE INDEX IF NOT EXISTS idx_ts_dhan_security ON tracked_stocks(dhan_security_id, exchange_segment)").executeUpdate();
@@ -823,19 +918,34 @@ public class DhanLivePriceService {
         double high = 0;
         double low = 0;
         double close = 0;
+        long totalBuyQty = 0, totalSellQty = 0;
         if (responseCode == RESPONSE_TICKER) {
             if (packet.remaining() >= 4) tradeTime = dhanEpochTime(packet.getInt());
-        } else if (packet.remaining() >= 42) {
-            packet.getShort();
-            tradeTime = dhanEpochTime(packet.getInt());
-            packet.getFloat();
-            volume = Integer.toUnsignedLong(packet.getInt());
-            packet.getInt();
-            packet.getInt();
-            open = packet.getFloat();
-            close = packet.getFloat();
-            high = packet.getFloat();
-            low = packet.getFloat();
+        } else if (packet.remaining() >= QUOTE_BYTES_AFTER_LTP) {
+            // Dhan v2 Quote packet (response code 4), offsets from the published spec:
+            //   13-14 last traded qty   15-18 LTT   19-22 ATP   23-26 volume
+            //   27-30 total SELL qty    31-34 total BUY qty
+            //   35-38 open   39-42 close   43-46 high   47-50 low
+            packet.getShort();                                        // 13-14 last traded qty
+            tradeTime = dhanEpochTime(packet.getInt());               // 15-18
+            packet.getFloat();                                        // 19-22 average trade price
+            volume = Integer.toUnsignedLong(packet.getInt());         // 23-26
+            // These two used to be bare getInt() calls - read off the wire purely to advance the
+            // buffer, then discarded. They are the depth figures the shortlist needs in order to
+            // tell a stock with no bid from one with a bid, and they have been arriving on every
+            // tick all along. Keeping them costs nothing: no extra subscription, no extra bytes.
+            //
+            // Deliberately NOT switched to the Full packet (response 8 / request 21) to get
+            // five-level depth: that is 162 bytes a tick against 50, more than triple the inbound
+            // traffic across 5,000 instruments, for detail nothing asks for. Total buy and sell
+            // quantity describe the whole book rather than just its top level, which is what
+            // "is there a buyer" actually means.
+            totalSellQty = Integer.toUnsignedLong(packet.getInt());   // 27-30
+            totalBuyQty  = Integer.toUnsignedLong(packet.getInt());   // 31-34
+            open = packet.getFloat();                                 // 35-38
+            close = packet.getFloat();                                // 39-42, post-close only
+            high = packet.getFloat();                                 // 43-46
+            low = packet.getFloat();                                  // 47-50
         }
         if (high <= 0 && ltp > 0) high = ltp;
         if (low <= 0 && ltp > 0) low = ltp;
@@ -844,7 +954,7 @@ public class DhanLivePriceService {
         return new LiveQuote(
             instrument.symbol(), instrument.tradingSymbol(), instrument.underlyingSymbol(),
             instrument.securityId(), instrument.exchangeSegment(), ltp, 0, 0, open, high, low,
-            close, volume, tradeTime, change, changePct, DateUtil.now()
+            close, volume, totalBuyQty, totalSellQty, tradeTime, change, changePct, DateUtil.now()
         );
     }
 
@@ -876,10 +986,21 @@ public class DhanLivePriceService {
         String rawJson = "{}";
         try { rawJson = mapper.writeValueAsString(q.toMap()); } catch (Exception ignored) {}
         int quoteRows = em.createNativeQuery(
-            "INSERT INTO live_price_quotes(broker_name,exchange_segment,broker_security_id,dhan_security_id,symbol,trading_symbol,current_price,last_traded_price,bid_price,ask_price,open_price,high_price,low_price,close_price,volume,last_trade_time,change_value,change_percent,tick_received_at,price_updated_at,raw_json,created_at,updated_at) " +
-            "VALUES('dhan',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
-            "ON CONFLICT (broker_name,exchange_segment,broker_security_id) DO UPDATE SET symbol=EXCLUDED.symbol,trading_symbol=EXCLUDED.trading_symbol,dhan_security_id=EXCLUDED.dhan_security_id,current_price=EXCLUDED.current_price,last_traded_price=EXCLUDED.last_traded_price,bid_price=EXCLUDED.bid_price,ask_price=EXCLUDED.ask_price,open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,low_price=EXCLUDED.low_price,close_price=EXCLUDED.close_price,volume=EXCLUDED.volume,last_trade_time=EXCLUDED.last_trade_time,change_value=EXCLUDED.change_value,change_percent=EXCLUDED.change_percent,tick_received_at=EXCLUDED.tick_received_at,price_updated_at=EXCLUDED.price_updated_at,raw_json=EXCLUDED.raw_json,updated_at=EXCLUDED.updated_at " +
-            "WHERE live_price_quotes.current_price IS DISTINCT FROM EXCLUDED.current_price OR live_price_quotes.volume IS DISTINCT FROM EXCLUDED.volume OR live_price_quotes.last_trade_time IS DISTINCT FROM EXCLUDED.last_trade_time")
+            "INSERT INTO live_price_quotes(broker_name,exchange_segment,broker_security_id,dhan_security_id,symbol,trading_symbol,current_price,last_traded_price,bid_price,ask_price,open_price,high_price,low_price,close_price,volume,last_trade_time,change_value,change_percent,tick_received_at,price_updated_at,raw_json,created_at,updated_at,total_buy_quantity,total_sell_quantity) " +
+            "VALUES('dhan',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
+            "ON CONFLICT (broker_name,exchange_segment,broker_security_id) DO UPDATE SET symbol=EXCLUDED.symbol,trading_symbol=EXCLUDED.trading_symbol,dhan_security_id=EXCLUDED.dhan_security_id,current_price=EXCLUDED.current_price,last_traded_price=EXCLUDED.last_traded_price,bid_price=EXCLUDED.bid_price,ask_price=EXCLUDED.ask_price,open_price=EXCLUDED.open_price,high_price=EXCLUDED.high_price,low_price=EXCLUDED.low_price,close_price=EXCLUDED.close_price,volume=EXCLUDED.volume,last_trade_time=EXCLUDED.last_trade_time,change_value=EXCLUDED.change_value,change_percent=EXCLUDED.change_percent,tick_received_at=EXCLUDED.tick_received_at,price_updated_at=EXCLUDED.price_updated_at,raw_json=EXCLUDED.raw_json,updated_at=EXCLUDED.updated_at,total_buy_quantity=EXCLUDED.total_buy_quantity,total_sell_quantity=EXCLUDED.total_sell_quantity " +
+            // The guard stays price/volume/time based, so the thousands of ticks that only shuffle
+            // book quantities still cost no write. But the two zero-crossing tests are added,
+            // because the liquidity gate reads exactly that: whether a book is empty.
+            //
+            // Without them a stock that had a bid at 09:20 and lost it by 14:00 without trading in
+            // between would never write again, and the gate would keep seeing the 09:20 quantity -
+            // showing a tradeable stock that no longer is, which is the one error this gate exists
+            // to prevent. Comparing the booleans rather than the numbers means a write happens
+            // only when emptiness actually changes, which is rare.
+            "WHERE live_price_quotes.current_price IS DISTINCT FROM EXCLUDED.current_price OR live_price_quotes.volume IS DISTINCT FROM EXCLUDED.volume OR live_price_quotes.last_trade_time IS DISTINCT FROM EXCLUDED.last_trade_time " +
+            "OR (COALESCE(live_price_quotes.total_buy_quantity,0) = 0) IS DISTINCT FROM (EXCLUDED.total_buy_quantity = 0) " +
+            "OR (COALESCE(live_price_quotes.total_sell_quantity,0) = 0) IS DISTINCT FROM (EXCLUDED.total_sell_quantity = 0)")
             .setParameter(1, q.exchangeSegment())
             .setParameter(2, q.securityId())
             .setParameter(3, q.securityId())
@@ -902,6 +1023,8 @@ public class DhanLivePriceService {
             .setParameter(20, rawJson)
             .setParameter(21, DateUtil.now())
             .setParameter(22, DateUtil.now())
+            .setParameter(23, q.totalBuyQuantity())
+            .setParameter(24, q.totalSellQuantity())
             .executeUpdate();
 
         int stockRows = em.createNativeQuery(
@@ -1151,13 +1274,26 @@ public class DhanLivePriceService {
         String key() { return exchangeSegment + ":" + securityId; }
     }
 
+    /**
+     * {@code bid} and {@code ask} are best-bid and best-offer prices, which only the Full packet
+     * carries - they stay zero and nothing reads them. {@code totalBuyQuantity} and
+     * {@code totalSellQuantity} are the aggregate book quantities from the Quote packet, which is
+     * what the liquidity gate is built on.
+     */
     private record LiveQuote(String symbol, String tradingSymbol, String underlyingSymbol, String securityId,
                              String exchangeSegment, double ltp, double bid, double ask, double open,
-                             double high, double low, double close, double volume, String lastTradeTime,
+                             double high, double low, double close, double volume,
+                             long totalBuyQuantity, long totalSellQuantity, String lastTradeTime,
                              double change, double changePercent, String tickReceivedAt) {
         String key() { return exchangeSegment + ":" + securityId; }
 
         boolean sameMarketValues(LiveQuote other) {
+            // Book quantities move on almost every tick even when price and volume have not, so
+            // they are deliberately NOT part of this comparison. Including them would defeat the
+            // de-duplication this guard exists for and push a database write per tick per symbol -
+            // on 1,300 symbols that is the difference between a few hundred writes a minute and
+            // tens of thousands. A stale book quantity for a few seconds costs nothing; the gate
+            // only asks whether it is zero.
             return Double.compare(ltp, other.ltp) == 0
                 && Double.compare(volume, other.volume) == 0
                 && String.valueOf(lastTradeTime).equals(String.valueOf(other.lastTradeTime));
@@ -1179,6 +1315,8 @@ public class DhanLivePriceService {
             m.put("low", low);
             m.put("close", close);
             m.put("volume", volume);
+            m.put("totalBuyQuantity", totalBuyQuantity);
+            m.put("totalSellQuantity", totalSellQuantity);
             m.put("lastTradeTime", lastTradeTime);
             m.put("change", change);
             m.put("changePercent", changePercent);

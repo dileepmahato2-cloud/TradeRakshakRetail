@@ -42,6 +42,43 @@ public sealed interface Operand {
     /** A constant. */
     record Literal(double value) implements Operand {}
 
+    /**
+     * The same operand, {@code barsBack} bars earlier on the condition's own timeframe.
+     *
+     * <p>A wrapper rather than an {@code offset} component on Field and Indicator. Three reasons.
+     * It covers arithmetic for free, so "yesterday's close minus the close five days before it"
+     * needs nothing new. It keeps the shift in one place in the evaluator - move the context,
+     * resolve the inner operand - instead of once per operand kind, each of which would be a
+     * chance to forget. And it makes "20 days ago" composable with the crossings: a crossing
+     * resolves both sides on two sessions, and a shifted operand inside one simply resolves
+     * further back on each.
+     *
+     * <p>In JSON this is sugar: {@code {"type":"field","name":"high","offset":20}} parses to a
+     * Shifted wrapping a Field, because that is how the builder renders it - one row with an
+     * "N bars ago" box, not a nested node the author has to reason about.
+     *
+     * @param barsBack how many bars earlier, counted backwards. 0 is the bar being evaluated and
+     *                 parses to the inner operand with no wrapper at all.
+     */
+    record Shifted(Operand of, int barsBack) implements Operand {
+
+        /**
+         * A negative shift would read a bar that had not happened yet.
+         *
+         * <p>Rejected at construction rather than flagged by the validator, because this is the
+         * one mistake in the whole language that cannot be allowed to reach a backtest. A rule
+         * that peeks one bar into the future backtests beautifully and loses money live, and it
+         * does so without ever looking wrong. Making the node impossible to build is worth more
+         * than a warning nobody reads.
+         */
+        public Shifted {
+            if (barsBack < 0) {
+                throw new IllegalArgumentException("An offset counts bars backwards and cannot be "
+                    + "negative - " + barsBack + " would read a bar that has not happened yet.");
+            }
+        }
+    }
+
     enum ArithOp {
         ADD("+"), SUB("-"), MUL("*"), DIV("/");
 

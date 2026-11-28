@@ -4,6 +4,8 @@ import com.traderakshak.service.strategy.ast.AstNode;
 import com.traderakshak.service.strategy.ast.AstParser;
 import com.traderakshak.service.strategy.ast.AstValidator;
 import com.traderakshak.service.strategy.ast.FieldCatalogue;
+import com.traderakshak.service.strategy.ast.Timeframe;
+import com.traderakshak.service.strategy.ast.TimeframeAvailability;
 import com.traderakshak.service.strategy.eval.EvalResult;
 import com.traderakshak.service.strategy.eval.MapEvalContext;
 import com.traderakshak.service.strategy.eval.RuleEvaluator;
@@ -13,6 +15,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -26,7 +29,13 @@ class RuleEngineTest {
 
     private final RuleEvaluator evaluator = new RuleEvaluator();
     private final AstParser parser = new AstParser();
-    private final AstValidator validator = new AstValidator(new FieldCatalogue());
+    private final AstValidator validator =
+        new AstValidator(new FieldCatalogue(), TimeframeAvailability.ALL);
+
+    /** Hourly and daily present, every width below an hour absent - which is this database. */
+    private final TimeframeAvailability hourlyAndDailyOnly = tf ->
+        tf == Timeframe.H1 || tf == Timeframe.DAILY
+            || tf == Timeframe.WEEKLY || tf == Timeframe.MONTHLY;
 
     /** One session with a close and an RSI, which most of these tests are enough served by. */
     private MapEvalContext one(double close, Double rsi) {
@@ -496,6 +505,260 @@ class RuleEngineTest {
                 + " \"left\":{\"type\":\"indicator\",\"name\":\"RSI\",\"params\":{\"period\":14}},"
                 + " \"right\":[55,75]}]}");
             assertTrue(validator.validate(ast).ok());
+        }
+    }
+
+    // ================================================================== offsets
+
+    @Nested
+    @DisplayName("Bars-ago offsets")
+    class Offsets {
+
+        /** Three sessions, oldest first, so "2 bars ago" has somewhere to point. */
+        private MapEvalContext threeCloses(double oldest, double middle, double latest) {
+            return MapEvalContext.at("TEST", List.of(
+                MapEvalContext.session("2026-11-18").put("close", oldest),
+                MapEvalContext.session("2026-11-19").put("close", middle),
+                MapEvalContext.session("2026-11-20").put("close", latest)));
+        }
+
+        @Test
+        @DisplayName("offset reads the bar N back, not the current one")
+        void offsetReadsBackwards() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\","
+                + "\"left\":\"close\","
+                + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":2}}");
+            // 120 today against 100 two bars back. Without the shift this is a number compared
+            // with itself, which is the mistake this test exists to catch.
+            assertTrue(evaluator.eval(ast, threeCloses(100, 110, 120)).matched());
+        }
+
+        @Test
+        @DisplayName("offset 0 is the bar being evaluated and adds no wrapper")
+        void zeroOffsetIsIdentity() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\"=\","
+                + "\"left\":{\"type\":\"field\",\"name\":\"close\",\"offset\":0},"
+                + "\"right\":120}");
+            assertTrue(evaluator.eval(ast, threeCloses(100, 110, 120)).matched());
+        }
+
+        @Test
+        @DisplayName("An offset past the start of the window is UNKNOWN, not FALSE")
+        void offsetBeyondWindowIsUnknown() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\","
+                + "\"left\":\"close\","
+                + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":40}}");
+            EvalResult r = evaluator.eval(ast, threeCloses(100, 110, 120));
+            assertEquals(TriState.UNKNOWN, r.value(),
+                "a stock without 40 bars of history has not failed the test - we cannot run it");
+        }
+
+        @Test
+        @DisplayName("A negative offset is refused: it would read a bar that has not happened")
+        void negativeOffsetRefused() {
+            AstParser.AstParseException e = assertThrows(AstParser.AstParseException.class, () ->
+                parser.parse("{\"type\":\"compare\",\"op\":\">\",\"left\":\"close\","
+                    + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":-1}}"));
+            assertTrue(e.getMessage().toLowerCase().contains("negative"), e.getMessage());
+        }
+
+        @Test
+        @DisplayName("A fractional offset is refused rather than quietly truncated")
+        void fractionalOffsetRefused() {
+            assertThrows(AstParser.AstParseException.class, () ->
+                parser.parse("{\"type\":\"compare\",\"op\":\">\",\"left\":\"close\","
+                    + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":1.5}}"));
+        }
+
+        @Test
+        @DisplayName("An offset works on an indicator, not just a raw field")
+        void offsetOnIndicator() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\","
+                + "\"left\":{\"type\":\"indicator\",\"name\":\"RSI\",\"params\":{\"period\":14}},"
+                + "\"right\":{\"type\":\"indicator\",\"name\":\"RSI\",\"params\":{\"period\":14},"
+                + "           \"offset\":1}}");
+            MapEvalContext ctx = MapEvalContext.at("TEST", List.of(
+                MapEvalContext.session("2026-11-19").put("RSI(14)", 48.0),
+                MapEvalContext.session("2026-11-20").put("RSI(14)", 55.0)));
+            assertTrue(evaluator.eval(ast, ctx).matched(), "RSI turning up over one bar");
+        }
+
+        @Test
+        @DisplayName("Arithmetic inside a shifted operand is shifted with it")
+        void offsetWrapsArithmetic() {
+            // (high - low) two bars ago: the day's range, read two sessions back.
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\","
+                + "\"left\":{\"type\":\"arith\",\"op\":\"-\",\"left\":\"high\",\"right\":\"low\","
+                + "          \"offset\":2},"
+                + "\"right\":5}");
+            MapEvalContext ctx = MapEvalContext.at("TEST", List.of(
+                MapEvalContext.session("2026-11-18").put("high", 120.0).put("low", 100.0),
+                MapEvalContext.session("2026-11-19").put("high", 101.0).put("low", 100.0),
+                MapEvalContext.session("2026-11-20").put("high", 102.0).put("low", 101.0)));
+            assertTrue(evaluator.eval(ast, ctx).matched(),
+                "the 20-point range two bars back, not the 1-point range today");
+        }
+
+        @Test
+        @DisplayName("A bar offset on a financial figure is refused - those move by period")
+        void offsetOnFundamentalRefused() {
+            assertThrows(AstParser.AstParseException.class, () ->
+                parser.parse("{\"type\":\"compare\",\"op\":\">\",\"left\":{\"type\":\"shifted\","
+                    + "\"of\":{\"type\":\"fundamental\",\"metric\":\"eps\"},\"offset\":2},"
+                    + "\"right\":10}"));
+        }
+
+        @Test
+        @DisplayName("A fundamental's own offset still counts reporting periods")
+        void fundamentalOffsetUnchanged() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\","
+                + "\"left\":{\"type\":\"fundamental\",\"metric\":\"eps\",\"period\":\"QUARTER\","
+                + "          \"basis\":\"ABS\",\"offset\":1},"
+                + "\"right\":10}");
+            MapEvalContext ctx = MapEvalContext.at("TEST", List.of(
+                MapEvalContext.session("2026-11-20").put("eps:QUARTER:ABS:1", 12.0)));
+            assertTrue(evaluator.eval(ast, ctx).matched());
+        }
+
+        @Test
+        @DisplayName("The reason text says how far back it read")
+        void offsetIsDescribed() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\",\"left\":\"close\","
+                + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":1}}");
+            EvalResult r = evaluator.eval(ast, threeCloses(100, 110, 120));
+            assertTrue(r.label().contains("1 bar ago"), "was: " + r.label());
+        }
+    }
+
+    // =============================================================== timeframes
+
+    @Nested
+    @DisplayName("Timeframes")
+    class Timeframes {
+
+        /** RSI as the builder sends it: a named indicator with its period, not a bare field. */
+        private static final String RSI =
+            "{\"type\":\"indicator\",\"name\":\"RSI\",\"params\":{\"period\":14}}";
+
+        /** Daily and hourly bars for one symbol, each with their own history. */
+        private MapEvalContext dailyAndHourly() {
+            return MapEvalContext.at("TEST", Map.of(
+                Timeframe.DAILY, List.of(
+                    MapEvalContext.session("2026-11-19").put("close", 100.0).put("RSI(14)", 28.0),
+                    MapEvalContext.session("2026-11-20").put("close", 102.0).put("RSI(14)", 29.0)),
+                Timeframe.H1, List.of(
+                    MapEvalContext.session("2026-11-20 13:00")
+                        .put("close", 101.0).put("RSI(14)", 45.0),
+                    MapEvalContext.session("2026-11-20 14:00")
+                        .put("close", 102.0).put("RSI(14)", 58.0))),
+                Timeframe.DAILY);
+        }
+
+        @Test
+        @DisplayName("A condition with no timeframe is daily, exactly as before")
+        void defaultsToDaily() {
+            AstNode ast = parser.parse(
+                "{\"type\":\"compare\",\"op\":\"<\",\"left\":\"RSI\",\"right\":30}");
+            assertEquals(Timeframe.DAILY, ((AstNode.Compare) ast).timeframe());
+        }
+
+        @Test
+        @DisplayName("Two conditions on two timeframes read two different sets of bars")
+        void conditionsReadTheirOwnTimeframe() {
+            // Daily RSI oversold AND hourly RSI already above 50: one rule, two bar widths. On a
+            // single timeframe this is a contradiction, which is the point of the test.
+            AstNode ast = parser.parse("{\"type\":\"logical\",\"op\":\"AND\",\"children\":["
+                + "{\"type\":\"compare\",\"op\":\"<\",\"left\":" + RSI + ",\"right\":30,"
+                + " \"timeframe\":\"daily\"},"
+                + "{\"type\":\"compare\",\"op\":\">\",\"left\":" + RSI + ",\"right\":50,"
+                + " \"timeframe\":\"1h\"}]}");
+            assertTrue(evaluator.eval(ast, dailyAndHourly()).matched());
+        }
+
+        @Test
+        @DisplayName("A timeframe with no bars is UNKNOWN with a reason, never FALSE")
+        void missingTimeframeIsUnknown() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\"<\",\"left\":" + RSI
+                + ",\"right\":30,\"timeframe\":\"5m\"}");
+            EvalResult r = evaluator.eval(ast, dailyAndHourly());
+            assertEquals(TriState.UNKNOWN, r.value());
+            assertTrue(r.unknownReasons().stream().anyMatch(x -> x.contains("5 Minutes")),
+                "the reason should name the width that is missing: " + r.unknownReasons());
+        }
+
+        @Test
+        @DisplayName("An offset counts bars of the condition's own timeframe")
+        void offsetFollowsTheTimeframe() {
+            // One hourly bar back is 101, not yesterday's daily close of 100.
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\"=\","
+                + "\"left\":{\"type\":\"field\",\"name\":\"close\",\"offset\":1},"
+                + "\"right\":101,\"timeframe\":\"1h\"}");
+            assertTrue(evaluator.eval(ast, dailyAndHourly()).matched());
+        }
+
+        @Test
+        @DisplayName("A quantifier counts bars of its own timeframe too")
+        void quantifierHonoursTimeframe() {
+            AstNode ast = parser.parse("{\"type\":\"quantifier\",\"op\":\"RISING\",\"periods\":2,"
+                + "\"over\":" + RSI + ",\"timeframe\":\"1h\"}");
+            assertTrue(evaluator.eval(ast, dailyAndHourly()).matched(), "45 then 58 is rising");
+        }
+
+        @Test
+        @DisplayName("Chart shorthand, labels and enum names all parse to the same width")
+        void spellingsAgree() {
+            assertEquals(Timeframe.H1, Timeframe.from("1h"));
+            assertEquals(Timeframe.H1, Timeframe.from("1 Hour"));
+            assertEquals(Timeframe.H1, Timeframe.from("H1"));
+            assertEquals(Timeframe.M15, Timeframe.from("15m"));
+            assertEquals(Timeframe.DAILY, Timeframe.from("1d"));
+            assertEquals(Timeframe.DAILY, Timeframe.from(null), "silence means daily");
+            assertThrows(IllegalArgumentException.class, () -> Timeframe.from("fortnightly"));
+        }
+
+        @Test
+        @DisplayName("An unknown timeframe is a parse error carrying the node path")
+        void unknownTimeframeIsAParseError() {
+            AstParser.AstParseException e = assertThrows(AstParser.AstParseException.class, () ->
+                parser.parse("{\"type\":\"logical\",\"op\":\"AND\",\"children\":["
+                    + "{\"type\":\"compare\",\"op\":\">\",\"left\":\"close\",\"right\":1,"
+                    + " \"timeframe\":\"2 weeks\"}]}"));
+            assertEquals(".children[0]", e.path());
+        }
+
+        @Test
+        @DisplayName("A width with no candles warns but does not block the save")
+        void unavailableTimeframeWarnsOnly() {
+            AstValidator strict = new AstValidator(new FieldCatalogue(), hourlyAndDailyOnly);
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\"<\",\"left\":" + RSI
+                + ",\"right\":30,\"timeframe\":\"5m\"}");
+            AstValidator.Result r = strict.validate(ast);
+            assertTrue(r.ok(), "the rule is correct and works once 5-minute bars are collected");
+            assertTrue(r.issues().stream()
+                .anyMatch(i -> i.severity() == AstValidator.Severity.WARNING),
+                "but the author must be told it matches nothing today");
+        }
+
+        @Test
+        @DisplayName("Hourly and daily pass the same validator without a warning")
+        void availableTimeframesAreSilent() {
+            AstValidator strict = new AstValidator(new FieldCatalogue(), hourlyAndDailyOnly);
+            AstNode ast = parser.parse("{\"type\":\"logical\",\"op\":\"AND\",\"children\":["
+                + "{\"type\":\"compare\",\"op\":\"<\",\"left\":" + RSI + ",\"right\":30,"
+                + " \"timeframe\":\"daily\"},"
+                + "{\"type\":\"compare\",\"op\":\">\",\"left\":" + RSI + ",\"right\":50,"
+                + " \"timeframe\":\"1h\"}]}");
+            assertTrue(strict.validate(ast).issues().isEmpty(),
+                "a rule on widths we hold should produce nothing at all");
+        }
+
+        @Test
+        @DisplayName("A shifted operand keeps its unit, so no spurious mismatch warning")
+        void shiftedOperandKeepsItsUnit() {
+            AstNode ast = parser.parse("{\"type\":\"compare\",\"op\":\">\",\"left\":\"close\","
+                + "\"right\":{\"type\":\"field\",\"name\":\"close\",\"offset\":20}}");
+            assertTrue(validator.validate(ast).issues().isEmpty(),
+                "price against price is not a unit mismatch");
         }
     }
 }

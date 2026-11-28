@@ -91,6 +91,30 @@ class CrossoverTradeResolutionTest {
         return dates;
     }
 
+    /**
+     * The hold the service is configured with, read rather than copied.
+     *
+     * <p>This test used to hardcode 15 sessions and the date that followed from it, and went red
+     * the day the strategy was respecified to 22. What is worth pinning is the rule - the defined
+     * exit is N trading sessions after entry, weekends skipped, anchored to the entry date - not
+     * the value of N, which is the strategy author to choose.
+     */
+    private static int maxHold() throws Exception {
+        java.lang.reflect.Field fld =
+            StockTrackerService.class.getDeclaredField("CROSSOVER_MAX_HOLD");
+        fld.setAccessible(true);
+        return (int) fld.get(null);
+    }
+
+    /** N trading sessions after a date, counted the way the calendar mock above trades. */
+    private static String sessionsAfter(String from, int sessions) {
+        LocalDate d = LocalDate.parse(from);
+        for (int i = 0; i < sessions; i++) {
+            do { d = d.plusDays(1); } while (d.getDayOfWeek().getValue() > 5);
+        }
+        return d.toString();
+    }
+
     private List<double[]> quietBars(int n) {
         List<double[]> bars = new ArrayList<>();
         for (int i = 0; i < n; i++) bars.add(new double[]{104.0, 97.0, 100.0}); // never hits either
@@ -139,20 +163,21 @@ class CrossoverTradeResolutionTest {
     }
 
     @Test
-    void untouchedTradeExitsOnTheDefinedDateAfterFifteenSessions() throws Exception {
+    void untouchedTradeExitsOnTheDefinedDateAfterTheConfiguredHold() throws Exception {
         List<String> dates = quietDates();
         Map<String, Object> row = resolve(dates, quietBars(dates.size()), "2026-12-31");
+        String expected = sessionsAfter(dates.get(0), maxHold());
 
         assertEquals("DEFINED DATE EXIT", row.get("trade_status"));
-        // 15 TRADING days after Mon 05 Jan, skipping weekends, is Mon 26 Jan.
-        assertEquals("2026-01-26", row.get("defined_exit_date"));
-        assertEquals("2026-01-26", row.get("exit_date"));
+        // Trading sessions, not calendar days: the weekends in between must not be counted.
+        assertEquals(expected, row.get("defined_exit_date"));
+        assertEquals(expected, row.get("exit_date"));
     }
 
     @Test
     void tradeWhoseDeadlineHasNotArrivedStaysOpenWithNoExit() throws Exception {
         List<String> dates = quietDates();
-        // Evaluated a week after entry: the 15-session hold has not run out yet.
+        // Evaluated a week after entry: the configured hold has not run out yet.
         Map<String, Object> row = resolve(dates, quietBars(dates.size()), "2026-01-12");
 
         assertEquals("OPEN", row.get("trade_status"));
@@ -166,6 +191,7 @@ class CrossoverTradeResolutionTest {
         Map<String, Object> row = resolve(dates, quietBars(dates.size()), "2026-12-31");
         // The resolver owns the exit side; the entry date it was handed must survive untouched
         // in the defined exit calculation, which is anchored to 2026-01-05 and not to 2026-12-31.
-        assertEquals("2026-01-26", row.get("defined_exit_date"));
+        // Counting from the evaluation date would land in 2027, which is the bug being excluded.
+        assertEquals(sessionsAfter(dates.get(0), maxHold()), row.get("defined_exit_date"));
     }
 }

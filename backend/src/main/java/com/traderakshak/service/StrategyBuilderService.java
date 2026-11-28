@@ -69,6 +69,8 @@ public class StrategyBuilderService {
             .visualJson(toJson(req.get("visualBlocks")))
             .basePriceDate(blankToNull(req.get("basePriceDate")))
             .basePriceTime(blankToNull(req.get("basePriceTime")))
+            .ruleAst(toJson(req.get("ruleAst")))
+            .astVersion(req.get("ruleAst") == null ? null : 1)
             .stopLossPct(getDouble(req, "stopLossPct", appConfig.getDouble("strategy.default_stop_loss_pct", 5.0)))
             .targetPct(getDouble(req, "targetPct", appConfig.getDouble("strategy.default_target_pct", 10.0)))
             .rrMin(getDouble(req, "rrMin", appConfig.getDouble("strategy.default_rr_min", 2.0)))
@@ -126,6 +128,10 @@ public class StrategyBuilderService {
         existing.setRiskManagementJson(toJson(req.getOrDefault("riskManagement", null)));
         // Blank clears the reference point and falls back to the uploaded base price, so an
         // empty string must not be stored as one.
+        if (req.containsKey("ruleAst")) {
+            existing.setRuleAst(toJson(req.get("ruleAst")));
+            existing.setAstVersion(req.get("ruleAst") == null ? null : 1);
+        }
         if (req.containsKey("basePriceDate")) existing.setBasePriceDate(blankToNull(req.get("basePriceDate")));
         if (req.containsKey("basePriceTime")) existing.setBasePriceTime(blankToNull(req.get("basePriceTime")));
         existing.setStopLossPct(getDouble(req, "stopLossPct", existing.getStopLossPct() != null ? existing.getStopLossPct() : 5.0));
@@ -164,6 +170,7 @@ public class StrategyBuilderService {
             symbols, strategy.getBasePriceDate(), strategy.getBasePriceTime());
 
         List<Map<String, Object>> results = new ArrayList<>();
+        List<String> skippedNotes = new ArrayList<>();
 
         for (String sym : symbols) {
             try {
@@ -173,6 +180,10 @@ public class StrategyBuilderService {
                 if (refBase != null && refBase > 0) data.put("base_price", refBase);
 
                 boolean pass = evaluator.evaluate(conditions, data, "entry");
+                // Captured from the first symbol actually evaluated. Which conditions are
+                // skipped is a property of the strategy and the data pipeline, not of the
+                // stock, so one reading describes the whole run.
+                if (skippedNotes.isEmpty()) skippedNotes.addAll(evaluator.lastSkipped());
                 if (!pass) continue;
 
                 // Get latest data for the result row
@@ -212,14 +223,20 @@ public class StrategyBuilderService {
         // Persist results
         persistScreenerResults(strategy.getId(), results);
 
-        return Map.of(
-            "strategy",    strategy.getName(),
-            "results",     results,
-            "totalScanned",symbols.size(),
-            "matched",     results.size(),
-            "scanTime",    elapsed + "ms",
-            "scanDate",    DateUtil.today()
-        );
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("strategy",     strategy.getName());
+        out.put("results",      results);
+        out.put("totalScanned", symbols.size());
+        out.put("matched",      results.size());
+        out.put("scanTime",     elapsed + "ms");
+        out.put("scanDate",     DateUtil.today());
+        // Named in the result rather than left to be noticed. A filter the user wrote that was
+        // not applied has to be visible on the same screen as the list it did not narrow -
+        // otherwise the list looks like the answer to the question they asked.
+        out.put("skippedConditions",
+                skippedNotes);
+        out.put("skippedCount",      skippedNotes.size());
+        return out;
     }
 
     // ── Backtest ──────────────────────────────────────────────────────────────
@@ -564,6 +581,34 @@ public class StrategyBuilderService {
     // ── Private helpers ────────────────────────────────────────────────────────
 
     @SuppressWarnings("unchecked")
+    /**
+     * Where BETWEEN's upper bound travels, inside the params_right JSON.
+     *
+     * <p>strategy_conditions stores one value column, value_right, so a two-bound operator has
+     * nowhere to put its second number: BETWEEN could be built in the UI and evaluated by the
+     * engine, and was dropped in between by the save. params_right is already a JSON column and
+     * is empty for a BETWEEN row - the right-hand side is a literal, not an indicator - so the
+     * bound rides there rather than adding a column for one operator.
+     *
+     * <p>Lifted back out on load, so callers keep seeing the flat {@code valueRightUpper} the
+     * evaluator reads and neither of them needs to know where it was kept.
+     */
+    private static final String UPPER_BOUND_KEY = "valueRightUpper";
+
+    /** paramsRight with BETWEEN's upper bound folded in, when the condition has one. */
+    @SuppressWarnings("unchecked")
+    private static Object paramsRightWithUpperBound(Map<String, Object> c) {
+        Object upper = c.get(UPPER_BOUND_KEY);
+        Object params = c.get("paramsRight");
+        if (upper == null) return params;
+        Map<String, Object> merged = new LinkedHashMap<>();
+        if (params instanceof Map<?, ?> m) {
+            for (Map.Entry<?, ?> e : m.entrySet()) merged.put(String.valueOf(e.getKey()), e.getValue());
+        }
+        merged.put(UPPER_BOUND_KEY, upper);
+        return merged;
+    }
+
     private void saveConditions(Long stratId, Map<String, Object> req) {
         Object conds = req.get("conditions");
         if (!(conds instanceof List)) return;
@@ -571,11 +616,16 @@ public class StrategyBuilderService {
         for (int i = 0; i < list.size(); i++) {
             Map<String, Object> c = list.get(i);
             try {
+                // group_index / group_mode / group_join carry the builder's numbered groups.
+                // They are what lets "all of these AND any one of those" survive a save: without
+                // them the rows come back as a flat list and the screener folds them left to
+                // right, which is a different strategy that happens to use the same conditions.
                 em.createNativeQuery(
                     "INSERT INTO strategy_conditions(strategy_id,condition_group,group_operator," +
                     "condition_order,operator,indicator_left,params_left,comparator," +
-                    "indicator_right,params_right,value_right,multiplier,created_at) " +
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+                    "indicator_right,params_right,value_right,multiplier," +
+                    "group_index,group_mode,group_join,created_at) " +
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
                     .setParameter(1, stratId)
                     .setParameter(2, c.getOrDefault("group","entry"))
                     .setParameter(3, c.getOrDefault("groupOperator","AND"))
@@ -585,13 +635,23 @@ public class StrategyBuilderService {
                     .setParameter(7, toJson(c.get("paramsLeft")))
                     .setParameter(8, c.get("comparator"))
                     .setParameter(9, c.get("indicatorRight"))
-                    .setParameter(10, toJson(c.get("paramsRight")))
+                    .setParameter(10, toJson(paramsRightWithUpperBound(c)))
                     .setParameter(11, c.getOrDefault("valueRight",0))
                     .setParameter(12, c.getOrDefault("multiplier",1.0))
-                    .setParameter(13, DateUtil.now())
+                    .setParameter(13, str(c.get("groupIndex")))
+                    .setParameter(14, str(c.get("groupMode")))
+                    .setParameter(15, str(c.get("groupJoin")))
+                    .setParameter(16, DateUtil.now())
                     .executeUpdate();
             } catch (Exception e) { log.debug("Save condition error: {}", e.getMessage()); }
         }
+    }
+
+    /** A nullable column value: blank and null both store as null, never as "null". */
+    private static String str(Object v) {
+        if (v == null) return null;
+        String t = String.valueOf(v).trim();
+        return t.isEmpty() ? null : t;
     }
 
     @SuppressWarnings("unchecked")
@@ -604,7 +664,8 @@ public class StrategyBuilderService {
     private List<Map<String, Object>> loadConditions(Long stratId, String group) {
         List<Object[]> rows = em.createNativeQuery(
             "SELECT condition_group, operator, indicator_left, params_left, comparator, " +
-            "indicator_right, params_right, value_right, multiplier, group_operator " +
+            "indicator_right, params_right, value_right, multiplier, group_operator, " +
+            "group_index, group_mode, group_join " +
             "FROM strategy_conditions WHERE strategy_id=:id ORDER BY condition_order")
             .setParameter("id", stratId).getResultList();
 
@@ -614,10 +675,22 @@ public class StrategyBuilderService {
             c.put("group",          r[0]); c.put("operator",     r[1]);
             c.put("indicatorLeft",  r[2]); c.put("paramsLeft",   parseJson(r[3]));
             c.put("comparator",     r[4]); c.put("indicatorRight",r[5]);
-            c.put("paramsRight",    parseJson(r[6]));
+            Map<String, Object> pr = parseJson(r[6]);
+            // Lift the upper bound back to the flat key the evaluator reads, and take it out of
+            // the params so an indicator never sees a parameter it does not have.
+            if (pr != null && pr.containsKey(UPPER_BOUND_KEY)) {
+                Object upper = pr.remove(UPPER_BOUND_KEY);
+                if (upper instanceof Number n) c.put(UPPER_BOUND_KEY, n.doubleValue());
+            }
+            c.put("paramsRight",    pr);
             c.put("valueRight",     r[7] != null ? ((Number)r[7]).doubleValue() : 0);
             c.put("multiplier",     r[8] != null ? ((Number)r[8]).doubleValue() : 1.0);
             c.put("groupOperator",  r[9]);
+            // Null for every strategy saved before groups existed, which the evaluator reads as
+            // "one implicit group" - the behaviour those strategies have always had.
+            c.put("groupIndex",     r[10]);
+            c.put("groupMode",      r[11]);
+            c.put("groupJoin",      r[12]);
             result.add(c);
         }
         return result;
@@ -647,9 +720,16 @@ public class StrategyBuilderService {
     private Object[] getLatestData(String sym, String ex) {
         try {
             return (Object[]) em.createNativeQuery(
-                "SELECT close, prev_close, COALESCE(total_volume,volume), delivery_pct FROM broker_market_candles " +
+                // Same malformation as IndicatorCacheService.loadOhlcv had: the candle_mode
+                // filter sat between FROM and WHERE, which Postgres rejects outright. The catch
+                // below returns null, the screener reads that as "no data for this symbol" and
+                // skips it - so every scan quietly matched nothing, with the real error visible
+                // only as a SQLState 42601 in the log.
+                "SELECT close, prev_close, COALESCE(total_volume,volume), delivery_pct " +
+                "FROM broker_market_candles " +
+                "WHERE symbol=:s AND exchange=:e " +
                 "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
-                "WHERE symbol=:s AND exchange=:e ORDER BY trade_date DESC LIMIT 1")
+                "ORDER BY trade_date DESC LIMIT 1")
                 .setParameter("s",sym).setParameter("e",ex).getSingleResult();
         } catch (Exception e) { return null; }
     }

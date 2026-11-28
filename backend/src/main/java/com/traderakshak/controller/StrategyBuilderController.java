@@ -17,6 +17,7 @@ import com.traderakshak.service.StrategyBuilderService;
 import com.traderakshak.service.strategy.ast.AstNode;
 import com.traderakshak.service.strategy.ast.AstParser;
 import com.traderakshak.service.strategy.ast.AstValidator;
+import com.traderakshak.service.strategy.TimeframeCatalogue;
 import com.traderakshak.service.strategy.ast.FieldCatalogue;
 import com.traderakshak.util.DateUtil;
 import io.swagger.v3.oas.annotations.Operation;
@@ -45,6 +46,7 @@ public class StrategyBuilderController {
     private final FieldCatalogue          fieldCatalogue;
     private final AstParser               astParser;
     private final AstValidator            astValidator;
+    private final TimeframeCatalogue      timeframeCatalogue;
 
     @PersistenceContext private EntityManager em;
 
@@ -99,6 +101,61 @@ public class StrategyBuilderController {
         body.put("fields", out);
         body.put("count", out.size());
         return ResponseEntity.ok(ApiResponse.ok(body));
+    }
+
+    /**
+     * The bar widths a condition may be measured on, each with what is actually behind it.
+     *
+     * <p>Published rather than hardcoded in the builder because availability is a fact about the
+     * candles collected, not a product decision. Every intraday candle in this database is
+     * 60-minute, so a 5-minute condition would evaluate to UNKNOWN for every stock - which on
+     * screen is indistinguishable from a strategy nobody qualifies for. The selector greys those
+     * widths out and states the reason, and they light up on their own if finer candles are ever
+     * collected, with nothing to redeploy.
+     */
+    @GetMapping("/timeframes")
+    @Operation(summary = "Bar widths for rule conditions, each with measured availability")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> timeframes() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        int usable = 0;
+        for (TimeframeCatalogue.Coverage c : timeframeCatalogue.all()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("key", c.timeframe().name());
+            m.put("label", c.timeframe().label());
+            m.put("minutes", c.timeframe().minutes());
+            m.put("intraday", c.timeframe().intraday());
+            m.put("available", c.available());
+            // Separate from availability on purpose: the hourly history here ends several
+            // sessions before the daily feed, which stops a scan of today without affecting a
+            // backtest over the range it does cover. Folding the two together would either hide
+            // a usable width or promise a live scan that cannot run.
+            m.put("current", c.current());
+            m.put("reason", c.reason());
+            m.put("bars", c.bars());
+            m.put("symbols", c.symbols());
+            m.put("sessions", c.sessions());
+            m.put("bars_per_symbol", c.barsPerSymbol());
+            m.put("first", c.first());
+            m.put("latest", c.latest());
+            m.put("derived_from", c.derivedFrom() == null ? null : c.derivedFrom().name());
+            out.add(m);
+            if (c.available()) usable++;
+        }
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("timeframes", out);
+        body.put("available_count", usable);
+        body.put("default", com.traderakshak.service.strategy.ast.Timeframe.DAILY.name());
+        return ResponseEntity.ok(ApiResponse.ok(body));
+    }
+
+    /**
+     * Refreshes the measured coverage, for use after a backfill rather than waiting for the cache.
+     */
+    @PostMapping("/timeframes/refresh")
+    @Operation(summary = "Re-measure candle coverage now")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> refreshTimeframes() {
+        timeframeCatalogue.invalidate();
+        return timeframes();
     }
 
     /**

@@ -55,12 +55,15 @@ import { SyncBannerComponent } from './shared/sync-banner.component';
         <a routerLink="/market-breadth" routerLinkActive="active" class="nav-link">Stock Tracker Dashboard</a>
         <a routerLink="/stock-tracker" routerLinkActive="active" class="nav-link">Stock Upload</a>
         <a routerLink="/trading" routerLinkActive="active" class="nav-link">Trading</a>
+        <a routerLink="/journal" routerLinkActive="active" class="nav-link">Trade Journal</a>
+        <a routerLink="/pnl" routerLinkActive="active" class="nav-link">Profit &amp; Loss</a>
         <a routerLink="/data" routerLinkActive="active" class="nav-link">Data Warehouse</a>
         <a routerLink="/events" routerLinkActive="active" class="nav-link">Events Calendar</a>
         <a routerLink="/broker" routerLinkActive="active" class="nav-link">Broker</a>
         <a routerLink="/reports" routerLinkActive="active" class="nav-link">Reports</a>
 
         <div class="pt-2 pb-1 px-3 text-xs text-slate-600 uppercase tracking-wider">Strategy</div>
+        <a routerLink="/auto-trade" routerLinkActive="active" class="nav-link">Auto Buy &amp; Sell</a>
         <a routerLink="/strategy-builder" routerLinkActive="active" class="nav-link">Strategy Builder</a>
         <a routerLink="/strategy-tester" routerLinkActive="active" class="nav-link">Strategy Tester</a>
 

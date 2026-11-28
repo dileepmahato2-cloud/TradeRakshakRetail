@@ -67,6 +67,7 @@ public class LiveCandleAggregator {
 
     private final EntityManager em;
     private final PlatformTransactionManager transactionManager;
+    private final AppConfigService appConfig;
 
     @Value("${livecandle.enabled:true}")
     private boolean enabled;
@@ -77,6 +78,16 @@ public class LiveCandleAggregator {
     /** When on, a detected gap asks the broker for today's candles instead of only reporting it. */
     @Value("${livecandle.autoCatchUp:true}")
     private boolean autoCatchUp;
+
+    /**
+     * Write the session's daily candle after the close.
+     *
+     * <p>On by default. Without it a live session leaves intraday bars and no daily bar, and
+     * every screen that reads daily bars - which is all of them - cannot see that session until
+     * somebody runs a historical fetch by hand.
+     */
+    @Value("${livecandle.dailyClose.enabled:true}")
+    private boolean dailyCloseEnabled;
 
     /** Open bars, keyed by instrument + bucket start. */
     private final Map<String, Bar> openBars = new ConcurrentHashMap<>();
@@ -98,10 +109,12 @@ public class LiveCandleAggregator {
     private volatile String healthLevel = "IDLE";
 
     public LiveCandleAggregator(EntityManager em, PlatformTransactionManager transactionManager,
-                                ObjectProvider<StartupSyncService> syncProvider) {
+                                ObjectProvider<StartupSyncService> syncProvider,
+                                AppConfigService appConfig) {
         this.em = em;
         this.transactionManager = transactionManager;
         this.syncProvider = syncProvider;
+        this.appConfig = appConfig;
     }
 
     /**
@@ -497,4 +510,140 @@ public class LiveCandleAggregator {
 
         String key() { return exchangeSegment + ":" + securityId + "@" + bucket; }
     }
+    // ══ End-of-day daily candle ═════════════════════════════════════════════
+    //
+    // Nothing wrote a DAILY candle for today. The only writer of daily bars was the historical
+    // backfill, so a session existed as intraday bars and nothing else until somebody ran a
+    // fetch - and if nobody did, that session simply had no daily candle, ever.
+    //
+    // Everything downstream reads daily bars: the entry tests, the 20-session volume average,
+    // the previous close, the charts. So a live session the platform had watched tick by tick
+    // was still unscreenable the next morning. The read-time fold that papers over this
+    // (StockTrackerService.gapBars) rebuilds the same bar on every request, holds it in memory
+    // only, and cannot be backfilled against or audited.
+    //
+    // This closes the loop: once the session is over, the day's intraday bars are aggregated
+    // into one daily candle and stored. Written with source LIVE_EOD and the same upsert key
+    // the backfill uses, so an official fetch later overwrites it with the broker's own values -
+    // these are a stand-in until that happens, never a replacement for it.
+
+    /**
+     * Fold today's intraday bars into one daily candle per symbol, after the close.
+     *
+     * <p>Runs every ten minutes from 15:40 to 18:00 IST on weekdays rather than once, because a
+     * single shot at a fixed minute is one restart away from being missed for that day and a
+     * missed day is exactly what this exists to prevent. The write is an upsert, so repeating it
+     * costs nothing and corrects itself if late ticks landed after the first run.
+     */
+    @Scheduled(cron = "0 40/10 15-18 * * MON-FRI", zone = "Asia/Kolkata")
+    public void writeDailyCloseCandles() {
+        if (!dailyCloseEnabled) return;
+        try {
+            String today = LocalDate.now(IST).toString();
+            int written = writeDailyCandlesFor(today);
+            if (written > 0) {
+                log.info("[EodCandle] Daily candle stored for {} symbol(s) on {}", written, today);
+            }
+        } catch (Exception e) {
+            log.warn("[EodCandle] Daily close write failed: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Aggregate one session's intraday bars into a daily candle per symbol.
+     *
+     * <p>Open is the first bar's open, close the last bar's close, high and low the extremes,
+     * volume the sum - the same arithmetic a broker applies, over the bars this process built
+     * itself. Returns how many symbols were written.
+     *
+     * <p>Grouped by bar width as well as symbol, and only one width is kept: a day holding both
+     * 60- and 120-minute bars would otherwise report roughly twice the volume it traded. The
+     * width currently being written wins; failing that, the finest the session has.
+     */
+    public int writeDailyCandlesFor(String tradeDate) {
+        if (tradeDate == null || tradeDate.isBlank()) return 0;
+        try {
+            return new TransactionTemplate(transactionManager).execute(status ->
+                em.createNativeQuery(
+                "INSERT INTO broker_market_candles "
+              + "(broker_name,broker_security_id,exchange,exchange_segment,segment,instrument_type,"
+              + " symbol,trading_symbol,candle_mode,interval_key,interval_minutes,"
+              + " candle_time,trade_date,open,high,low,close,volume,total_volume,source,data_type) "
+              + "SELECT 'dhan', z.security_id, 'NSE', z.exchange_segment, 'EQUITY', 'EQUITY', "
+              + "       z.symbol, z.trading_symbol, 'DAILY', 'DAY', 1440, "
+              + "       z.trade_date || 'T15:30:00', z.trade_date, "
+              + "       z.open, z.high, z.low, z.close, z.vol, z.vol, 'LIVE_EOD', 'CANDLE' "
+              + "FROM ("
+              + "  SELECT broker_security_id AS security_id, exchange_segment, symbol, "
+              + "         trading_symbol, trade_date, "
+              + "         (ARRAY_AGG(open  ORDER BY candle_time ASC))[1]  AS open, "
+              + "         (ARRAY_AGG(close ORDER BY candle_time DESC))[1] AS close, "
+              + "         MAX(high) AS high, MIN(low) AS low, "
+              + "         SUM(COALESCE(total_volume, volume)) AS vol, "
+              + "         ROW_NUMBER() OVER (PARTITION BY broker_security_id, exchange_segment "
+              + "           ORDER BY (COALESCE(interval_minutes,0) = :pref) DESC, "
+              + "                    COALESCE(interval_minutes,0) ASC) AS pick "
+              + "  FROM broker_market_candles "
+              + "  WHERE UPPER(COALESCE(candle_mode,'')) = 'INTRADAY' "
+              + "    AND trade_date = :d AND close IS NOT NULL AND close > 0 "
+              + "  GROUP BY broker_security_id, exchange_segment, symbol, trading_symbol, "
+              + "           trade_date, COALESCE(interval_minutes,0)"
+              + ") z WHERE z.pick = 1 "
+              // Never overwrite the broker's own daily bar with one built from ticks. A row
+              // already here from the backfill is the authority; this only fills a hole.
+              + "ON CONFLICT (broker_name,broker_security_id,exchange_segment,candle_mode,"
+              + "interval_key,candle_time) DO NOTHING")
+                .setParameter("d", tradeDate)
+                .setParameter("pref", intervalMinutes)
+                .executeUpdate());
+        } catch (Exception e) {
+            log.warn("[EodCandle] Could not write daily candles for {}: {}", tradeDate, e.getMessage());
+            return 0;
+        }
+    }
+
+    /**
+     * Warn when a configured trade time does not land on a bar start.
+     *
+     * <p>The class note says the bar width "is not a free number", because every intraday price
+     * lookup seeks the first bar at or AFTER the time it is given. A time that is not a bar
+     * start therefore does not fail - it silently resolves to the next one, and the chart shows
+     * a trade entered or exited at a different moment from the one configured. With 60-minute
+     * bars every :15 time happened to work; at 120 minutes only every other one does.
+     *
+     * <p>Reported at startup, once, naming the times that do not fit and what they resolve to.
+     */
+    @jakarta.annotation.PostConstruct
+    public void checkTradeTimesAlignToBars() {
+        if (!enabled || intervalMinutes <= 0) return;
+        try {
+            java.time.LocalTime open = java.time.LocalTime.of(9, 15);
+            java.util.List<String> starts = new ArrayList<>();
+            for (java.time.LocalTime t = open; !t.isAfter(java.time.LocalTime.of(15, 30));
+                 t = t.plusMinutes(intervalMinutes)) {
+                starts.add(t.toString().substring(0, 5));
+            }
+            log.info("[LiveCandles] {}-minute bars start at {}", intervalMinutes,
+                     String.join(", ", starts));
+
+            for (String[] cfg : new String[][]{
+                    {"top10.trade.buy_time",  appConfig.getString("top10.trade.buy_time", "15:15")},
+                    {"top10.trade.sell_time", appConfig.getString("top10.trade.sell_time", "15:15")},
+                    {"volbreakout.finalize.time",
+                     appConfig.getString("volbreakout.finalize.time", "15:15")}}) {
+                String value = cfg[1];
+                if (value == null || value.length() != 5 || value.charAt(2) != ':') continue;
+                if (starts.contains(value)) continue;
+                String lands = starts.stream().filter(x -> x.compareTo(value) >= 0)
+                    .findFirst().orElse("after the close - no bar at all");
+                log.warn("[LiveCandles] {} is {}, which is not a {}-minute bar start. "
+                       + "A price lookup at that time resolves to {}. Either move the setting to "
+                       + "a bar start or change livecandle.interval.minutes.",
+                       cfg[0], value, intervalMinutes, lands);
+            }
+        } catch (Exception e) {
+            log.debug("[LiveCandles] Trade-time alignment check skipped: {}", e.getMessage());
+        }
+    }
+
 }

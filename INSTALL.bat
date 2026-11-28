@@ -384,22 +384,81 @@ echo  ============================================================
 echo    Configuration this install applies
 echo  ============================================================
 echo.
-echo    Candle store: 1 hour per bar, anchored on the 09:15 open,
-echo                  so bars start 09:15 10:15 ... 15:15. This is the
-echo                  same stamping Dhan uses for its own 60-minute
-echo                  candles, so live and backfilled bars share one row.
+echo    Candle store: 2 hours per bar, anchored on the 09:15 open,
+echo                  so bars start 09:15 11:15 13:15 15:15. The 15:15
+echo                  cut-off the RSI 45 shortlist is frozen at lands
+echo                  exactly on a bar start, which it must - every
+echo                  intraday price lookup seeks the first bar at or
+echo                  after the time it is given.
 echo.
-echo    Trade legs:   BUY 15:15, SELL 10:15 the next trading day.
+echo    Trade legs:   BUY 15:15, SELL at the next trading day's close.
 echo                  On an existing database the first start moves these
-echo                  once, from 15:20/11:00, and records that it has done
+echo                  once, from 15:20/11:00 and then off 10:15, and records
 echo                  so - it will not overwrite times you set yourself
 echo                  afterwards. Watch for this line in the log:
 echo                    [Config] Stock Upload trade legs retimed
 echo.
 echo    Both times are bar starts. If you change either one, keep it on
-echo    the hour from 09:15 - the price lookup takes the first candle at
-echo    or after the time given, so an off-grid time silently prices off
-echo    the next bar, and anything past 15:15 matches no candle at all.
+echo    a 2-hour boundary from 09:15 - 09:15, 11:15, 13:15, 15:15 - because
+echo    the price lookup takes the first candle at or after the time given.
+echo    An off-grid time silently prices off the next bar ^(this is what the
+echo    old 10:15 sell leg did: it resolved to 11:15, an hour late^), and
+echo    anything past 15:15 matches no candle at all.
+echo  ============================================================
+echo.
+echo  ============================================================
+echo    Volume Breakout Strategy - everything below ships OFF
+echo  ============================================================
+echo.
+echo    This strategy can open positions and, in REAL mode, send orders
+echo    to a broker. So nothing about it becomes active because a database
+echo    was created or the application was upgraded - only because you
+echo    switch it on in Settings ^> Application Settings.
+echo.
+echo    Entry test:   Current Price ^>= Base Price
+echo                  AND today's volume ^> the average of the previous 20
+echo                  completed sessions. The crossing rule the other two
+echo                  RSI 45 sections use is NOT applied here.
+echo                  Shortlisted by volume ratio, highest first.
+echo.
+echo    Switches:     volbreakout.enabled          false
+echo                  volbreakout.auto.buy         false
+echo                  volbreakout.auto.sell        false
+echo                  volbreakout.mode             PAPER
+echo                  positionmonitor.enabled      false
+echo                  reconciliation.enabled       true  ^(read-only^)
+echo.
+echo    Timing:       Shortlist frozen at 15:30. Buy at that session's
+echo                  closing price, sell at the next trading day's close.
+echo.
+echo                  A REAL order cannot be filled AT 15:30 - that is the
+echo                  bell, and the official close is a weighted average of
+echo                  the last thirty minutes rather than a tradeable price.
+echo                  So a real order is sent at volbreakout.real.order.time
+echo                  ^(15:25^) and fills at whatever is trading then. Paper
+echo                  fills use the official close exactly. The journal
+echo                  keeps both figures, so backtests are not flattered.
+echo.
+echo    Charges:      Brokerage, STT, exchange and SEBI charges, stamp duty,
+echo                  GST and the per-ISIN depository fee are now computed
+echo                  at Dhan's published rates ^(Settings ^> CHARGES^).
+echo                  Nothing computed them before - every net P/L equalled
+echo                  gross. A delivery round trip costs about 0.30%% of the
+echo                  position, so a one-session hold must clear that before
+echo                  it earns anything. Check one figure against a real
+echo                  contract note before trusting net P/L.
+echo.
+echo    Stop-loss:    The position monitor closes PAPER positions only.
+echo                  A real stop belongs at the broker as a resting order,
+echo                  where it survives this process stopping, the network
+echo                  dropping or the machine rebooting. An application-side
+echo                  stop on real money is a promise a scheduler cannot keep.
+echo.
+echo    New tables:   volbreakout_shortlist, strategy_signals. Created on
+echo                  first start. The finalized five are written once per
+echo                  day and never recalculated - that is what makes them
+echo                  final. The ~200 stocks that merely qualify stay
+echo                  calculated and downloadable, not stored.
 echo  ============================================================
 echo.
 echo  ============================================================

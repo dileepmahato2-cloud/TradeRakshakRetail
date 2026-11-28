@@ -1,8 +1,10 @@
 package com.traderakshak.service.strategy.eval;
 
 import com.traderakshak.service.strategy.ast.Operand;
+import com.traderakshak.service.strategy.ast.Timeframe;
 
 import java.util.ArrayList;
+import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -35,18 +37,48 @@ public class MapEvalContext implements EvalContext {
     }
 
     private final String symbol;
-    private final List<Session> sessions;
+    private final Map<Timeframe, List<Session>> byTimeframe;
+    private final Timeframe timeframe;
     private final int index;
 
+    /** Sessions supplied on their own are daily, which is what a rule means when it says nothing. */
     public MapEvalContext(String symbol, List<Session> sessions, int index) {
+        this(symbol, oneTimeframe(Timeframe.DAILY, sessions), Timeframe.DAILY, index);
+    }
+
+    public MapEvalContext(String symbol, Map<Timeframe, List<Session>> byTimeframe,
+                          Timeframe timeframe, int index) {
         this.symbol = symbol;
-        this.sessions = sessions;
+        this.byTimeframe = byTimeframe;
+        this.timeframe = timeframe;
         this.index = index;
     }
 
     /** Positioned at the most recent session. */
     public static MapEvalContext at(String symbol, List<Session> sessions) {
         return new MapEvalContext(symbol, sessions, sessions.size() - 1);
+    }
+
+    /**
+     * Several bar widths at once, positioned at the most recent bar of {@code primary}.
+     *
+     * <p>What a multi-timeframe rule needs to be tested against: daily bars and hourly bars for
+     * the same symbol, each with their own history, so a condition that mixes the two can be
+     * checked rather than assumed.
+     */
+    public static MapEvalContext at(String symbol, Map<Timeframe, List<Session>> byTimeframe,
+                                    Timeframe primary) {
+        List<Session> s = byTimeframe.get(primary);
+        if (s == null || s.isEmpty()) {
+            throw new IllegalArgumentException("No " + primary + " sessions supplied.");
+        }
+        return new MapEvalContext(symbol, new EnumMap<>(byTimeframe), primary, s.size() - 1);
+    }
+
+    private static Map<Timeframe, List<Session>> oneTimeframe(Timeframe tf, List<Session> s) {
+        Map<Timeframe, List<Session>> m = new EnumMap<>(Timeframe.class);
+        m.put(tf, s);
+        return m;
     }
 
     public static Session session(String date) { return new Session(date); }
@@ -82,9 +114,19 @@ public class MapEvalContext implements EvalContext {
     @Override
     public EvalContext shift(int sessionsBack) {
         int i = index + sessionsBack;
-        if (i < 0 || i >= sessions.size()) return null;
-        return new MapEvalContext(symbol, sessions, i);
+        if (i < 0 || i >= sessions().size()) return null;
+        return new MapEvalContext(symbol, byTimeframe, timeframe, i);
     }
+
+    @Override
+    public EvalContext on(Timeframe tf) {
+        if (tf == null || tf == timeframe) return this;
+        List<Session> s = byTimeframe.get(tf);
+        if (s == null || s.isEmpty()) return null;
+        return new MapEvalContext(symbol, byTimeframe, tf, s.size() - 1);
+    }
+
+    private List<Session> sessions() { return byTimeframe.get(timeframe); }
 
     @Override
     public List<Double> series(Operand over, int periods) {
@@ -106,16 +148,20 @@ public class MapEvalContext implements EvalContext {
         if (o instanceof Operand.Fundamental f) {
             return c.fundamental(f.metric(), f.period(), f.basis(), f.offset());
         }
+        if (o instanceof Operand.Shifted sh) {
+            EvalContext back = c.shift(-sh.barsBack());
+            return back == null ? null : resolveOn(back, sh.of());
+        }
         return null;
     }
 
     @Override
-    public String date() { return sessions.get(index).date; }
+    public String date() { return sessions().get(index).date; }
 
     @Override
     public String symbol() { return symbol; }
 
     private Double lookup(String key) {
-        return key == null ? null : sessions.get(index).values.get(key.toUpperCase(Locale.ROOT));
+        return key == null ? null : sessions().get(index).values.get(key.toUpperCase(Locale.ROOT));
     }
 }

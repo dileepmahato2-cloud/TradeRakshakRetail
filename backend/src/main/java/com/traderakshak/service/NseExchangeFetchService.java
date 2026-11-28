@@ -7,6 +7,10 @@ import com.traderakshak.util.InrUtil;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -25,6 +29,7 @@ import java.util.*;
 import java.util.zip.GZIPInputStream;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class NseExchangeFetchService {
 
@@ -37,6 +42,7 @@ public class NseExchangeFetchService {
 
     private final DataImportService importService;
     private final ObjectMapper mapper;
+    private final HolidayCalendarVersion holidayVersion;
     @PersistenceContext private EntityManager em;
 
     @Transactional
@@ -145,6 +151,265 @@ public class NseExchangeFetchService {
         urls.add("https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_" + ymd + "_F_0000.csv.zip");
         urls.add("https://archives.nseindia.com/content/historical/EQUITIES/" + yyyy + "/" + mon + "/cm" + ddMonYear + "bhav.csv.zip");
         return urls;
+    }
+
+    // == Exchange holiday calendar ==========================================
+    //
+    // NSE publishes the whole year's trading holidays, per segment, at one JSON endpoint. It is
+    // the authority: the calendar is amended during the year - a Maharashtra municipal election
+    // closed the market on 15 Jan 2026 and no fixed list written in advance would have carried it.
+    //
+    // Served from www.nseindia.in. The .com host refuses a plain HTTP client outright (403 on the
+    // home page, then a 301 away from the API), while the .in host answers an ordinary request
+    // with an honest User-Agent. Both are NSE's own; this asks the one that will answer rather
+    // than dressing the client up as a browser to get past the other.
+
+    /** NSE's published trading-holiday calendar, all segments, keyed by segment code. */
+    private static final String HOLIDAY_URL = "https://www.nseindia.in/api/holiday-master?type=trading";
+
+    /** One published closure: which segment, which day, and NSE's own reason for it. */
+    public record Holiday(String segment, LocalDate date, String weekDay, String description) { }
+
+    /**
+     * Flatten NSE's per-segment holiday payload into rows.
+     *
+     * <p>Separate from the fetch and the write so it can be exercised against a captured payload,
+     * because the two things that break here are silent. The dates arrive as {@code dd-MMM-yyyy}
+     * ("24-Nov-2026"), which no ISO parser reads. And the segments must stay apart: NSE closes
+     * the capital market 20 days in 2026 and the corporate bond market 24, so folding them
+     * together would mark four sessions as holidays on which equities in fact traded.
+     *
+     * <p>A row whose date will not parse is skipped rather than failing the fetch - one malformed
+     * entry in one segment should not cost the whole calendar.
+     */
+    static List<Holiday> parseHolidayPayload(JsonNode root) {
+        List<Holiday> out = new ArrayList<>();
+        if (root == null || !root.isObject()) return out;
+        Iterator<String> segments = root.fieldNames();
+        while (segments.hasNext()) {
+            String segment = segments.next();
+            JsonNode rows = root.path(segment);
+            if (!rows.isArray()) continue;
+            for (JsonNode row : rows) {
+                String raw = row.path("tradingDate").asText("").trim();
+                if (raw.isEmpty()) continue;
+                try {
+                    out.add(new Holiday(segment, LocalDate.parse(raw, NSE_DD_MMM_YYYY),
+                        row.path("weekDay").asText("").trim(),
+                        row.path("description").asText("").trim()));
+                } catch (Exception e) {
+                    log.debug("[NseHolidays] Unparseable date {} in segment {}", raw, segment);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Fetch NSE's trading-holiday calendar and store it.
+     *
+     * <p>Upserted on (exchange, segment, date) so running it twice is free and an amended
+     * description or a newly added holiday is picked up. Dates NSE has dropped from a year it has
+     * reissued are removed for the years the response covers, because a holiday that is quietly
+     * withdrawn is as wrong as one that is missing - but only for those years, so an override
+     * someone entered for next year is never swept away by a fetch about this one.
+     */
+    @Transactional
+    public Map<String, Object> fetchTradingHolidays() {
+        Map<String, Object> out = new LinkedHashMap<>();
+        try {
+            List<Holiday> parsed = parseHolidayPayload(mapper.readTree(requestText(HOLIDAY_URL)));
+            if (parsed.isEmpty()) {
+                throw new IllegalStateException("NSE holiday response carried no usable dates.");
+            }
+
+            // One timestamp for the whole batch, stamped from here rather than read back from
+            // the database.
+            //
+            // Reading it back was a cast error: `SELECT now()` comes through Hibernate 6 as a
+            // java.time.Instant, not a java.sql.Timestamp, so the fetch failed on its first
+            // statement and reported "class java.time.Instant cannot be cast to class
+            // java.sql.Timestamp" - with the calendar left empty and every NSE holiday still
+            // being reported as a session missing its candles.
+            //
+            // Writing the same value into every row of a batch is also strictly better than a
+            // before-marker: the sweep below can then match on equality instead of ordering, so
+            // it cannot catch a row from its own batch whose now() landed microseconds later.
+            String batchStamp = java.time.LocalDateTime.now(
+                java.time.ZoneId.of("Asia/Kolkata")).withNano(0).toString().replace('T', ' ');
+
+            int stored = 0;
+            Set<Integer> years = new LinkedHashSet<>();
+            List<Map<String, Object>> cm = new ArrayList<>();
+
+            for (Holiday h : parsed) {
+                years.add(h.date().getYear());
+                em.createNativeQuery(
+                    "INSERT INTO market_holidays "
+                  + "(exchange,segment,holiday_date,week_day,description,source,fetched_at) "
+                  + "VALUES ('NSE',?,CAST(? AS DATE),?,?,'NSE_API',CAST(? AS TIMESTAMP)) "
+                  + "ON CONFLICT (exchange,segment,holiday_date) DO UPDATE SET "
+                  + "week_day=EXCLUDED.week_day, description=EXCLUDED.description, "
+                  + "source=EXCLUDED.source, fetched_at=EXCLUDED.fetched_at")
+                    .setParameter(1, h.segment())
+                    .setParameter(2, h.date().toString())
+                    .setParameter(3, h.weekDay())
+                    .setParameter(4, h.description())
+                    .setParameter(5, batchStamp)
+                    .executeUpdate();
+                stored++;
+
+                if ("CM".equalsIgnoreCase(h.segment())) {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("date", h.date().toString());
+                    row.put("week_day", h.weekDay());
+                    row.put("description", h.description());
+                    cm.add(row);
+                }
+            }
+
+            // Withdrawn dates, scoped to the years this response actually spoke about.
+            //
+            // Every row this fetch wrote carries batchStamp, so anything else in these years is
+            // a date NSE no longer publishes. Matching on inequality rather than on an ordering
+            // means a row from this very batch can never be swept. Only NSE_API rows are
+            // touched, so a manually entered date survives a fetch.
+            int removed = 0;
+            if (!years.isEmpty() && stored > 0) {
+                removed = em.createNativeQuery(
+                    "DELETE FROM market_holidays WHERE exchange='NSE' AND source='NSE_API' "
+                  + "AND EXTRACT(YEAR FROM holiday_date) IN (" + inList(years) + ") "
+                  + "AND fetched_at <> CAST(? AS TIMESTAMP)")
+                    .setParameter(1, batchStamp)
+                    .executeUpdate();
+            }
+
+            // Retire any cache built from the calendar this fetch has just replaced.
+            holidayVersion.bump();
+
+            out.put("success", true);
+            out.put("stored", stored);
+            out.put("withdrawn", removed);
+            out.put("years", new ArrayList<>(years));
+            out.put("cm_holidays", cm);
+            out.put("message", "Stored " + stored + " holiday row(s) from NSE for "
+                             + inList(years) + "; " + cm.size()
+                             + " of them equity (CM) sessions.");
+            log.info("[NseHolidays] {}", out.get("message"));
+        } catch (Exception e) {
+            log.warn("[NseHolidays] Fetch failed: {}", e.getMessage());
+            out.put("success", false);
+            out.put("stored", 0);
+            out.put("message", "Could not fetch the NSE holiday calendar: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * The stored equity (CM) calendar, for a year or for all of them.
+     *
+     * <p>CM only: this is the calendar the equity screens act on, and showing a reader the
+     * corporate-bond or currency segments alongside it would invite them to reconcile dates that
+     * were never meant to agree - for 2026, CM closes 20 days and CBM 24.
+     */
+    public Map<String, Object> storedTradingHolidays(Integer year) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<Map<String, Object>> rows = new ArrayList<>();
+        try {
+            StringBuilder sql = new StringBuilder(
+                "SELECT to_char(holiday_date,'YYYY-MM-DD'), week_day, description, source, "
+              + "to_char(fetched_at,'YYYY-MM-DD HH24:MI') FROM market_holidays "
+              + "WHERE exchange='NSE' AND segment='CM' ");
+            if (year != null) sql.append("AND EXTRACT(YEAR FROM holiday_date) = ").append(year.intValue()).append(' ');
+            sql.append("ORDER BY holiday_date");
+
+            for (Object o : em.createNativeQuery(sql.toString()).getResultList()) {
+                Object[] r = (Object[]) o;
+                Map<String, Object> h = new LinkedHashMap<>();
+                h.put("date", r[0]);
+                h.put("week_day", r[1]);
+                h.put("description", r[2]);
+                h.put("source", r[3]);
+                h.put("fetched_at", r[4]);
+                rows.add(h);
+            }
+            out.put("success", true);
+            out.put("holidays", rows);
+            out.put("count", rows.size());
+            out.put("message", rows.isEmpty()
+                ? "No holiday calendar stored yet. Fetch it from NSE to populate it."
+                : rows.size() + " equity holiday(s) stored.");
+        } catch (Exception e) {
+            log.warn("[NseHolidays] Could not read the stored calendar: {}", e.getMessage());
+            out.put("success", false);
+            out.put("holidays", rows);
+            out.put("count", 0);
+            out.put("message", "Could not read the stored holiday calendar: " + e.getMessage());
+        }
+        return out;
+    }
+
+    /**
+     * Fill the holiday calendar on startup when it is empty for the current year.
+     *
+     * <p>The daily 06:00 refresh alone was not enough. A server started at 10:00 would hold an
+     * empty calendar until the following morning, and an empty calendar is not inert: the
+     * data-health panel reports every holiday in the last three weeks as a session missing its
+     * candles, and tells the reader to backfill days the exchange was shut. That was reported
+     * from the live server for 10 and 24 November 2026, both NSE holidays.
+     *
+     * <p>Only fetches when the year has no rows, so a restart does not call NSE needlessly and a
+     * calendar already stored is left alone. Runs on the ready event and never blocks startup -
+     * a failure here leaves the config-key fallback in place and is logged, not thrown.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void fetchHolidayCalendarOnStartup() {
+        try {
+            Number have = (Number) em.createNativeQuery(
+                "SELECT COUNT(*) FROM market_holidays WHERE exchange='NSE' AND segment='CM' "
+              + "AND EXTRACT(YEAR FROM holiday_date) = EXTRACT(YEAR FROM CURRENT_DATE)")
+                .getSingleResult();
+            if (have != null && have.longValue() > 0) {
+                log.info("[NseHolidays] Calendar already stored for this year ({} dates).",
+                    have.longValue());
+                return;
+            }
+            log.info("[NseHolidays] No calendar stored for this year; fetching from NSE.");
+            fetchTradingHolidays();
+        } catch (Exception e) {
+            log.warn("[NseHolidays] Startup calendar fetch skipped: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Keep the calendar current without anyone asking.
+     *
+     * <p>Once a day at 06:00 IST, before the session. NSE amends the calendar within the year -
+     * the 15 Jan 2026 election holiday was added after the year's list was first published - so a
+     * fetch only at startup or only in January would carry a calendar that is quietly wrong. The
+     * write is an upsert over about 250 rows, so repeating it daily costs nothing.
+     */
+    // 08:05, not 06:00. Automatic outbound calls are confined to 08:00-16:00 IST, and a 06:00
+    // fetch would sit permanently outside that window and never run - leaving the calendar
+    // empty, which is what makes every exchange holiday read as a session missing its candles.
+    // Five past, so it does not contend with the other jobs that start on the hour.
+    @Scheduled(cron = "0 5 8 * * *", zone = "Asia/Kolkata")
+    public void refreshHolidayCalendarDaily() {
+        try {
+            fetchTradingHolidays();
+        } catch (Exception e) {
+            log.debug("[NseHolidays] Daily refresh skipped: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Comma-joined years for an IN clause.
+     *
+     * <p>Safe to inline because every value came from {@code LocalDate.getYear()} - an int, not
+     * text from the response - so there is no string here to escape.
+     */
+    private static String inList(Collection<Integer> years) {
+        return years.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
     }
 
     private Map<String, Object> fetchFiiDii(String source) {

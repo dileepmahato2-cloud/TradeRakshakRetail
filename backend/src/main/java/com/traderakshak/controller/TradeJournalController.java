@@ -25,6 +25,7 @@ public class TradeJournalController {
 
     private final TradeJournalRepository journalRepo;
     private final AuditService auditService;
+    private final com.traderakshak.service.TradeJournalService tradeJournal;
 
     @GetMapping
     @Operation(summary = "List journal entries. Admin sees all; user sees own.")
@@ -108,4 +109,110 @@ public class TradeJournalController {
         journalRepo.deleteById(id);
         return ResponseEntity.ok(ApiResponse.ok("Deleted.", null));
     }
+    // ======================================================================
+    //  CONSOLIDATED TRADE JOURNAL  (BRD sections 8, 9, 10)
+    //
+    //  One journal for every trade: paper, real, manual, automated, stop-loss
+    //  and trailing-stop exits. trading_journal is the system of record; the
+    //  older trade_journal is read for history and never written to, so no
+    //  past entry is lost and nothing new widens the split.
+    //
+    //  The legacy routes above are left exactly as they are. They still serve
+    //  anything that calls them, and removing them would break a caller to
+    //  tidy a URL.
+    // ======================================================================
+
+    @GetMapping("/v2")
+    @Operation(summary = "The whole journal, filterable, with totals that match the rows shown")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> journalV2(
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String symbol,
+            @RequestParam(required = false) String strategy,
+            @RequestParam(required = false) String mode,
+            // ALL, SYSTEM or MANUAL. Section 9 requires manual trades to stay distinguishable
+            // from system-generated ones.
+            @RequestParam(required = false) String source,
+            @RequestParam(required = false) String status,
+            @RequestParam(defaultValue = "500") int limit,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(tradeJournal.list(
+            user.getId(), from, to, symbol, strategy, mode, source, status, limit)));
+    }
+
+    @PostMapping("/v2/manual")
+    @Operation(summary = "Record a trade by hand. Charges are computed, not accepted from the "
+                       + "caller, and no broker order is placed.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> saveManualV2(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        Map<String, Object> result = tradeJournal.saveManual(
+            user.getId(), user.getInstitutionId(), user.getName(), req);
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("JOURNAL-INVALID", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    @PostMapping("/v2/{id}/close")
+    @Operation(summary = "Close an open manual position, computing exit charges and net P&L")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> closeManualV2(
+            @PathVariable Long id, @RequestBody Map<String, Object> req,
+            @AuthenticationPrincipal User user) {
+        double exit = req.get("exitPrice") instanceof Number n ? n.doubleValue()
+            : parseDouble(String.valueOf(req.get("exitPrice")));
+        Map<String, Object> result = tradeJournal.closeManual(user.getId(), id, exit,
+            str(req.get("exitDate")), str(req.get("closingRemark")));
+        return Boolean.FALSE.equals(result.get("success"))
+            ? ResponseEntity.badRequest().body(
+                ApiResponse.error("JOURNAL-CLOSE", String.valueOf(result.get("message"))))
+            : ResponseEntity.ok(ApiResponse.ok(result));
+    }
+
+    @GetMapping("/v2/symbols")
+    @Operation(summary = "Symbol suggestions for the manual-entry box, prefix matches first")
+    public ResponseEntity<ApiResponse<java.util.List<Map<String, Object>>>> symbolSearch(
+            @RequestParam(name = "q", defaultValue = "") String q,
+            @RequestParam(defaultValue = "12") int limit) {
+        return ResponseEntity.ok(ApiResponse.ok(tradeJournal.searchSymbols(q, limit)));
+    }
+
+    @GetMapping("/v2/open")
+    @Operation(summary = "Open manual positions, marked to market, net of the exit charges still to pay")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> openManualV2(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(tradeJournal.openManualPositions(user.getId())));
+    }
+
+    @DeleteMapping("/v2/{id}")
+    @Operation(summary = "Delete a MANUAL entry. A system-generated trade cannot be deleted here.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteManualV2(
+            @PathVariable Long id, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(tradeJournal.deleteManual(user.getId(), id)));
+    }
+
+    @GetMapping("/v2/export")
+    @Operation(summary = "The journal as CSV, with the filters the screen is showing")
+    public ResponseEntity<byte[]> exportV2(
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(required = false) String symbol,
+            @RequestParam(required = false) String strategy,
+            @RequestParam(required = false) String mode,
+            @RequestParam(required = false) String source,
+            @RequestParam(required = false) String status,
+            @AuthenticationPrincipal User user) {
+        byte[] csv = tradeJournal.exportCsv(user.getId(), from, to, symbol, strategy, mode, source, status);
+        org.springframework.http.HttpHeaders h = new org.springframework.http.HttpHeaders();
+        h.setContentType(org.springframework.http.MediaType.parseMediaType("text/csv"));
+        h.setContentDisposition(org.springframework.http.ContentDisposition.attachment()
+            .filename("TradeRakshak_Trade_Journal_" + DateUtil.today() + ".csv").build());
+        return ResponseEntity.ok().headers(h).body(csv);
+    }
+
+    private static String str(Object o) { return o == null ? "" : String.valueOf(o).trim(); }
+    private static double parseDouble(String s) {
+        try { return s == null || s.isBlank() ? 0 : Double.parseDouble(s); }
+        catch (Exception e) { return 0; }
+    }
+
 }

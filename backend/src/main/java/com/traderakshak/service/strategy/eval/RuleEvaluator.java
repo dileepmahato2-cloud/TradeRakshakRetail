@@ -2,6 +2,7 @@ package com.traderakshak.service.strategy.eval;
 
 import com.traderakshak.service.strategy.ast.AstNode;
 import com.traderakshak.service.strategy.ast.Operand;
+import com.traderakshak.service.strategy.ast.Timeframe;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -61,8 +62,11 @@ public class RuleEvaluator {
 
     // ------------------------------------------------------------------ compare
 
-    private EvalResult compare(AstNode.Compare n, EvalContext ctx) {
+    private EvalResult compare(AstNode.Compare n, EvalContext outer) {
         String label = describe(n);
+
+        EvalContext ctx = outer.on(n.timeframe());
+        if (ctx == null) return noBars(n.timeframe(), outer, label);
 
         if (n.op().needsPriorSession()) return crossing(n, ctx, label);
 
@@ -127,6 +131,18 @@ public class RuleEvaluator {
         return EvalResult.of(fired, label, lNow);
     }
 
+    /**
+     * UNKNOWN, not FALSE, when the bar width a condition asks for is not stored.
+     *
+     * <p>The distinction is the point of the three-valued logic. FALSE would mean "this stock
+     * does not qualify", which is a claim about the stock; UNKNOWN means "we cannot tell", which
+     * is a claim about the data - and it is the one that is true.
+     */
+    private EvalResult noBars(Timeframe tf, EvalContext ctx, String label) {
+        return EvalResult.unknown(label, "No " + tf.label() + " candles are stored for "
+            + ctx.symbol() + ", so this condition cannot be measured.");
+    }
+
     private boolean test(double l, AstNode.CompareOp op, double r) {
         switch (op) {
             case GT:  return l > r + EPSILON;
@@ -167,8 +183,12 @@ public class RuleEvaluator {
 
     // --------------------------------------------------------------- quantifier
 
-    private EvalResult quantifier(AstNode.Quantifier n, EvalContext ctx) {
+    private EvalResult quantifier(AstNode.Quantifier n, EvalContext outer) {
         String label = n.op() + " for " + n.periods() + " periods: " + describe(n.over());
+
+        EvalContext ctx = outer.on(n.timeframe());
+        if (ctx == null) return noBars(n.timeframe(), outer, label);
+
         List<Double> s = ctx.series(n.over(), n.periods());
 
         if (s == null || s.size() < n.periods()) {
@@ -229,6 +249,12 @@ public class RuleEvaluator {
         if (o instanceof Operand.Fundamental f) {
             return ctx.fundamental(f.metric(), f.period(), f.basis(), f.offset());
         }
+        if (o instanceof Operand.Shifted sh) {
+            // Move the window, then resolve the inner operand there. One place, so every operand
+            // kind gets "N bars ago" without each needing to know about it.
+            EvalContext back = ctx.shift(-sh.barsBack());
+            return back == null ? null : resolve(sh.of(), back);
+        }
         if (o instanceof Operand.Arith a) {
             Double l = resolve(a.left(), ctx);
             Double r = resolve(a.right(), ctx);
@@ -252,6 +278,9 @@ public class RuleEvaluator {
         for (int i = 0; i < n.right().size(); i++) {
             sb.append(i == 1 ? " and " : " ").append(describe(n.right().get(i)));
         }
+        // Stated only when it is not daily, so the Why column does not repeat "on Daily" on
+        // every row of a single-timeframe strategy.
+        if (n.timeframe() != Timeframe.DAILY) sb.append(" on ").append(n.timeframe().label());
         return sb.toString();
     }
 
@@ -280,6 +309,10 @@ public class RuleEvaluator {
         }
         if (o instanceof Operand.Arith a) {
             return describe(a.left()) + " " + a.op().symbol() + " " + describe(a.right());
+        }
+        if (o instanceof Operand.Shifted sh) {
+            return describe(sh.of()) + " " + sh.barsBack()
+                 + (sh.barsBack() == 1 ? " bar ago" : " bars ago");
         }
         return "?";
     }

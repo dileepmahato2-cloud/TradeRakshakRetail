@@ -150,6 +150,14 @@ if not errorlevel 1 (
     :: is up, so do the thing the click was actually asking for and open it.
     start "" /b powershell -NoProfile -WindowStyle Hidden -Command "Start-Process 'http://localhost:%APP_PORT%'" >nul 2>&1
     echo    Opening it in your browser...
+echo.
+echo    Volume Breakout: OFF until you enable it in Settings.
+echo      volbreakout.enabled / auto.buy / auto.sell = false, mode = PAPER
+echo      positionmonitor.enabled = false
+echo    Nothing is finalized, no position is opened and no order is sent
+echo    while those are off. Charges are now computed at Dhan's published
+echo    rates, so net P/L no longer equals gross.
+echo.
     echo.
     :: Wait, but never indefinitely.
     ::
@@ -229,6 +237,14 @@ if "%NEED_BACKUP%"=="YES" (
 
 :: JVM heap. Defaults suit a desktop; on a small server set JAVA_HEAP_OPTS in .env,
 :: e.g. JAVA_HEAP_OPTS=-Xms160m -Xmx320m -XX:+UseSerialGC -Xss512k
+::
+:: On the Linux server use start-server.sh instead of launching the jar by hand.
+:: `java -jar traderakshak.jar` passes NO heap argument, so the JVM takes its default
+:: ceiling of a quarter of host RAM - about 512 MB on a 2 GB box - and the daily-bars
+:: load then dies with an OutOfMemoryError inside Hibernate's row assembly. That error
+:: does not look like one in the log: the bars loader catches Exception, so only an
+:: Error escapes to print a stack, and the preceding GC thrash shows up as the same
+:: query taking 11 seconds one hour and 33 the next.
 if not defined JAVA_HEAP_OPTS set "JAVA_HEAP_OPTS=-Xms512m -Xmx2048m"
 
 if not exist "%APP_DIR%logs" mkdir "%APP_DIR%logs"
@@ -249,10 +265,14 @@ echo  Open browser at:  http://localhost:%APP_PORT%
 echo  Login: superadmin@traderakshak.local / Admin@123
 echo  Startup log: %APP_DIR%logs\startup.log
 echo.
-echo  Candles:    1 hour, bars start 09:15 10:15 ... 15:15 ^(livecandle.interval.minutes^)
-echo  Trade legs: BUY 15:15  ^|  SELL 10:15 the next trading day
-echo              Both times are bar starts - they must stay on the hour from 09:15,
-echo              or the price lookup finds no candle and the trade is skipped.
+echo  Candles:    2 hours, bars start 09:15 11:15 13:15 15:15 ^(livecandle.interval.minutes^)
+echo  Trade legs: BUY 15:15  ^|  SELL the next trading day's close
+echo              Both legs sit on a bar start. 10:15 is NOT a 2-hour boundary, which
+echo              is why the sell leg moved off it - a 10:15 lookup silently resolved
+echo              to the 11:15 bar and priced the trade an hour late ^(V54^).
+echo  Calendar:   NSE trading holidays are fetched on startup when the year is empty,
+echo              then refreshed daily at 06:00 IST. Without them the data-health
+echo              panel reports every holiday as a session missing its candles.
 echo  Stopping:   use STOP.bat, or close this window. Either way the open candle is
 echo              saved on the way out; Task Manager End-task loses up to an hour.
 echo.

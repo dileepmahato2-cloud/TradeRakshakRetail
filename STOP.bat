@@ -131,3 +131,20 @@ for %%q in (%PIDS%) do (
 )
 set "GONE=1"
 exit /b 0
+
+echo.
+echo  ============================================================
+echo    Note on automated trading
+echo  ============================================================
+echo.
+echo    While the application is stopped, nothing watches your positions.
+echo    The stop-loss, trailing-stop and target rules run inside this
+echo    process, so an open PAPER position is not protected until you
+echo    start it again.
+echo.
+echo    This is exactly why a REAL stop is never kept here: it is placed
+echo    at the broker as a resting order, which survives this process
+echo    being stopped. If you are trading real money, check that your
+echo    stop orders are live at Dhan before closing this.
+echo  ============================================================
+echo.

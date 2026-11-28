@@ -32,6 +32,20 @@ public class Strategy {
      */
     @Column(name="base_price_date") private String basePriceDate;
     @Column(name="base_price_time") private String basePriceTime;
+    /**
+     * The rule tree, as the JSON {@code AstParser} reads.
+     *
+     * <p>The column has existed since V51 and nothing wrote it, so a strategy's grouping lived
+     * only in the builder's own memory and was lost the moment it was saved. Stored here it
+     * round-trips, and it is the one representation the validator, the screener and the
+     * natural-language interpreter can all be pointed at without drifting apart.
+     *
+     * <p>Null for every strategy built before the grouped canvas, which keeps working from its
+     * flat conditions.
+     */
+    @Column(name="rule_ast")    private String ruleAst;
+    @Column(name="ast_version") private Integer astVersion;
+
     @Column(name="trade_window_start") @Builder.Default private String tradeWindowStart="15:10";
     @Column(name="trade_window_end") @Builder.Default private String tradeWindowEnd="15:20";
     @Builder.Default private String universe="ALL_CASH";

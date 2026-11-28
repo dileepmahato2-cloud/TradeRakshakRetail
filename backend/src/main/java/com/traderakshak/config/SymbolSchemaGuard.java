@@ -44,6 +44,7 @@ public class SymbolSchemaGuard implements ApplicationRunner {
         addSymbol("option_chain");
         addTradeBatchTables();
         addStockUploadHistoryTable();
+        addVolumeBreakoutTables();
         backfillSymbols();
         appConfigService.deferredInit();
     }
@@ -422,6 +423,147 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             "(institution_id, entry_date) WHERE base_price IS NULL OR base_price <= 0");
     }
 
+    /**
+     * Volume Breakout: the finalized shortlist, the signal log, and the additive columns the
+     * trading plumbing needs.
+     *
+     * <p><b>What is stored and what is not.</b> Only the finalized five per day land here - five
+     * rows a day, about 1,250 a year. The ~211 stocks that merely qualified stay calculated on
+     * demand and downloadable, because they are fully reproducible from candles already held and
+     * storing them would be ~53,000 rows a year of duplicate truth.
+     *
+     * <p>The five cannot be left to recalculation, and this is the one place where "calculate, do
+     * not store" has to give way: the whole point of the finalized list is that it STOPS changing.
+     * Recalculating it later would reproduce exactly the mutability the specification forbids - a
+     * stock whose price moved after 15:30 would silently drop out of a day that had already been
+     * acted on. It is a trade selection, not a ranking.
+     */
+    private void addVolumeBreakoutTables() {
+        try {
+            tx.executeWithoutResult(status -> {
+                em.createNativeQuery("""
+                    CREATE TABLE IF NOT EXISTS volbreakout_shortlist (
+                        id SERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        institution_id INTEGER NOT NULL DEFAULT 1,
+                        trade_date TEXT NOT NULL,
+                        rank INTEGER NOT NULL,
+                        symbol TEXT NOT NULL,
+                        sector TEXT,
+                        close_price DOUBLE PRECISION,
+                        base_price DOUBLE PRECISION,
+                        previous_close DOUBLE PRECISION,
+                        day_volume DOUBLE PRECISION,
+                        avg20_volume DOUBLE PRECISION,
+                        volume_ratio DOUBLE PRECISION,
+                        volume_sessions INTEGER,
+                        rsi14 DOUBLE PRECISION,
+                        atr14 DOUBLE PRECISION,
+                        atr_pct DOUBLE PRECISION,
+                        qualifying_count INTEGER,
+                        data_complete INTEGER DEFAULT 1,
+                        entry_price DOUBLE PRECISION,
+                        entry_price_source TEXT,
+                        exit_date TEXT,
+                        exit_price DOUBLE PRECISION,
+                        exit_price_source TEXT,
+                        return_pct DOUBLE PRECISION,
+                        finalized_at TEXT,
+                        created_at TEXT,
+                        updated_at TEXT
+                    )""").executeUpdate();
+                // Immutability is the database's job, not the application's. A unique key plus
+                // ON CONFLICT DO NOTHING makes a second finalize for the same day a no-op even if
+                // two schedulers fire at once - which a check-then-insert in Java cannot promise,
+                // because both callers pass the check before either inserts.
+                em.createNativeQuery("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_volbreak_day_symbol
+                    ON volbreakout_shortlist(user_id, institution_id, trade_date, symbol)
+                    """).executeUpdate();
+                em.createNativeQuery("""
+                    CREATE TABLE IF NOT EXISTS strategy_signals (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        institution_id INTEGER NOT NULL DEFAULT 1,
+                        strategy_key TEXT NOT NULL,
+                        trade_date TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        trigger_rule TEXT NOT NULL,
+                        signal_at TEXT NOT NULL,
+                        reference_price DOUBLE PRECISION,
+                        acted_on INTEGER DEFAULT 0,
+                        order_ref TEXT,
+                        detail TEXT,
+                        created_at TEXT
+                    )""").executeUpdate();
+                // One signal per strategy, stock, side and rule per day. Section 5 requires that a
+                // signal and an order stay separate objects, and section 7 that a duplicate order
+                // be impossible; both start with the signal itself not being recordable twice.
+                em.createNativeQuery("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS ux_strategy_signal_once
+                    ON strategy_signals(user_id, strategy_key, trade_date, symbol, side, trigger_rule)
+                    """).executeUpdate();
+            });
+        } catch (Exception e) {
+            log.warn("Volume Breakout table creation skipped: {}", e.getMessage());
+        }
+
+        addIndex("volbreakout_shortlist", "idx_volbreak_day", "user_id, trade_date DESC");
+        addIndex("volbreakout_shortlist", "idx_volbreak_symbol", "symbol, trade_date DESC");
+        addIndex("volbreakout_shortlist", "idx_volbreak_open", "user_id, exit_price");
+        addIndex("strategy_signals", "idx_sigs_day", "user_id, trade_date DESC");
+        addIndex("strategy_signals", "idx_sigs_symbol", "symbol, trade_date DESC");
+
+        // ── paper_trades: what a stop-loss engine needs and the table never had ──
+        //
+        // high_water_mark is the one that matters. A trailing stop is measured from the highest
+        // price seen SINCE ENTRY, and that figure exists nowhere else - it cannot be derived from
+        // the entry price, and recomputing it from candles on every tick would be both slow and
+        // wrong intraday. Its absence is why trailing_sl_level has sat on this table unable to do
+        // anything.
+        addColumn("paper_trades", "high_water_mark DOUBLE PRECISION");
+        addColumn("paper_trades", "strategy_key TEXT");
+        addColumn("paper_trades", "signal_id BIGINT");
+        addColumn("paper_trades", "idempotency_key TEXT");
+        addColumn("paper_trades", "exit_reason TEXT");
+        addColumn("paper_trades", "gross_pnl DOUBLE PRECISION");
+        addColumn("paper_trades", "total_charges DOUBLE PRECISION DEFAULT 0");
+        addColumn("paper_trades", "charges_breakdown TEXT");
+        addIndex("paper_trades", "idx_pt_strategy_open", "user_id, strategy_key, status");
+
+        // ── trading_journal: the section 8 lifecycle fields ──
+        //
+        // The journal recorded a trade's outcome but not its history: when the signal fired, when
+        // the order was placed, when it filled. Without those three a partially filled order and a
+        // fully filled one are indistinguishable, and "a trade is not closed until the exit order
+        // is confirmed executed" cannot be expressed at all.
+        addColumn("trading_journal", "signal_at TEXT");
+        addColumn("trading_journal", "order_placed_at TEXT");
+        addColumn("trading_journal", "executed_at TEXT");
+        addColumn("trading_journal", "gross_pnl DOUBLE PRECISION");
+        addColumn("trading_journal", "charges_breakdown TEXT");
+        addColumn("trading_journal", "trade_status TEXT DEFAULT 'PLACED'");
+        addColumn("trading_journal", "filled_qty INTEGER DEFAULT 0");
+        addColumn("trading_journal", "pending_qty INTEGER DEFAULT 0");
+        addColumn("trading_journal", "broker_order_id TEXT");
+        addColumn("trading_journal", "is_manual INTEGER DEFAULT 0");
+        addColumn("trading_journal", "idempotency_key TEXT");
+        addColumn("trading_journal", "product_type TEXT DEFAULT 'DELIVERY'");
+        addIndex("trading_journal", "idx_tj_status", "user_id, trade_status");
+        addIndex("trading_journal", "idx_tj_strategy", "user_id, strategy_key, created_at DESC");
+        addIndex("trading_journal", "idx_tj_broker_order", "broker_order_id");
+
+        // Duplicate-order prevention, enforced by the database rather than by application logic.
+        // A check-then-insert in Java does not prevent duplicates: two concurrent submissions both
+        // pass the check and both insert. Partial so that rows without a key (every historical
+        // row, and manual entries) are unaffected.
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_tj_idem ON trading_journal(idempotency_key) "
+              + "WHERE idempotency_key IS NOT NULL");
+        execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_pt_idem ON paper_trades(idempotency_key) "
+              + "WHERE idempotency_key IS NOT NULL");
+    }
+
     private void addTradeBatchTables() {
         try {
             tx.executeWithoutResult(status -> {
@@ -536,7 +678,7 @@ public class SymbolSchemaGuard implements ApplicationRunner {
             {"prevtop10.auto_buy.enabled",            "Auto Buy Enabled",                  "false", "BOOLEAN", "4"},
             {"prevtop10.auto_sell.enabled",           "Auto Sell Enabled",                 "false", "BOOLEAN", "5"},
             {"prevtop10.buy_time",                    "Auto Buy Time (HH:mm IST)",         "15:15", "STRING",  "6"},
-            {"prevtop10.sell_time",                   "Auto Sell Time (HH:mm IST)",        "10:15", "STRING",  "7"},
+            {"prevtop10.sell_time",                   "Auto Sell Time (HH:mm IST)",        "15:15", "STRING",  "7"},
             {"prevtop10.execution_mode",              "Execution Mode",                    "PAPER", "STRING",  "8"},
             {"prevtop10.use_real_price_if_executed",  "Use Real Executed Price",           "true",  "BOOLEAN", "9"},
             {"market.holidays",                       "Market Holidays (yyyy-MM-dd list)", "",      "STRING",  "10"},
@@ -593,8 +735,8 @@ public class SymbolSchemaGuard implements ApplicationRunner {
 
             String[][] legs = {
                 {"prevtop10.buy_time",   "15:15"},
-                {"prevtop10.sell_time",  "10:15"},
-                {"top10.trade.sell_time","10:15"},
+                {"prevtop10.sell_time",  "15:15"},
+                {"top10.trade.sell_time","15:15"},
             };
             for (String[] leg : legs) {
                 tx.executeWithoutResult(status -> em.createNativeQuery(

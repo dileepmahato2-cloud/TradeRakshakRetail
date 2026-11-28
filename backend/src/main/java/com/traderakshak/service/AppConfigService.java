@@ -650,6 +650,110 @@ public class AppConfigService {
         seed("BACKUP", "backup.auto_backup_enabled", "Auto Backup Enabled", "false", "BOOLEAN", "false", null, null, "Enable scheduled database backups", ++order, now);
         seed("BACKUP", "backup.retention_days", "Backup Retention Days", "30", "INTEGER", "30", "7", "365", "Days to retain backup files", ++order, now);
 
+        // ── Brokerage & Statutory Charges ────────────────────────────────────
+        // Rates as published on dhan.co/pricing (Equity tab, and Demat Account Related Charges),
+        // read 2026-11-24. Editable here because these change by regulation and by broker plan: a
+        // rate frozen into a build is a rate that goes stale without anyone noticing, and every
+        // net P&L figure in the application is computed from these.
+        //
+        // Percentages are stored as percentages, exactly as the pricing page states them, so a
+        // value here can be compared with the page without converting anything.
+        seed("CHARGES", "charges.equity.delivery.brokerage", "Delivery Brokerage (Rs/order)", "0", "DOUBLE", "0", "0", "100", "Dhan charges zero brokerage on equity delivery.", ++order, now);
+        seed("CHARGES", "charges.equity.intraday.brokerage.pct", "Intraday Brokerage %", "0.03", "DOUBLE", "0.03", "0", "1", "Intraday/MTF brokerage: the LOWER of this percentage and the cap below, per executed order.", ++order, now);
+        seed("CHARGES", "charges.equity.intraday.brokerage.cap", "Intraday Brokerage Cap (Rs)", "20", "DOUBLE", "20", "0", "100", "Upper limit on intraday brokerage per executed order. A cap, not a flat fee - small orders pay the percentage.", ++order, now);
+        seed("CHARGES", "charges.txn.nse.pct", "NSE Transaction Charge %", "0.0030699", "DOUBLE", "0.0030699", "0", "1", "NSE exchange transaction charge on turnover.", ++order, now);
+        seed("CHARGES", "charges.txn.bse.pct", "BSE Transaction Charge %", "0.00375", "DOUBLE", "0.00375", "0", "1", "BSE exchange transaction charge on turnover.", ++order, now);
+        seed("CHARGES", "charges.stt.delivery.pct", "STT Delivery % (both legs)", "0.1", "DOUBLE", "0.1", "0", "1", "Securities Transaction Tax on equity delivery - charged on BOTH buy and sell.", ++order, now);
+        seed("CHARGES", "charges.stt.intraday.sell.pct", "STT Intraday % (sell only)", "0.025", "DOUBLE", "0.025", "0", "1", "STT on equity intraday - charged on the SELL leg only.", ++order, now);
+        seed("CHARGES", "charges.sebi.pct", "SEBI Turnover Fee %", "0.0001", "DOUBLE", "0.0001", "0", "1", "SEBI turnover fee on turnover.", ++order, now);
+        seed("CHARGES", "charges.stampduty.delivery.buy.pct", "Stamp Duty Delivery % (buy)", "0.015", "DOUBLE", "0.015", "0", "1", "Stamp duty on delivery - buy turnover only.", ++order, now);
+        seed("CHARGES", "charges.stampduty.intraday.buy.pct", "Stamp Duty Intraday % (buy)", "0.003", "DOUBLE", "0.003", "0", "1", "Stamp duty on intraday - buy turnover only.", ++order, now);
+        seed("CHARGES", "charges.ipft.pct", "IPFT Contribution %", "0.0000001", "DOUBLE", "0.0000001", "0", "1", "Investor Protection Fund Trust contribution on turnover.", ++order, now);
+        seed("CHARGES", "charges.gst.pct", "GST %", "18", "DOUBLE", "18", "0", "50", "GST on brokerage + transaction charges + SEBI turnover fee + IPFT. NOT on STT or stamp duty, which are taxes rather than services.", ++order, now);
+        seed("CHARGES", "charges.dp.per.isin", "DP Charge (Rs/ISIN)", "12.50", "DOUBLE", "12.50", "0", "100", "Depository charge per instruction per ISIN on a delivery sell, plus GST. Flat, so it is a heavier drag on small positions.", ++order, now);
+
+        // ── Volume Breakout Strategy ─────────────────────────────────────────
+        // Every switch here ships OFF. This strategy can open positions and, in REAL mode, send
+        // orders to a broker, so nothing about it may become active because a database was
+        // created or an application upgraded - only because someone turned it on.
+        seed("VOLBREAKOUT", "volbreakout.enabled", "Volume Breakout Enabled", "false", "BOOLEAN", "false", null, null, "Master switch. While off, nothing is finalized, no position is opened and no order is sent.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.shortlist.size", "Shortlist Size", "5", "INTEGER", "5", "1", "50", "How many stocks the screen keeps, highest volume ratio first.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.finalize.time", "Finalize Time (HH:MM IST)", "15:15", "STRING", "15:15", null, null, "When the day's shortlist is frozen. The identities are written once and never revised. 15:15 matches the configured buy time, so the list is frozen at the moment it would be acted on.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.real.order.time", "Real Order Time (HH:MM IST)", "15:25", "STRING", "15:25", null, null, "When a REAL order is sent. It cannot be sent at 15:30: that is the bell, and the official close is a weighted average of the last thirty minutes rather than a tradeable price. Paper fills use the official close exactly.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.sell.time", "Sell Time (HH:MM IST)", "15:25", "STRING", "15:25", null, null, "When the exit sweep runs on the next trading day.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.mode", "Trading Mode", "PAPER", "STRING", "PAPER", null, null, "PAPER or REAL. REAL additionally requires the user's own real-trading permission, a verified trading-enabled broker and the pre-trade compliance gate.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.auto.buy", "Auto Buy", "false", "BOOLEAN", "false", null, null, "Open positions in the finalized shortlist automatically.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.auto.sell", "Auto Sell", "false", "BOOLEAN", "false", null, null, "Run the exit sweep automatically at the sell time.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.investment.amount", "Total Investment (Rs)", "100000", "DOUBLE", "100000", "0", "100000000", "Split equally across the shortlist, in whole shares.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.available.funds", "Available Funds (Rs)", "0", "DOUBLE", "0", "0", "100000000", "Cap on deployed capital for paper trading. 0 falls back to the investment amount - it does not mean 'no money'.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.max.open.positions", "Max Open Positions", "5", "INTEGER", "5", "0", "100", "0 means no limit. Caps risk taken ON; it never blocks an exit.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.max.daily.loss", "Max Daily Loss (Rs)", "0", "DOUBLE", "0", "0", "100000000", "Stops new entries once today's realised loss reaches this. 0 means no limit.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.max.daily.trades", "Max Daily Trades", "0", "INTEGER", "0", "0", "1000", "0 means no limit.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.stop.loss.pct", "Stop Loss %", "0", "DOUBLE", "0", "0", "50", "Percent below entry. 0 disables it. Note that a position entered at the close is unprotected overnight: a gap through this level fills at the open, not at the level.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.trailing.stop.pct", "Trailing Stop Loss %", "0", "DOUBLE", "0", "0", "50", "Percent below the highest price seen since entry. 0 disables it.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.target.pct", "Target %", "0", "DOUBLE", "0", "0", "200", "Percent above entry. 0 disables it.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.liquidity.gate", "Buyer/Seller Filter", "true", "BOOLEAN", "true", null, null, "Hide a qualifying stock with no buyer or no seller. Applies only while the market is open AND the live feed is actually reporting an order book - otherwise an absence of data would read as an absence of buyers.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.ratio.max", "Max Volume Ratio", "0", "DOUBLE", "0", "0", "1000", "Ignore ratios above this when picking the shortlist. 0 means no cap. Ratios above roughly 20x are usually block deals, index rebalances or corporate actions rather than organic breakouts.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.min.avg20.volume", "Min 20-Day Avg Volume", "0", "DOUBLE", "0", "0", "1000000000", "Require this much average volume before a stock may be shortlisted, so the five are names a position can actually be closed in. 0 means no floor.", ++order, now);
+
+        // ── Per-mode overrides (section 6: separate Paper and Real settings) ─
+        //
+        // Each of these falls back to the shared volbreakout.* value above when left at its
+        // default, so adding them changes nothing until one is deliberately set. They exist
+        // because Paper and Real genuinely want different numbers: a 5% stop that is fine on a
+        // simulated position is not what most people want on their first real one, and a single
+        // shared set means switching mode silently re-applies whatever was tuned for the other.
+        //
+        // -1 means "not set, use the shared value". 0 is a real value for several of these
+        // (0 = no limit), so it cannot double as "unset".
+        String[][] perMode = {
+            {"stop.loss.pct",        "Stop Loss %"},
+            {"trailing.stop.pct",    "Trailing Stop Loss %"},
+            {"target.pct",           "Target %"},
+            {"investment.amount",    "Total Investment (Rs)"},
+            {"max.open.positions",   "Max Open Positions"},
+            {"max.capital.per.stock","Max Capital Per Stock (Rs)"},
+            {"max.daily.loss",       "Max Daily Loss (Rs)"},
+            {"max.daily.trades",     "Max Daily Trades"},
+        };
+        for (String mode : new String[]{"paper", "real"}) {
+            String label = mode.equals("paper") ? "Paper" : "Real";
+            for (String[] k : perMode) {
+                seed("VOLBREAKOUT", "volbreakout." + mode + "." + k[0],
+                     label + ": " + k[1], "inherit", "STRING", "inherit", null, null,
+                     "Applies only in " + label + " mode. Leave as 'inherit' to use the shared "
+                   + "volbreakout." + k[0] + " value; set a number to override it here.",
+                     ++order, now);
+            }
+            seed("VOLBREAKOUT", "volbreakout." + mode + ".auto.buy", label + ": Auto Buy",
+                 "inherit", "STRING", "inherit", null, null,
+                 "Automated entry in " + label + " mode. 'inherit', 'true' or 'false'.", ++order, now);
+            seed("VOLBREAKOUT", "volbreakout." + mode + ".auto.sell", label + ": Auto Sell",
+                 "inherit", "STRING", "inherit", null, null,
+                 "Automated exit in " + label + " mode. 'inherit', 'true' or 'false'.", ++order, now);
+            seed("VOLBREAKOUT", "volbreakout." + mode + ".trading.start.time",
+                 label + ": Trading Start (HH:MM IST)", "inherit", "STRING", "inherit", null, null,
+                 "Automation does not act before this time in " + label + " mode.", ++order, now);
+            seed("VOLBREAKOUT", "volbreakout." + mode + ".trading.end.time",
+                 label + ": Trading End (HH:MM IST)", "inherit", "STRING", "inherit", null, null,
+                 "Automation does not act after this time in " + label + " mode.", ++order, now);
+        }
+        seed("VOLBREAKOUT", "volbreakout.max.capital.per.stock", "Max Capital Per Stock (Rs)",
+             "0", "DOUBLE", "0", "0", "100000000",
+             "Caps what one stock may take of the total, whatever the equal split works out to. "
+           + "0 means no cap.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.trading.start.time", "Trading Start (HH:MM IST)",
+             "09:15", "STRING", "09:15", null, null,
+             "Shared default. Automation does not act before this time.", ++order, now);
+        seed("VOLBREAKOUT", "volbreakout.trading.end.time", "Trading End (HH:MM IST)",
+             "15:30", "STRING", "15:30", null, null,
+             "Shared default. Automation does not act after this time.", ++order, now);
+
+        // ── Automation safety ────────────────────────────────────────────────
+        seed("TRADING", "positionmonitor.enabled", "Position Monitor Enabled", "false", "BOOLEAN", "false", null, null, "Let stop-loss, trailing stop, target and time-exit rules close PAPER positions. A real position's stop belongs at the broker as a resting order, where it survives this process stopping.", ++order, now);
+        seed("TRADING", "reconciliation.enabled", "Order Reconciliation Enabled", "true", "BOOLEAN", "true", null, null, "Settle real orders against Dhan's order book every five minutes. Read-only at the broker: it never places, modifies or cancels anything.", ++order, now);
+        seed("CURRENT_TOP10", "tracker.ranking.on_refresh", "Run Ranking On Every Price Refresh", "false", "BOOLEAN", "false", null, null, "OFF. This was about 3.3s of every 6s refresh on 1,314 stocks and the source of the [RankTiming] log lines. Nothing on screen depends on it: Today's Top 10 and the bulk-order flow both CALCULATE their list live. Stored runs remain only for history. The explicit Run Ranking button still works.", ++order, now);
+
         log.info("Seeded {} default application settings.", order);
     }
 

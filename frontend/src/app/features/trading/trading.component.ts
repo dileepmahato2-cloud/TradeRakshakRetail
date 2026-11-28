@@ -19,13 +19,12 @@ import { Subscription } from 'rxjs';
 <div class="page">
   <section class="hero">
     <div class="title">Trading</div>
-    <div class="subtle">Trade execution, strategy automation, pre-trade checklist validation, and complete trading journal.</div>
+    <div class="subtle">Trade execution, strategy automation and pre-trade checklist validation. Trades are recorded in Trade Journal.</div>
   </section>
 
   <div class="tabs">
     <button [class.active]="activeTab==='desk'" (click)="activeTab='desk'">Trade Execution</button>
     <button [class.active]="activeTab==='checklist'" (click)="activeTab='checklist'">Manage Checklist Items</button>
-    <button [class.active]="activeTab==='journal'" (click)="activeTab='journal'">Trading Journal</button>
   </div>
 
   @if (loading()) {
@@ -175,28 +174,11 @@ import { Subscription } from 'rxjs';
       </div>
     }
 
-    @if (activeTab==='journal') {
-      <div class="grid widgets">
-        <div class="widget"><div class="subtle">Total Trades</div><div class="value">{{ journalAnalytics.totalTrades || 0 }}</div></div>
-        <div class="widget"><div class="subtle">Win Rate</div><div class="value">{{ journalAnalytics.winRate || 0 }}%</div></div>
-        <div class="widget"><div class="subtle">Loss Rate</div><div class="value">{{ journalAnalytics.lossRate || 0 }}%</div></div>
-        <div class="widget"><div class="subtle">Average Profit</div><div class="value">{{ money(journalAnalytics.averageProfit) }}</div></div>
-        <div class="widget"><div class="subtle">Average Loss</div><div class="value">{{ money(journalAnalytics.averageLoss) }}</div></div>
-        <div class="widget"><div class="subtle">Net P&L</div><div class="value">{{ money(journalAnalytics.netPnl) }}</div></div>
-      </div>
-      <section class="panel">
-        <div class="actions" style="justify-content:space-between;margin-bottom:12px">
-          <div class="panel-title" style="margin:0">Trading Journal</div>
-          <div class="actions"><input class="input" style="width:220px" [(ngModel)]="journalSearch" placeholder="Search symbol"><button class="btn" (click)="loadJournal()">Filter</button><button class="btn primary" (click)="exportJournal()">Export Excel CSV</button><button class="btn" (click)="printPage()">Print</button></div>
-        </div>
-        <div class="table-wrap"><table><thead><tr><th>Date</th><th>Trade ID</th><th>Strategy</th><th>Mode</th><th>Type</th><th>Symbol</th><th>Qty</th><th>Buy</th><th>Sell</th><th>Current</th><th>SL</th><th>Trail SL</th><th>Target</th><th>Capital</th><th>Margin</th><th>P&L</th><th>Outcome</th><th>Exit Reason</th></tr></thead><tbody>
-          @for (j of journal; track j.tradeRef + j.createdAt) {
-            <tr><td>{{ j.createdAt }}</td><td>{{ j.tradeRef }}</td><td>{{ j.strategyName }}</td><td>{{ j.tradingMode }}</td><td>{{ j.tradeType }}</td><td><strong>{{ j.symbol }}</strong></td><td>{{ j.quantity }}</td><td>{{ number(j.buyPrice) }}</td><td>{{ number(j.sellPrice) }}</td><td [title]="j.livePnl ? 'Live price - this row is still open, so P&L moves with it.' : 'Trade is closed; P&L is the realised figure.'">{{ j.livePnl ? number(j.currentPrice) : '-' }}</td><td>{{ number(j.stopLoss) }}</td><td>{{ number(j.trailingStopLoss) }}</td><td>{{ number(j.targetPrice) }}</td><td>{{ money(j.capitalUtilized) }}</td><td>{{ j.marginUtilized }}%</td><td [style.color]="j.netProfitLoss >= 0 ? '#5eead4' : '#ff6b6b'">{{ money(j.netProfitLoss) }}</td><td><span class="chip">{{ j.outcome }}</span></td><td>{{ j.exitReason }}</td></tr>
-          }
-          @if (!journal.length) { <tr><td colspan="18" style="text-align:center;color:#94a3b8">No trading journal records yet.</td></tr> }
-        </tbody></table></div>
-      </section>
-    }
+    <!-- The Trading Journal tab lived here. It is now a top-level screen, Trade Journal,
+         because there were two journals - this one over trading_journal and a separate manual
+         screen over trade_journal - and "what did I make this month" had two answers. One
+         journal now holds paper, real, manual and automated trades alike, with charges
+         computed rather than typed. -->
   }
 
   @if (confirmOpen) {
@@ -257,7 +239,9 @@ export class TradingComponent implements OnInit, OnDestroy {
     // The sidebar's "Executed Trades" links straight here. Without this it landed on the
     // trade desk and the journal it promised was one unmarked click away.
     const tab = this.route.snapshot.queryParamMap.get('tab');
-    if (tab === 'journal' || tab === 'checklist' || tab === 'desk') this.activeTab = tab;
+    // 'journal' deliberately absent: it is a screen of its own now, so an old
+    // ?tab=journal link falls through to the default tab instead of a blank panel.
+    if (tab === 'checklist' || tab === 'desk') this.activeTab = tab;
     this.resetChecklistForm();
     this.load();
     this.livePrices.connect();

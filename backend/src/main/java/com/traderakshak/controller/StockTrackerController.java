@@ -56,11 +56,17 @@ import java.util.stream.Collectors;
 public class StockTrackerController {
 
     private final StockTrackerService trackerService;
+    private final com.traderakshak.service.DeadSymbolService deadSymbols;
     /** Owns the upload pipeline (stage-by-stage progress) that the upload screen polls. */
     private final com.traderakshak.service.StockProcessingService processingService;
     /** Append-only upload log: Mode A (latest per symbol) and Mode B (as-of / exact date). */
     private final com.traderakshak.service.StockUploadHistoryService uploadHistory;
     private final com.traderakshak.service.MarketRegimeService marketRegime;
+    // Allocation is an annotation on the qualified list, so the controller owns the join between
+    // the screen's rows and the capital behind them; neither service needs to know the other.
+    private final com.traderakshak.service.CapitalAllocationService allocation;
+    private final com.traderakshak.service.DemoAccountService demoAccount;
+    private final com.traderakshak.service.BrokerFundsService brokerFunds;
 
     @PersistenceContext
     private EntityManager em;
@@ -314,18 +320,32 @@ public class StockTrackerController {
     }
 
     @GetMapping("/export/rsi45-section")
-    @Operation(summary = "The RSI 45 section's stocks, laid out like the ATR Base Price Crossover file")
+    @Operation(summary = "The RSI 45 section's stocks, with the same columns the section shows")
     public ResponseEntity<byte[]> exportRsi45Section(
             @RequestParam(required = false) Double maxPrice,
             @RequestParam(defaultValue = "true")  boolean requireCrossing,
             @RequestParam(defaultValue = "false") boolean requireVolume,
             @RequestParam(defaultValue = "false") boolean applyRanking,
+            // The flags the SECTION uses. Without them the file could never match the screen:
+            // useNewestSession alone put the export two sessions behind what was on display.
+            @RequestParam(defaultValue = "false") boolean requireFullVolumeWindow,
+            @RequestParam(defaultValue = "false") boolean sortByVolumeRatio,
+            @RequestParam(defaultValue = "false") boolean requireStochCross,
+            @RequestParam(defaultValue = "false") boolean useNewestSession,
+            @RequestParam(defaultValue = "false") boolean sortByReturn,
+            @RequestParam(defaultValue = "false") boolean requireRsiLevel,
+            @RequestParam(defaultValue = "0") double maxPctAboveBase,
+            @RequestParam(defaultValue = "0") int limit,
+            @RequestParam(required = false) String title,
             @AuthenticationPrincipal User user) {
         byte[] csv = trackerService.exportRsi45SectionCsv(
             user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
-            applyRanking);
-        return buildCsvResponse(csv,
-            "TradeRakshak_RSI45_Previous_Close_Less_Base_Price_" + today() + ".csv");
+            applyRanking, requireFullVolumeWindow, sortByVolumeRatio, requireStochCross,
+            useNewestSession, sortByReturn, requireRsiLevel, Math.max(0.0, maxPctAboveBase),
+            Math.max(0, limit), title);
+        String slug = (title == null || title.isBlank())
+            ? "RSI45_Section" : title.replaceAll("[^A-Za-z0-9]+", "_");
+        return buildCsvResponse(csv, "TradeRakshak_" + slug + "_" + today() + ".csv");
     }
 
     @GetMapping("/export/chart-trades")
@@ -359,10 +379,123 @@ public class StockTrackerController {
             @RequestParam(defaultValue = "true") boolean applyRanking,
             // Must match the cap of the section this preview is shown inside. 0 = no cap.
             @RequestParam(defaultValue = "0") int limit,
+            // The RSI 45 crossover, so this preview screens on the same mandatory conditions as
+            // the table it sits beneath. Default false keeps any other caller unchanged.
+            // The section's own volume condition and base-price ceiling. Defaulted off
+            // so any existing caller keeps the preview it has always had; both RSI 45
+            // sections send their own values.
+            @RequestParam(defaultValue = "false") boolean requireVolume,
+            @RequestParam(defaultValue = "0") double maxPctAboveBase,
+            @RequestParam(defaultValue = "false") boolean requireRsiLevel,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getProvisionalTop10(
             user.getId(), user.getInstitutionId(), requireCrossing, applyRanking,
-            Math.max(0, limit))));
+            Math.max(0, limit), requireRsiLevel, requireVolume, Math.max(0.0, maxPctAboveBase))));
+    }
+
+    @GetMapping("/stock-history")
+    @Operation(summary = "Stored daily closes for one symbol, oldest first, for the price chart")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> stockHistory(
+            @RequestParam String symbol,
+            @RequestParam(defaultValue = "120") int days,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            trackerService.dailyCloseSeries(symbol, Math.max(2, Math.min(days, 500)))));
+    }
+
+    @GetMapping("/volbreakout/previous")
+    @Operation(summary = "The five finalized on the previous trading session. Identities frozen, "
+                       + "market data live.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volumeBreakoutPrevious(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            trackerService.getVolumeBreakoutPrevious(user.getId(), user.getInstitutionId())));
+    }
+
+    @PostMapping("/volbreakout/finalize")
+    @Operation(summary = "Freeze today's shortlist. Idempotent - a day already finalized is not "
+                       + "recalculated, which is what makes it final.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volumeBreakoutFinalize(
+            // A past session can be finalized for the first time, but one already stored is never
+            // rewritten whatever is passed.
+            @RequestParam(required = false) String forDate,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(trackerService.finalizeVolumeBreakoutDay(
+            user.getId(), user.getInstitutionId(), forDate)));
+    }
+
+    @PostMapping("/volbreakout/attach-prices")
+    @Operation(summary = "Fill in entry and exit prices from official daily closes where they are "
+                       + "still missing. Never revises a price already set.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volumeBreakoutAttachPrices(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            trackerService.attachVolumeBreakoutPrices(user.getId(), user.getInstitutionId())));
+    }
+
+    @GetMapping("/export/volbreakout")
+    @Operation(summary = "Every stock that qualified for the Volume Breakout section, as CSV")
+    public ResponseEntity<byte[]> exportVolumeBreakout(@AuthenticationPrincipal User user) {
+        byte[] csv = trackerService.exportVolumeBreakoutCsv(user.getId(), user.getInstitutionId());
+        return buildCsvResponse(csv, "TradeRakshak_Volume_Breakout_All_Qualifying_" + today() + ".csv");
+    }
+
+    @GetMapping("/dead-symbols")
+    @Operation(summary = "Symbols Dhan refuses (DH-905) that are still in the uploaded list. "
+                       + "Reading this changes nothing.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deadSymbols(
+            // Distinct backfill jobs, not occurrences: one job retries a symbol over several date
+            // ranges, so counting occurrences would let a single bad run look like a pattern.
+            @RequestParam(defaultValue = "2") int minJobs,
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            deadSymbols.report(user.getId(), user.getInstitutionId(), minJobs)));
+    }
+
+    @PostMapping("/dead-symbols/deactivate")
+    @Operation(summary = "Deactivate NAMED symbols. No bulk form: the symbols must be listed.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deactivateDeadSymbols(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(deadSymbols.deactivate(
+            user.getId(), user.getInstitutionId(), stringList(req.get("symbols")), user.getName())));
+    }
+
+    @PostMapping("/dead-symbols/reactivate")
+    @Operation(summary = "Undo, by name - for a symbol deactivated by mistake or relisted since")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reactivateDeadSymbols(
+            @RequestBody Map<String, Object> req, @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(deadSymbols.reactivate(
+            user.getId(), user.getInstitutionId(), stringList(req.get("symbols")))));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static java.util.List<String> stringList(Object raw) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (raw instanceof java.util.List<?> l) {
+            for (Object o : l) if (o != null) out.add(String.valueOf(o));
+        } else if (raw != null && !String.valueOf(raw).isBlank()) {
+            for (String s : String.valueOf(raw).split("[,\s]+")) if (!s.isBlank()) out.add(s);
+        }
+        return out;
+    }
+
+    @GetMapping("/volbreakout/current")
+    @Operation(summary = "Volume Breakout: close at or above base price, with today's volume above "
+                       + "the 20-session average. Shortlisted by volume ratio.")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> volumeBreakoutCurrent(
+            // 0 lists every qualifying stock, which is what the download asks for. The screen
+            // passes nothing and gets the configured shortlist size, so the screen and the file
+            // cannot disagree about how many "the top five" is.
+            @RequestParam(required = false) Integer limit,
+            // Only ever passed false by a caller that wants the unfiltered list - the export. The
+            // gate is a display rule, so an export must not inherit it.
+            @RequestParam(defaultValue = "true") boolean applyLiquidityGate,
+            @AuthenticationPrincipal User user) {
+        int screenLimit = limit == null
+            ? trackerService.getVolumeBreakoutShortlistSize()
+            : Math.max(0, limit);
+        return ResponseEntity.ok(ApiResponse.ok(trackerService.getVolumeBreakoutCurrent(
+            user.getId(), user.getInstitutionId(), screenLimit, applyLiquidityGate)));
     }
 
     @GetMapping("/ranking/below-price-top10")
@@ -382,10 +515,102 @@ public class StockTrackerController {
             // but are read differently - one as a shortlist to trade, one as the full list of
             // what qualified - so the cap is the caller's to state, not something to infer here.
             @RequestParam(defaultValue = "0") int limit,
+            // Added for the volume-based entry test. All three default to the previous
+            // behaviour, so every existing caller is unaffected.
+            @RequestParam(defaultValue = "false") boolean requireFullVolumeWindow,
+            @RequestParam(defaultValue = "false") boolean sortByVolumeRatio,
+            // A screen asks "what qualifies now", a holding panel asks "what was selected last
+            // session". Default false keeps every existing caller on the holding reading.
+            @RequestParam(defaultValue = "false") boolean useNewestSession,
+            // "Strongest move first", for the section whose heading says exactly that. Default
+            // false keeps every other caller ordered by traded volume as before.
+            @RequestParam(defaultValue = "false") boolean sortByReturn,
+            // The RSI 45 crossover as a MANDATORY entry condition. It was computed and displayed
+            // but never tested, so both RSI 45 sections listed stocks that had not crossed 45.
+            // Default false so only the callers that ask for it change.
+            @RequestParam(defaultValue = "false") boolean requireRsiLevel,
+            // Exclude stocks whose current price sits more than this percentage above their
+            // base price - the base is then too stale for a crossing to be reachable at all.
+            // 0 = no limit.
+            @RequestParam(defaultValue = "0") double maxPctAboveBase,
+            // Stochastic %K crossing above %D. Reported on every row regardless; this decides
+            // whether it also excludes a stock.
+            // Which trading session after entry the exit close is taken from.
+            // 1 = the next session, the basis this endpoint has always used.
+            @RequestParam(defaultValue = "1") int holdingDays,
+            @RequestParam(defaultValue = "false") boolean requireStochCross,
+            // Capital to spread across the stocks this screen qualifies. 0 leaves the list
+            // exactly as it was: the allocation is an annotation on these rows, never a filter,
+            // so asking for it can add columns but can never change which stocks appear.
+            @RequestParam(defaultValue = "0") double investmentAmount,
+            // DEMO spends the virtual balance; REAL would spend the broker's. Defaults to DEMO
+            // so an allocation can never be sized against real money by omission.
+            @RequestParam(defaultValue = "DEMO") String accountType,
             @AuthenticationPrincipal User user) {
-        return ResponseEntity.ok(ApiResponse.ok(trackerService.getBelowPriceTop10(
+
+        Map<String, Object> panel = trackerService.getBelowPriceTop10(
             user.getId(), user.getInstitutionId(), maxPrice, requireCrossing, requireVolume,
-            applyRanking, priceAtClose, Math.max(0, limit))));
+            applyRanking, priceAtClose, Math.max(0, limit),
+            requireFullVolumeWindow, sortByVolumeRatio, requireStochCross, useNewestSession,
+            sortByReturn, requireRsiLevel, Math.max(0.0, maxPctAboveBase),
+            Math.max(1, holdingDays));
+
+        if (investmentAmount > 0) {
+            attachAllocation(panel, investmentAmount, accountType, user);
+        }
+        return ResponseEntity.ok(ApiResponse.ok(panel));
+    }
+
+    /**
+     * Annotate the qualified rows with each stock's share of the investment.
+     *
+     * <p>Writes onto the list the strategy produced rather than returning one of its own. A
+     * second table would have to be kept in step with the first, and a stock appearing in one
+     * but not the other makes both untrustworthy.
+     *
+     * <p>A REAL allocation needs the broker's buying power, which the platform cannot yet read -
+     * there is no funds call in the broker integration. Rather than size an allocation against a
+     * number that is not the user's money, this reports that and allocates nothing.
+     */
+    @SuppressWarnings("unchecked")
+    private void attachAllocation(Map<String, Object> panel, double investment,
+                                  String accountType, User user) {
+        List<Map<String, Object>> rows =
+            (List<Map<String, Object>>) panel.getOrDefault("top10", List.of());
+        String type = accountType == null ? "DEMO" : accountType.trim().toUpperCase();
+
+        double available;
+        Map<String, Object> accountInfo;
+
+        if ("REAL".equals(type)) {
+            accountInfo = brokerFunds.funds(user);
+            Object bp = accountInfo.get("buying_power");
+            if (bp == null) bp = accountInfo.get("available_balance");
+            if (!(bp instanceof Number)) {
+                // No balance at all - no connected account, and nothing read before. Sizing an
+                // order against a number that is not the user's money is the one thing this
+                // must never do.
+                Map<String, Object> blocked = new LinkedHashMap<>();
+                blocked.put("allocated", false);
+                blocked.put("account_type", "REAL");
+                blocked.put("reason", String.valueOf(accountInfo.getOrDefault("message",
+                    "The broker balance is unavailable, so nothing was allocated.")));
+                blocked.put("account", accountInfo);
+                panel.put("allocation", blocked);
+                return;
+            }
+            available = ((Number) bp).doubleValue();
+        } else {
+            available = demoAccount.balance(user.getId(), user.getInstitutionId());
+            accountInfo = demoAccount.summary(user.getId(), user.getInstitutionId());
+        }
+        Map<String, Object> summary = allocation.attachToRows(
+            rows, investment, available, com.traderakshak.service.BrokerageCalculator.Product.DELIVERY, "NSE");
+        summary.put("account_type", type);
+        // The account the figures came from, including whether a real balance is stale, so the
+        // screen can say which money it is sizing against.
+        summary.put("account", accountInfo);
+        panel.put("allocation", summary);
     }
 
     @GetMapping("/ranking/reconstruct-trend")
@@ -406,6 +631,28 @@ public class StockTrackerController {
             @RequestParam(required = false) Boolean applyRanking,
             @RequestParam(required = false) Boolean requireVolume,
             @RequestParam(required = false) Boolean priceAtClose,
+            // The Volume Breakout chart needs its own basket rules: ratio order rather than raw
+            // volume, and short-history stocks held out. Both default to the old behaviour so no
+            // existing caller changes.
+            @RequestParam(defaultValue = "false") boolean requireFullVolumeWindow,
+// The screen's stochastic checkbox. Default false so every existing caller keeps
+            // the basket it has always charted; the RSI 45 section sends its own value, which
+            // is what makes its bars and its table the same strategy.
+            @RequestParam(defaultValue = "false") boolean requireStochCrossBars,
+            // Buy intraday at buyTime, sell at the next trading day's official close. Default
+            // false so every existing chart keeps the basis it has always been drawn on.
+            @RequestParam(defaultValue = "false") boolean sellAtClose,
+            // Same condition on the backtest, so the bars measure the strategy the screen runs.
+            // How many exchange trading sessions after entry the exit close is taken from.
+            // 1 is the next trading session, which is what this endpoint has always charted, so
+            // every existing caller keeps its basis. Counted in sessions, so weekends and
+            // exchange holidays are skipped rather than counted as days.
+            @RequestParam(defaultValue = "1") int holdingDays,
+            @RequestParam(defaultValue = "false") boolean requireRsiLevelBars,
+            // The same ceiling the section's table applies. Without it the bars averaged a
+            // larger population than the table listed.
+            @RequestParam(defaultValue = "0") double maxPctAboveBaseBars,
+                        @RequestParam(defaultValue = "false") boolean sortByVolumeRatio,
             // The section's own stock cap, so the bars average exactly the rows its table lists.
             // 0 averages every qualifying stock.
             @RequestParam(defaultValue = "0") int limit,
@@ -428,7 +675,10 @@ public class StockTrackerController {
         boolean atClose = priceAtClose != null ? priceAtClose : false;
         return ResponseEntity.ok(ApiResponse.ok(trackerService.getReconstructedTrend(
             user.getId(), user.getInstitutionId(), from, to, maxPrice, buyTime, sellTime,
-            band, cross, cap, rank, vol, atClose, Math.max(0, limit))));
+            band, cross, cap, rank, vol, atClose, Math.max(0, limit),
+            requireFullVolumeWindow, sortByVolumeRatio, requireStochCrossBars, sellAtClose,
+            requireRsiLevelBars, Math.max(0.0, maxPctAboveBaseBars),
+            Math.max(1, holdingDays))));
     }
 
     @GetMapping("/ranking/reconstruct-day")
@@ -684,11 +934,55 @@ public class StockTrackerController {
     @GetMapping("/market-health")
     @Operation(summary = "Market Health Score 0-100 and the Strong Buy / Buy / No Trade / Sell / "
                        + "Strong Sell state, from Nifty 500 breadth")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> getMarketHealth() {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMarketHealth(
+            @RequestParam(defaultValue = "false") boolean force) {
         // No user scoping: market breadth is a property of the market, not of one account's
         // watchlist. Scoping it to uploaded stocks would make two users disagree about whether
         // it is a buy market.
-        return ResponseEntity.ok(ApiResponse.ok(marketRegime.computeMarketHealth()));
+        //
+        // force=true is the Refresh button on the status band. It scans ~2,600 symbols over 260
+        // sessions, so it is a deliberate action, never the page-load path.
+        return ResponseEntity.ok(ApiResponse.ok(marketRegime.marketHealth(force)));
+    }
+
+    /** Every stored daily reading, newest first, for the history panel. */
+    /** What the platform can measure right now, and what each gap prevents. */
+    @GetMapping("/data-health")
+    @Operation(summary = "Data availability: missing sessions, intraday coverage, base prices, "
+                       + "and what each gap stops the screens from showing")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> dataHealth(
+            @AuthenticationPrincipal User user) {
+        return ResponseEntity.ok(ApiResponse.ok(
+            trackerService.dataHealth(user.getId(), user.getInstitutionId())));
+    }
+
+    @GetMapping("/market-health/history")
+    @Operation(summary = "Stored daily market status readings, one row per trading session")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> marketHealthHistory(
+            @RequestParam(defaultValue = "180") int limit) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        List<Map<String, Object>> rows = marketRegime.history(limit);
+        out.put("rows", rows);
+        out.put("count", rows.size());
+        return ResponseEntity.ok(ApiResponse.ok(out));
+    }
+
+    /**
+     * The same history as a spreadsheet.
+     *
+     * <p>CSV rather than a binary workbook: Excel opens it directly, it survives being diffed or
+     * scripted against, and the file is the data rather than a rendering of it.
+     */
+    @GetMapping("/export/market-health")
+    @Operation(summary = "Daily market status history as CSV, for Excel")
+    public ResponseEntity<byte[]> exportMarketHealth(
+            @RequestParam(defaultValue = "2000") int limit) {
+        byte[] body = marketRegime.historyCsv(limit);
+        return ResponseEntity.ok()
+            .header("Content-Type", "text/csv; charset=UTF-8")
+            .header("Content-Disposition",
+                    "attachment; filename=\"TradeRakshak_Daily_Market_Status.csv\"")
+            .body(body);
     }
 
     // ── Sectors List ─────────────────────────────────────────────────────────────
@@ -863,7 +1157,7 @@ public class StockTrackerController {
     @Operation(summary = "Configurable trend: backtest Top 10 buy@buyTime / sell next day@sellTime using stored intraday prices")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> backtestTrend(
             @RequestParam(defaultValue = "15:15") String buyTime,
-            @RequestParam(defaultValue = "10:15") String sellTime,
+            @RequestParam(defaultValue = "15:15") String sellTime,
             @RequestParam(defaultValue = "30") int days,
             @AuthenticationPrincipal User user) {
         return ResponseEntity.ok(ApiResponse.ok(
@@ -998,7 +1292,13 @@ public class StockTrackerController {
             @AuthenticationPrincipal User user) {
         List<Map<String, Object>> rows = uploadHistory.getBacktestReturns(
             date, asOf, user.getId(), user.getInstitutionId());
-        double avg = rows.stream().mapToDouble(r -> ((Number) r.get("return_pct")).doubleValue())
+        // Latent rather than live: this source always writes a number today. Guarded anyway,
+        // because the same unguarded cast on the RSI 45 rows took both sections off the screen
+        // the moment their Return % became legitimately absent.
+        double avg = rows.stream()
+            .map(r -> r.get("return_pct"))
+            .filter(Number.class::isInstance)
+            .mapToDouble(v -> ((Number) v).doubleValue())
             .average().orElse(0);
         return ResponseEntity.ok(ApiResponse.ok(Map.of(
             "mode", asOf ? "AS_OF_DATE" : "EXACT_DATE",

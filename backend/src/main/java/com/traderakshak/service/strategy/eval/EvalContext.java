@@ -1,6 +1,7 @@
 package com.traderakshak.service.strategy.eval;
 
 import com.traderakshak.service.strategy.ast.Operand;
+import com.traderakshak.service.strategy.ast.Timeframe;
 
 import java.util.List;
 import java.util.Map;
@@ -34,6 +35,16 @@ public interface EvalContext {
      * CROSSES_ABOVE on a stock's first day evaluate to UNKNOWN rather than throwing.
      */
     EvalContext shift(int sessions);
+
+    /**
+     * The same symbol and date read on a different bar width, or {@code null} when no candle of
+     * that width is stored.
+     *
+     * <p>Null rather than an empty context, so a 5-minute condition against hourly-only data
+     * evaluates to UNKNOWN with a reason the user can act on. The alternative - quietly falling
+     * back to daily - produces a screener that answers a question nobody asked.
+     */
+    EvalContext on(Timeframe timeframe);
 
     /**
      * The last {@code periods} values of an operand, oldest first, for the quantifiers.

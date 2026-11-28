@@ -19,6 +19,46 @@ Chart.register(...registerables);
     .tbl-row { border-bottom:1px solid #1e2a3b; transition:background 0.1s; }
     .tbl-row:hover { background:#1a2535; }
     .tbl-cell { font-size:11px; padding:7px 10px; color:#cbd5e1; }
+    /* The ten market-status readings, on ONE line.
+       grid-auto-flow:column rather than auto-fit: auto-fit wraps as soon as the cards stop
+       fitting, which is what put these on two and three rows. Column flow never wraps, so the
+       row stays a row - and the wrapper scrolls sideways instead, which is the only honest
+       option once ten cards will not fit a phone. Crushing them to 35px each would keep one
+       line and lose the numbers. */
+    /* All ten readings on one line, with NO sideways scroll.
+       The previous version scrolled because of min-width:max-content plus a 132px floor: that
+       pair tells the grid to take its natural width and let the wrapper scroll. Dropping both and
+       using minmax(0,1fr) lets the columns divide whatever width there is and shrink to fit, which
+       is what was asked for. grid-auto-flow:column keeps it adaptive - add an eleventh card and it
+       still fits, no count hard-coded anywhere. */
+    .regime-metrics-wrap { background:#1e2a3b; overflow:hidden; }
+    .regime-metrics {
+      display:grid; grid-auto-flow:column; grid-auto-columns:minmax(0,1fr);
+      gap:1px; background:#1e2a3b;
+    }
+    .regime-metrics > div { background:#0d1829; padding:9px 7px; min-width:0; }
+    .regime-metrics .rm-label {
+      font-size:9px; color:#94a3b8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    /* clamp(), so the figure shrinks with the column instead of forcing it wider. The floor is
+       13px because below that a percentage stops being readable at a glance, which is the entire
+       job of this strip. */
+    .regime-metrics .rm-value {
+      font-size:clamp(13px, 1.25vw, 19px); font-weight:800; line-height:1.15;
+      white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    .regime-metrics .rm-sub {
+      font-size:8.5px; color:#64748b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    }
+    @media (max-width:1150px) {
+      /* Ten columns of a 1150px window is about 110px each, and below that the labels become
+         ellipsis with nothing before it. So on narrow screens the strip wraps instead - still no
+         scrollbar, and every card stays readable. A single line of illegible slivers would honour
+         the letter of "one line" and lose the numbers, which is the point of the strip. */
+      .regime-metrics {
+        grid-auto-flow:row; grid-template-columns:repeat(auto-fit,minmax(118px,1fr));
+      }
+    }
     .tbl-cell-num { font-size:11px; padding:7px 10px; color:#cbd5e1; text-align:right; font-family:monospace; }
     .pos { color:#22c55e; font-weight:600; }
     .neg { color:#ef4444; font-weight:600; }
@@ -49,8 +89,12 @@ Chart.register(...registerables);
       <div style="font-size:11px; color:#94a3b8; margin-top:2px;">Track stock return distribution, positive/negative breadth, sentiment, and trend strength.</div>
     </div>
     <div style="display:flex; gap:8px;">
-      <button class="btn-blue" (click)="loadData()" [disabled]="loading">
-        @if (loading) { <span class="spin"></span> Loading... } @else { Refresh Data }
+      <!-- Forces a rescan rather than re-fetching the hourly cache. A Refresh that returns the
+           same numbers it already had is the same thing, to the reader, as one that does not
+           work. -->
+      <button class="btn-blue" (click)="loadData(true)" [disabled]="loading || healthRefreshing"
+              title="Re-reads breadth and recomputes the market health score from every constituent.">
+        @if (loading || healthRefreshing) { <span class="spin"></span> Loading... } @else { Refresh Data }
       </button>
     </div>
   </div>
@@ -58,6 +102,23 @@ Chart.register(...registerables);
   <!-- ══ Market Trend Identification Engine ══════════════════════════════════
        First thing on the page, deliberately: every other number here describes the
        market, and this one says what to DO about it. -->
+  @if (healthLoading && !health) {
+    <!-- A skeleton, not an empty space. The status band is the first thing on this page, so
+         while it loads the reader needs to see that something is coming rather than a gap that
+         silently fills in later. -->
+    <div class="card" style="padding:18px; margin-bottom:14px; border-left:5px solid #334155;">
+      <div style="display:flex; align-items:center; gap:10px;">
+        <span class="spin"></span>
+        <div>
+          <div style="font-size:13px; font-weight:700; color:#cbd5e1;">Reading market breadth&hellip;</div>
+          <div style="font-size:11px; color:#94a3b8; margin-top:3px;">
+            Scoring every constituent against its 20, 50, 100 and 200 day averages.
+          </div>
+        </div>
+      </div>
+    </div>
+  }
+
   @if (health?.success) {
     <div class="card" style="padding:0; margin-bottom:14px; overflow:hidden; border:1px solid #1e2a3b;">
 
@@ -82,6 +143,48 @@ Chart.register(...registerables);
               Score is 80+, but Strong Buy also needs: {{ health.strong_buy_blocked_by.join('; ') }}
             </div>
           }
+
+          <!-- Refresh, and next to it the two facts that decide whether refreshing is even the
+               right thing to try: when this was computed, and which session it was computed
+               from. They are different problems and only one of them has a button. -->
+          <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:10px;">
+            <button class="btn-outline" (click)="loadHealth(true)" [disabled]="healthRefreshing"
+                    style="font-size:10px; padding:5px 13px;"
+                    title="Rescans every constituent against its 20, 50, 100 and 200 day averages. The reading is otherwise computed once an hour.">
+              @if (healthRefreshing) { <span class="spin"></span> Refreshing&hellip; }
+              @else { Refresh }
+            </button>
+            <!-- Every reading is now kept, one row per session, so the score can be read back
+                 against what the strategies actually did on those days. Until this existed the
+                 engine computed a number, served it for an hour and forgot it. -->
+            <button class="btn-outline" (click)="downloadHistory()"
+                    style="font-size:10px; padding:5px 13px;"
+                    title="Every stored daily reading as a CSV for Excel: status, score and each component, one row per trading session.">
+              Download daily status
+            </button>
+            <span style="font-size:9.5px; color:#64748b;">
+              @if (healthAge) { Computed {{ healthAge }} }
+              @if (health.as_of) {
+                <span style="margin-left:6px;">&middot; from the {{ health.as_of }} session</span>
+              }
+              <span style="margin-left:6px;">&middot; recomputed hourly 08:00&ndash;20:00</span>
+            </span>
+          </div>
+
+          @if (healthMessage) {
+            <div style="font-size:10px; color:#9eb8dd; margin-top:5px;">{{ healthMessage }}</div>
+          }
+
+          @if (healthSessionStale) {
+            <!-- Stated rather than left to be inferred from a date. Refreshing cannot fix this
+                 one: the computation is current, the closes it reads are not. -->
+            <div style="font-size:10px; color:#fde68a; background:#3a2608; border:1px solid #d97706;
+                        border-radius:6px; padding:6px 9px; margin-top:7px; line-height:1.5;">
+              <strong>Reading the {{ health.as_of }} session.</strong> Later daily closes have not
+              been stored yet, so every figure here describes that day, not today. Refreshing will
+              not change it &mdash; backfill the daily candles first.
+            </div>
+          }
         </div>
 
         <div style="flex:0 0 190px; padding:14px 18px; display:flex; flex-direction:column;
@@ -103,73 +206,75 @@ Chart.register(...registerables);
       </div>
 
       <!-- The readings the specification asks to display -->
-      <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:1px; background:#1e2a3b;">
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">% Above 20 DMA</div>
-          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.pct_above_20dma | number:'1.1-1' }}%</div>
+      <div class="regime-metrics-wrap">
+        <div class="regime-metrics">
+        <div>
+          <div class="rm-label" title="% Above 20 DMA">% Above 20 DMA</div>
+          <div class="rm-value" style="color:#e2e8f0;">{{ health.pct_above_20dma | number:'1.1-1' }}%</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">% Above 50 DMA</div>
-          <div style="font-size:19px; font-weight:800;"
+        <div>
+          <div class="rm-label" title="% Above 50 DMA">% Above 50 DMA</div>
+          <div class="rm-value"
                [style.color]="health.pct_above_50dma >= 70 ? '#22c55e' : '#e2e8f0'">
             {{ health.pct_above_50dma | number:'1.1-1' }}%
           </div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">% Above 200 DMA</div>
-          <div style="font-size:19px; font-weight:800;"
+        <div>
+          <div class="rm-label" title="% Above 200 DMA">% Above 200 DMA</div>
+          <div class="rm-value"
                [style.color]="health.pct_above_200dma >= 60 ? '#22c55e' : '#e2e8f0'">
             {{ health.pct_above_200dma | number:'1.1-1' }}%
           </div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;"
+        <div
              [title]="health.advancing + ' advancing vs ' + health.declining + ' declining'">
-          <div style="font-size:9.5px; color:#94a3b8;">Advance / Decline</div>
-          <div style="font-size:19px; font-weight:800;"
+          <div class="rm-label" title="Advance / Decline">Advance / Decline</div>
+          <div class="rm-value"
                [style.color]="(health.advance_decline_ratio || 0) > 1 ? '#22c55e' : '#ef4444'">
             {{ health.advance_decline_ratio == null ? 'n/a' : (health.advance_decline_ratio | number:'1.2-2') }}
           </div>
-          <div style="font-size:9px; color:#64748b;">{{ health.advancing }} up &middot; {{ health.declining }} down</div>
+          <div class="rm-sub">{{ health.advancing }} up &middot; {{ health.declining }} down</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;"
+        <div
              [title]="health.new_highs + ' at a 52-week high vs ' + health.new_lows + ' at a 52-week low'">
-          <div style="font-size:9.5px; color:#94a3b8;">New High / New Low</div>
-          <div style="font-size:19px; font-weight:800;"
+          <div class="rm-label" title="New High / New Low">New High / New Low</div>
+          <div class="rm-value"
                [style.color]="(health.nh_nl_ratio || 0) >= 1 ? '#22c55e' : '#ef4444'">
             {{ health.nh_nl_ratio == null ? 'n/a' : (health.nh_nl_ratio | number:'1.2-2') }}
           </div>
-          <div style="font-size:9px; color:#64748b;">{{ health.new_highs }} hi &middot; {{ health.new_lows }} lo</div>
+          <div class="rm-sub">{{ health.new_highs }} hi &middot; {{ health.new_lows }} lo</div>
         </div>
 
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">Volume Participation</div>
-          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.volume_participation_pct | number:'1.1-1' }}%</div>
-          <div style="font-size:9px; color:#64748b;">{{ health.stocks_above_avg_volume }} above 20-day avg</div>
+        <div>
+          <div class="rm-label" title="Volume Participation">Volume Participation</div>
+          <div class="rm-value" style="color:#e2e8f0;">{{ health.volume_participation_pct | number:'1.1-1' }}%</div>
+          <div class="rm-sub">{{ health.stocks_above_avg_volume }} above 20-day avg</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">Composite RSI (14)</div>
-          <div style="font-size:19px; font-weight:800;"
+        <div>
+          <div class="rm-label" title="Composite RSI (14)">Composite RSI (14)</div>
+          <div class="rm-value"
                [style.color]="health.composite_rsi_state === 'BULLISH' ? '#22c55e' : health.composite_rsi_state === 'BEARISH' ? '#ef4444' : '#facc15'">
             {{ health.composite_rsi == null ? 'n/a' : (health.composite_rsi | number:'1.1-1') }}
           </div>
-          <div style="font-size:9px; color:#64748b;">{{ health.composite_rsi_state }}</div>
+          <div class="rm-sub">{{ health.composite_rsi_state }}</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;" [title]="health.composite_note">
-          <div style="font-size:9.5px; color:#94a3b8;">Composite Trend</div>
-          <div style="font-size:19px; font-weight:800;"
+        <div [title]="health.composite_note">
+          <div class="rm-label" title="Composite Trend">Composite Trend</div>
+          <div class="rm-value"
                [style.color]="health.composite_trend === 'BULLISH' ? '#22c55e' : health.composite_trend === 'BEARISH' ? '#ef4444' : '#facc15'">
             {{ health.composite_trend }}
           </div>
-          <div style="font-size:9px; color:#64748b;">close vs 50 vs 200 DMA</div>
+          <div class="rm-sub">close vs 50 vs 200 DMA</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">% Above 100 DMA</div>
-          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.pct_above_100dma | number:'1.1-1' }}%</div>
+        <div>
+          <div class="rm-label" title="% Above 100 DMA">% Above 100 DMA</div>
+          <div class="rm-value" style="color:#e2e8f0;">{{ health.pct_above_100dma | number:'1.1-1' }}%</div>
         </div>
-        <div style="background:#0d1829; padding:10px 14px;">
-          <div style="font-size:9.5px; color:#94a3b8;">Universe</div>
-          <div style="font-size:19px; font-weight:800; color:#e2e8f0;">{{ health.total_stocks | number }}</div>
-          <div style="font-size:9px; color:#64748b;">{{ health.universe }}</div>
+        <div>
+          <div class="rm-label" title="Universe">Universe</div>
+          <div class="rm-value" style="color:#e2e8f0;">{{ health.total_stocks | number }}</div>
+          <div class="rm-sub">{{ health.universe }}</div>
+        </div>
         </div>
       </div>
 
@@ -205,6 +310,28 @@ Chart.register(...registerables);
     <div class="card" style="padding:14px 18px; margin-bottom:14px; border-left:4px solid #facc15;">
       <div style="font-size:13px; font-weight:700; color:#facc15;">Market Health Score unavailable</div>
       <div style="font-size:11px; color:#94a3b8; margin-top:4px;">{{ health.message }}</div>
+      <button class="btn-outline" style="font-size:10px; padding:5px 13px; margin-top:9px;"
+              (click)="loadHealth(true)" [disabled]="healthRefreshing">
+        @if (healthRefreshing) { <span class="spin"></span> Recomputing&hellip; } @else { Recompute now }
+      </button>
+    </div>
+  } @else if (!healthLoading) {
+    <!-- The band had three states - loading, good, and "the server said no" - and no state for
+         "the request never came back". A failed or unauthorized call left "health" null, which
+         matched none of them, so the whole section rendered as nothing: not an error, not a
+         spinner, just absence. The first thing on this page silently disappearing is worse than
+         any error it could have shown, so there is now always a fourth state. -->
+    <div class="card" style="padding:14px 18px; margin-bottom:14px; border-left:4px solid #ef4444;">
+      <div style="font-size:13px; font-weight:700; color:#fca5a5;">Market breadth could not be read</div>
+      <div style="font-size:11px; color:#94a3b8; margin-top:4px; line-height:1.6;">
+        The request did not come back. The server may still be starting, or the session may have
+        expired. Nothing is wrong with the market data itself &mdash; this panel simply has
+        nothing to show yet.
+      </div>
+      <button class="btn-outline" style="font-size:10px; padding:5px 13px; margin-top:9px;"
+              (click)="loadData(true)" [disabled]="loading">
+        @if (loading) { <span class="spin"></span> Retrying&hellip; } @else { Try again }
+      </button>
     </div>
   }
 
@@ -217,7 +344,7 @@ Chart.register(...registerables);
 
   @if (data) {
     <!-- KPI Cards (6 columns) -->
-    <div style="display:grid; grid-template-columns:repeat(6,1fr); gap:8px; margin-bottom:14px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:8px; margin-bottom:14px;">
       <div class="card" style="padding:12px 14px;">
         <div style="font-size:10px; color:#94a3b8; margin-bottom:4px;">Total Stocks</div>
         <div style="font-size:26px; font-weight:800; color:#fff;">{{ data.total_stocks | number }}</div>
@@ -255,7 +382,7 @@ Chart.register(...registerables);
     </div>
 
     <!-- Row 1: Distribution Chart + Sentiment Meter -->
-    <div style="display:grid; grid-template-columns:1.4fr 1fr; gap:14px; margin-bottom:14px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:14px; margin-bottom:14px;">
       <!-- Distribution Curve -->
       <div class="card" style="padding:14px;">
         <div class="section-title" style="margin-bottom:10px;">Return Distribution Curve</div>
@@ -298,7 +425,7 @@ Chart.register(...registerables);
     </div>
 
     <!-- Row 2: Three charts -->
-    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:14px; margin-bottom:14px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:14px; margin-bottom:14px;">
       <!-- Positive vs Negative Breadth -->
       <div class="card" style="padding:14px;">
         <div class="section-title" style="margin-bottom:10px;">Positive vs Negative Breadth</div>
@@ -325,7 +452,7 @@ Chart.register(...registerables);
     </div>
 
     <!-- Row 3: Return Range Table + Sector Breadth Table -->
-    <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px;">
+    <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:14px; margin-bottom:14px;">
       <!-- Return Range Data -->
       <div class="card" style="overflow:hidden;">
         <div style="background:#1a3a5c; padding:10px 12px;">
@@ -397,7 +524,7 @@ Chart.register(...registerables);
     <!-- Export Section -->
     <div class="card" style="padding:12px;">
       <div class="section-title" style="margin-bottom:10px;">Download / Export</div>
-      <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:7px;">
+      <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:7px;">
         <button class="btn-outline" style="padding:7px 10px; font-size:10.5px;" (click)="downloadCsv('/tracker/export/distribution','TradeRakshak_Distribution.csv')">Distribution Report</button>
         <button class="btn-outline" style="padding:7px 10px; font-size:10.5px;" (click)="downloadCsv('/tracker/export/all-stocks','TradeRakshak_All_Stocks.csv')">All Stocks</button>
         <button class="btn-outline" style="padding:7px 10px; font-size:10.5px;" (click)="downloadCsv('/tracker/export/eligible','TradeRakshak_Eligible.csv')">Eligible Stocks</button>
@@ -428,7 +555,28 @@ export class MarketBreadthComponent implements OnInit, OnDestroy {
   private moduleSub?: { unsubscribe(): void };
   constructor(private api: ApiService, private http: HttpClient, private realtime: RealtimeService) {}
 
+  /**
+   * Last payloads, kept on the class rather than the instance.
+   *
+   * <p>This component is lazily routed, so navigating away destroys it and navigating back
+   * builds a new one with null fields - which is why the page "disappeared" and then showed a
+   * skeleton again on every return. The server answers from an hourly cache in about a fifth of
+   * a second, so the wait was never the computation; it was that the browser had thrown away a
+   * reading it had already been given. Holding it here means a return paints immediately from
+   * the last numbers and the refresh happens behind them.
+   *
+   * <p>Static, so it lives as long as the tab. It is deliberately not persisted any further:
+   * breadth from a previous day would be worse than a short wait.
+   */
+  private static cachedHealth: any = null;
+  private static cachedData: any = null;
+  private static cachedAt = 0;
+
   ngOnInit() {
+    // Paint first, fetch second.
+    this.health = MarketBreadthComponent.cachedHealth;
+    this.data = MarketBreadthComponent.cachedData;
+    if (this.data) setTimeout(() => this.buildCharts(), 50);
     this.loadData();
     this.timer = setInterval(() => this.loadData(), 5 * 60 * 1000);
     this.moduleSub = this.realtime.on('dashboard').subscribe(() => this.loadData());
@@ -444,12 +592,100 @@ export class MarketBreadthComponent implements OnInit, OnDestroy {
   health: any = null;
   healthLoading = false;
 
-  loadHealth() {
+  /** True only while a forced recompute is running, so the two buttons spin independently. */
+  healthRefreshing = false;
+  healthMessage = '';
+
+  /**
+   * Read the regime banner.
+   *
+   * <p>{@code force} asks the server to rescan the universe instead of serving its hourly
+   * cache. Without it the Refresh button could only ever re-fetch the identical cached map,
+   * which is indistinguishable from a button that is not wired up.
+   */
+  loadHealth(force = false) {
+    if (force) { this.healthRefreshing = true; this.healthMessage = ''; }
     this.healthLoading = true;
-    this.api.get<any>('/tracker/market-health').subscribe({
-      next: r => { this.health = r.data || null; this.healthLoading = false; },
-      error: () => { this.health = null; this.healthLoading = false; }
+    this.api.get<any>('/tracker/market-health', force ? { force: 'true' } : undefined).subscribe({
+      next: r => {
+        const next = r.data || null;
+        // Keep the reading on screen if the refresh came back empty. Replacing a good reading
+        // with null would blank the band, which is worse than showing the previous one.
+        if (next) { this.health = next; MarketBreadthComponent.cachedHealth = next; }
+        this.healthLoading = false;
+        if (force) {
+          this.healthRefreshing = false;
+          this.healthMessage = next
+            ? 'Recomputed from ' + (next.total_stocks || 0) + ' stocks at '
+              + new Date().toLocaleTimeString()
+            : 'The refresh returned nothing; the previous reading is still shown.';
+        }
+      },
+      error: () => {
+        this.healthLoading = false;
+        if (force) {
+          this.healthRefreshing = false;
+          this.healthMessage = 'Could not refresh. The reading on screen is the previous one.';
+        }
+      }
     });
+  }
+
+  /**
+   * Download the stored daily readings.
+   *
+   * <p>Fetched as a blob rather than opened in a tab: the endpoint needs the Authorization
+   * header, and a plain link cannot carry one - it would arrive as a 401 rendered as a broken
+   * download.
+   */
+  downloadHistory(): void {
+    this.http.get(environment.apiUrl + '/tracker/export/market-health?limit=2000',
+                  { responseType: 'blob' }).subscribe({
+      next: (blob: Blob) => {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'TradeRakshak_Daily_Market_Status.csv';
+        a.click();
+        URL.revokeObjectURL(url);
+      },
+      error: () => alert('Could not download the daily market status.')
+    });
+  }
+
+  /** How stale the reading on screen is, in words. */
+  get healthAge(): string {
+    const secs = Number(this.health?.cache_age_seconds);
+    if (!isFinite(secs) || secs < 0) return '';
+    if (secs < 90) return 'just now';
+    const mins = Math.round(secs / 60);
+    if (mins < 60) return mins + ' min ago';
+    const hrs = Math.floor(mins / 60);
+    return hrs + 'h ' + (mins % 60) + 'm ago';
+  }
+
+  /**
+   * Whether the reading is built from a session older than the last one that should exist.
+   *
+   * <p>This is the distinction the screen was missing. "Not updating" can mean the panel is
+   * serving an old computation, or it can mean the computation is current but the daily closes
+   * behind it stop several sessions back - and no amount of refreshing fixes the second one. The
+   * age above answers the first; this answers the second.
+   */
+  get healthSessionStale(): boolean {
+    const asOf = String(this.health?.as_of || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf)) return false;
+    const d = new Date(asOf + 'T00:00:00');
+    const now = new Date();
+    // Walk back from today to the most recent weekday, and allow it to be that or newer.
+    const probe = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    let guard = 0;
+    while ((probe.getDay() === 0 || probe.getDay() === 6) && guard++ < 7) {
+      probe.setDate(probe.getDate() - 1);
+    }
+    // One session of slack: before the close lands, yesterday's reading is the current one.
+    probe.setDate(probe.getDate() - 1);
+    return d < probe;
   }
 
   /** Width of a score-breakdown bar, as a percentage of that component's own maximum. */
@@ -476,12 +712,14 @@ export class MarketBreadthComponent implements OnInit, OnDestroy {
       .map(k => ({ key: k, label: labels[k], ...b[k] }));
   }
 
-  loadData() {
+  loadData(force = false) {
     this.loading = true;
-    this.loadHealth();
+    this.loadHealth(force);
     this.api.get<any>('/tracker/breadth').subscribe({
       next: r => {
         this.data = r.data || {};
+        MarketBreadthComponent.cachedData = this.data;
+        MarketBreadthComponent.cachedAt = Date.now();
         this.loading = false;
         setTimeout(() => this.buildCharts(), 50);
       },

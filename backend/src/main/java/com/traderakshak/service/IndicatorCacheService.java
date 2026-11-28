@@ -303,9 +303,17 @@ public class IndicatorCacheService {
     private Map<String, Object> loadOhlcv(String symbol, String exchange, int bars) {
         try {
             List<Object[]> rows = em.createNativeQuery(
-                "SELECT open, high, low, close, COALESCE(total_volume,volume) FROM broker_market_candles " +
-                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
+                // The candle_mode filter sat between FROM and WHERE, which is not valid SQL:
+                // "...FROM broker_market_candles AND UPPER(...)". Postgres rejected it at
+                // position 89 on every call, so this query never returned a row and the
+                // indicator cache never warmed - 1,314 failures in a single session's log,
+                // each one also poisoning its transaction ("current transaction is aborted").
+                // It failed silently because the caller logs at debug and returns null, which
+                // is indistinguishable from "this symbol has no candles".
+                "SELECT open, high, low, close, COALESCE(total_volume,volume) " +
+                "FROM broker_market_candles " +
                 "WHERE symbol=:sym AND (:ex IS NULL OR exchange=:ex) " +
+                "AND UPPER(COALESCE(candle_mode,''))='DAILY' " +
                 "ORDER BY trade_date DESC LIMIT :n")
                 .setParameter("sym", symbol).setParameter("ex", exchange)
                 .setParameter("n", bars).getResultList();

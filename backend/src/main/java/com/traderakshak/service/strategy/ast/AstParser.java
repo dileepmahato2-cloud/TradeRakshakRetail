@@ -124,7 +124,24 @@ public class AstParser {
             throw new AstParseException(path, "A comparison needs a right operand.");
         }
 
-        return new AstNode.Compare(op, operand(left, path + ".left"), right);
+        return new AstNode.Compare(op, operand(left, path + ".left"), right,
+                                   timeframe(n, path));
+    }
+
+    /**
+     * The bar width this node is measured on, defaulting to daily.
+     *
+     * <p>Read per node, not per strategy, so "daily RSI oversold while the hourly is already
+     * turning up" is one rule rather than two that cannot be combined.
+     */
+    private Timeframe timeframe(JsonNode n, String path) {
+        String raw = text(n, "timeframe");
+        if (raw == null) raw = text(n, "tf");
+        try {
+            return Timeframe.from(raw);
+        } catch (IllegalArgumentException e) {
+            throw new AstParseException(path, e.getMessage());
+        }
     }
 
     private AstNode branch(JsonNode n, String path) {
@@ -182,7 +199,8 @@ public class AstParser {
         JsonNode over = n.get("over");
         require(over != null, path, "A quantifier needs something to measure.");
         int periods = n.has("periods") ? n.get("periods").asInt(0) : 0;
-        return new AstNode.Quantifier(op, periods, operand(over, path + ".over"));
+        return new AstNode.Quantifier(op, periods, operand(over, path + ".over"),
+                                      timeframe(n, path));
     }
 
     // --------------------------------------------------------------- operands
@@ -199,7 +217,54 @@ public class AstParser {
         String type = text(n, "type");
         require(type != null, path, "An operand needs a \"type\".");
 
+        Operand base = bareOperand(n, type, path);
+
+        // "offset" on a fundamental already means periods back through its own calendar, so it is
+        // consumed there and must not be wrapped again - doing both would read four quarters back
+        // and then four more bars back on top.
+        if (base instanceof Operand.Fundamental) {
+            // A fundamental shifts through its own calendar, so an offset outside it has no
+            // reading. Silently ignoring it would be worse: the rule would say "two quarters
+            // before last" and mean "last quarter".
+            if (barsBack(n, path) != 0 && !"fundamental".equalsIgnoreCase(type)) {
+                throw new AstParseException(path, "A financial figure moves by reporting period, "
+                    + "not by bars. Put \"offset\" on the fundamental itself.");
+            }
+            return base;
+        }
+
+        int back = barsBack(n, path);
+        if (back == 0) return base;
+        try {
+            return new Operand.Shifted(base, back);
+        } catch (IllegalArgumentException e) {
+            throw new AstParseException(path, e.getMessage());
+        }
+    }
+
+    /** How many bars back this operand reads. Accepts the three spellings that reach us. */
+    private int barsBack(JsonNode n, String path) {
+        for (String key : new String[] {"offset", "barsBack", "ago"}) {
+            JsonNode v = n.get(key);
+            if (v == null || v.isNull()) continue;
+            if (!v.isNumber() || v.asDouble() != Math.rint(v.asDouble())) {
+                throw new AstParseException(path,
+                    "\"" + key + "\" counts whole bars back and must be a whole number.");
+            }
+            return v.asInt();
+        }
+        return 0;
+    }
+
+    private Operand bareOperand(JsonNode n, String type, String path) {
         switch (type.toLowerCase(Locale.ROOT)) {
+            case "shifted": {
+                JsonNode inner = n.get("of");
+                require(inner != null, path, "A shifted operand needs an \"of\".");
+                // The wrapper is applied by the caller from the same offset keys, so this case
+                // only unwraps - which keeps one code path for both spellings of the same thing.
+                return operand(inner, path + ".of");
+            }
             case "literal": {
                 JsonNode v = n.get("value");
                 require(v != null && v.isNumber(), path, "A literal needs a numeric \"value\".");

@@ -30,11 +30,33 @@ class LiveCandleBucketTest {
 
     /** intervalMinutes is @Value-injected, so set it the way Spring would. */
     private static LiveCandleAggregator aggregatorWithInterval(int minutes) throws Exception {
-        LiveCandleAggregator agg = new LiveCandleAggregator(null, null, null);
+        LiveCandleAggregator agg = new LiveCandleAggregator(null, null, null, null);
         Field f = LiveCandleAggregator.class.getDeclaredField("intervalMinutes");
         f.setAccessible(true);
         f.setInt(agg, minutes);
         return agg;
+    }
+
+    /**
+     * The 2-hour width the platform now runs on.
+     *
+     * <p>From the 09:15 open these start 09:15, 11:15, 13:15 and 15:15. The last one is the
+     * point of the whole arrangement: the RSI 45 shortlist is frozen at 15:15 and its entry is
+     * priced there, and a price lookup seeks the first bar at or AFTER the time it is given -
+     * so if 15:15 were not a bar start the entry would silently resolve to the next bar, or to
+     * nothing at all once the session had ended.
+     */
+    @Test
+    void twoHourBarsStartOnTheCutOff() throws Exception {
+        LiveCandleAggregator agg = aggregatorWithInterval(120);
+        assertEquals(LocalTime.of(9, 15),  bucketOf(agg, "09:15:00"));
+        assertEquals(LocalTime.of(9, 15),  bucketOf(agg, "11:14:59"));
+        assertEquals(LocalTime.of(11, 15), bucketOf(agg, "11:15:00"));
+        assertEquals(LocalTime.of(13, 15), bucketOf(agg, "13:20:00"));
+        assertEquals(LocalTime.of(15, 15), bucketOf(agg, "15:15:00"),
+            "15:15 must open a bar of its own - it is the moment the shortlist is frozen");
+        assertEquals(LocalTime.of(15, 15), bucketOf(agg, "15:29:59"),
+            "the last bar of the session runs to the close");
     }
 
     private static LocalTime bucketOf(LiveCandleAggregator agg, String hhmmss) {

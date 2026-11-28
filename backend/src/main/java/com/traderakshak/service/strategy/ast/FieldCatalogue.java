@@ -52,6 +52,13 @@ public class FieldCatalogue {
         price("prev_close", "Previous Close");
         price("prev_high", "Previous Day High");
         price("prev_low", "Previous Day Low");
+        // The level the crossover strategies are written against. Not derived from the price
+        // series at all - it is the price uploaded with the stock, or the price at a reference
+        // date and time the strategy chose - which is why it is supplied to the evaluator rather
+        // than computed. It was missing from this catalogue while the evaluator had always been
+        // able to read it, so the entry test every crossover strategy on this platform is built
+        // from was the one rule the builder could not express.
+        price("base_price", "Base Price");
 
         // ---- volume ----------------------------------------------------------------
         add("volume", "Volume", Category.VOLUME, List.of(), Availability.AVAILABLE, "shares");
@@ -128,6 +135,14 @@ public class FieldCatalogue {
         fundamental("ev_ebitda", "EV/EBITDA");
         fundamental("price_to_sales", "Price to Sales");
         fundamental("dividend_yield", "Dividend Yield");
+
+        // Market capitalisation, published as NO_DATA deliberately.
+        //
+        // stock_master has the column and it is empty for all 10,045 NSE rows, so a rule using
+        // it would match nothing. Publishing it greyed, with the reason, is the honest state:
+        // leaving it out entirely reads as "this platform cannot screen on market cap", which is
+        // a different and wrong message. It lights up on its own once the column is populated.
+        fundamental("market_cap", "Market Cap");
     }
 
     private static List<ParamDef> macdParams() {
@@ -146,8 +161,12 @@ public class FieldCatalogue {
                        new ParamDef("multiplier", "double", 3.0, 0.1, 20.0));
     }
 
+    /** The (14, 3, 3) form: %K look-back, %K smoothing, %D period. See the engine's note on
+     *  why the middle one is not optional - it is the difference between the fast and the slow
+     *  stochastic, and a crossing rule behaves very differently on each. */
     private static List<ParamDef> stochasticParams() {
         return List.of(new ParamDef("kPeriod", "int", 14, 1.0, 200.0),
+                       new ParamDef("smoothK", "int", 3, 1.0, 100.0),
                        new ParamDef("dPeriod", "int", 3, 1.0, 100.0));
     }
 

@@ -19,7 +19,9 @@ export const routes: Routes = [
       { path: 'backtesting',         loadComponent: () => import('./features/backtesting/backtesting.component').then(m => m.BacktestingComponent) },
       { path: 'trading',             loadComponent: () => import('./features/trading/trading.component').then(m => m.TradingComponent) },
       { path: 'paper',               loadComponent: () => import('./features/paper-trading/paper-trading.component').then(m => m.PortfolioComponent) },
+      { path: 'pnl',                 loadComponent: () => import('./features/pnl/pnl-dashboard.component').then(m => m.PnlDashboardComponent) },
       { path: 'journal',             loadComponent: () => import('./features/journal/journal.component').then(m => m.JournalComponent) },
+      { path: 'auto-trade',          loadComponent: () => import('./features/auto-trade/auto-trade.component').then(m => m.AutoTradeComponent) },
       { path: 'watchlist',           loadComponent: () => import('./features/watchlist/watchlist.component').then(m => m.WatchlistComponent) },
       { path: 'options',             loadComponent: () => import('./features/options/options.component').then(m => m.OptionsComponent) },
       { path: 'data',                loadComponent: () => import('./features/data-management/data-management.component').then(m => m.DataManagementComponent) },
@@ -61,7 +63,11 @@ export const routes: Routes = [
       { path: 'stock-ranking',         loadComponent: () => import('./features/stock-ranking/stock-ranking.component').then(m => m.StockRankingComponent) },
 
       // ── Strategy Builder ────────────────────────────────────────────────────
-      { path: 'strategy-builder',              loadComponent: () => import('./features/strategy-builder/strategy-hub.component').then(m => m.StrategyHubComponent) },
+      // The grouped canvas is the Strategy Builder. The text-conversion workspace it replaced
+      // is kept at /classic rather than deleted: pasting Chartink or plain English and having it
+      // converted is a real feature the canvas does not have.
+      { path: 'strategy-builder',              loadComponent: () => import('./features/strategy-builder/strategy-canvas.component').then(m => m.StrategyCanvasComponent) },
+      { path: 'strategy-builder/classic',      loadComponent: () => import('./features/strategy-builder/strategy-hub.component').then(m => m.StrategyHubComponent) },
       { path: 'strategy-tester',               loadComponent: () => import('./features/strategy-builder/strategy-tester.component').then(m => m.StrategyTesterComponent) },
       { path: 'strategy-builder/simple',       redirectTo: 'strategy-builder', pathMatch: 'full' },
       { path: 'strategy-builder/advanced',     redirectTo: 'strategy-builder', pathMatch: 'full' },

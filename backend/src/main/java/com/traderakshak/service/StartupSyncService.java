@@ -215,8 +215,19 @@ public class StartupSyncService {
         }
     }
 
-    @Scheduled(cron = "0 0 17 * * MON-FRI", zone = "Asia/Kolkata")
+    // Moved from 17:00 to 08:10, because automatic outbound calls are now confined to
+    // 08:00-16:00 IST and a 17:00 job would never run.
+    //
+    // Functionally the same fetch. It asks for the last COMPLETED trading day, and Dhan does not
+    // publish same-day EOD (sync.eod.same_day_available defaults to false), so at 17:00 it was
+    // already fetching the previous session rather than the one that had just closed. Running it
+    // the next morning asks for exactly the same candles, a few hours later.
+    @Scheduled(cron = "0 10 8 * * MON-FRI", zone = "Asia/Kolkata")
     public void fetchLatestCompletedDailyCandles() {
+        if (!calendar.isAutomationWindowOpen()) {
+            log.debug("[Sync] Daily candle fetch skipped: {}.", calendar.automationWindowReason());
+            return;
+        }
         // This asked for target, and could therefore never fetch anything. startHistoricalBackfill
         // refuses any range starting after lastCompletedTradingDay(), and while
         // sync.eod.same_day_available is false - which is its default, because Dhan does not

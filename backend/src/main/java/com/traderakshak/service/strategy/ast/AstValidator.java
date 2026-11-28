@@ -35,7 +35,11 @@ public class AstValidator {
         }
     }
 
+    /** How far back an offset may reach before it is more likely a typo than an intention. */
+    private static final int MAX_SANE_OFFSET = 500;
+
     private final FieldCatalogue catalogue;
+    private final TimeframeAvailability timeframes;
 
     public Result validate(AstNode root) {
         List<Issue> issues = new ArrayList<>();
@@ -63,6 +67,7 @@ public class AstValidator {
             }
 
         } else if (n instanceof AstNode.Compare c) {
+            checkTimeframe(c.timeframe(), path, out);
             checkCompare(c, path, out);
 
         } else if (n instanceof AstNode.Branch b) {
@@ -74,7 +79,23 @@ public class AstValidator {
             }
 
         } else if (n instanceof AstNode.Quantifier q) {
+            checkTimeframe(q.timeframe(), path, out);
             checkQuantifier(q, path, out);
+        }
+    }
+
+    /**
+     * A timeframe with no candles behind it is a warning, not an error.
+     *
+     * <p>Warning because the rule is correct and will start working the day those candles are
+     * collected; blocking the save would make the author rewrite a rule that is not wrong. But
+     * it must be said, because the alternative - an empty result that looks exactly like a
+     * strategy nobody qualifies for - is the one failure of a screener that cannot be debugged
+     * from the screen.
+     */
+    private void checkTimeframe(Timeframe tf, String path, List<Issue> out) {
+        if (tf != null && !timeframes.available(tf)) {
+            out.add(new Issue(path, Severity.WARNING, timeframes.unavailableReason(tf)));
         }
     }
 
@@ -132,7 +153,9 @@ public class AstValidator {
             if (def == null) {
                 out.add(new Issue(path, Severity.ERROR, "There is no field called \""
                     + f.name() + "\"."));
+                return;
             }
+            warnIfNoData(def, path, out);
 
         } else if (o instanceof Operand.Indicator i) {
             FieldCatalogue.FieldDef def = catalogue.get(i.name());
@@ -141,6 +164,7 @@ public class AstValidator {
                     + i.name() + "\"."));
                 return;
             }
+            warnIfNoData(def, path, out);
             checkParams(def, i.params(), path, out);
 
         } else if (o instanceof Operand.Fundamental f) {
@@ -150,11 +174,7 @@ public class AstValidator {
                     + f.metric() + "\"."));
                 return;
             }
-            if (def.availability() == FieldCatalogue.Availability.NO_DATA) {
-                out.add(new Issue(path, Severity.WARNING, def.label()
-                    + " has no data loaded yet, so this condition will match nothing until the "
-                    + "financials pipeline runs."));
-            }
+            warnIfNoData(def, path, out);
             if (f.offset() < 0) {
                 out.add(new Issue(path, Severity.ERROR,
                     "Offset counts periods backwards and cannot be negative."));
@@ -166,6 +186,14 @@ public class AstValidator {
                     + " does not apply to an annual figure."));
             }
 
+        } else if (o instanceof Operand.Shifted sh) {
+            if (sh.barsBack() > MAX_SANE_OFFSET) {
+                out.add(new Issue(path, Severity.WARNING, sh.barsBack() + " bars back is around "
+                    + (sh.barsBack() / 250) + " years of daily history - check this is the offset "
+                    + "you meant, as most stocks will not reach that far."));
+            }
+            checkOperand(sh.of(), path + ".of", out);
+
         } else if (o instanceof Operand.Arith a) {
             if (a.op() == Operand.ArithOp.DIV
                 && a.right() instanceof Operand.Literal l && l.value() == 0d) {
@@ -174,6 +202,23 @@ public class AstValidator {
             checkOperand(a.left(), path + ".left", out);
             checkOperand(a.right(), path + ".right", out);
         }
+    }
+
+    /**
+     * A warning, never an error, when the platform has no data for a field.
+     *
+     * <p>The rule is accepted and the condition is SKIPPED at evaluation - not failed, and not
+     * silently passed. Rejecting it would stop a perfectly good strategy being written ahead of
+     * the data; passing it would drop a filter the author wrote without telling them. Skipping
+     * it and saying so is the only reading that is both usable and honest, and it starts
+     * applying on its own the moment the data lands, with nothing to edit.
+     */
+    private void warnIfNoData(FieldCatalogue.FieldDef def, String path, List<Issue> out) {
+        if (def.availability() != FieldCatalogue.Availability.NO_DATA) return;
+        out.add(new Issue(path, Severity.WARNING, def.label()
+            + " has no data loaded yet. The condition is accepted and saved, but it is SKIPPED "
+            + "while the data is missing - it will neither include nor exclude any stock. It "
+            + "starts applying on its own once the data is loaded."));
     }
 
     private void checkParams(FieldCatalogue.FieldDef def, Map<String, Object> params,
@@ -216,6 +261,11 @@ public class AstValidator {
         if (o instanceof Operand.Arith a) {
             String l = unitOf(a.left());
             return l != null ? l : unitOf(a.right());
+        }
+        // A close 20 bars ago is still a price, so the shift must not hide the unit - otherwise
+        // every "today vs N days ago" comparison would carry a spurious mismatch warning.
+        if (o instanceof Operand.Shifted sh) {
+            return unitOf(sh.of());
         }
         return null;
     }
